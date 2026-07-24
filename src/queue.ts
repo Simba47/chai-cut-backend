@@ -1,6 +1,6 @@
 import { supabase } from './supabase.js'
-import type { Job, JobType } from '@chai-cut/shared'
-import { JOB_POLL_INTERVAL_MS } from '@chai-cut/shared'
+import type { Job, JobType } from './types.js'
+import { JOB_POLL_INTERVAL_MS } from './types.js'
 
 type JobHandler = (job: Job) => Promise<void>
 

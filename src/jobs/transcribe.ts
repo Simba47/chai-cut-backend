@@ -3,9 +3,23 @@ import { promisify } from 'node:util'
 import { writeFile, readFile, unlink, mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3'
+import { r2, R2_BUCKET } from '../r2.js'
 import { supabase } from '../supabase.js'
-import type { Job, TranscribeJobPayload } from '@chai-cut/shared'
-import { STORAGE_BUCKET_RAW } from '@chai-cut/shared'
+import type { Job, TranscribeJobPayload } from '../types.js'
+
+async function r2Download(key: string): Promise<Buffer> {
+  const res = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }))
+  const chunks: Buffer[] = []
+  for await (const chunk of res.Body as AsyncIterable<Uint8Array>) {
+    chunks.push(Buffer.from(chunk))
+  }
+  return Buffer.concat(chunks)
+}
+
+async function r2Upload(key: string, body: Buffer, contentType: string): Promise<void> {
+  await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: key, Body: body, ContentType: contentType }))
+}
 
 const execFileAsync = promisify(execFile)
 
@@ -44,14 +58,12 @@ export async function handleTranscribeJob(job: Job) {
     let audioCached = false
     if (isRetranscribe && audioStoragePath) {
       try {
-        const { data: cachedData } = await supabase.storage.from(STORAGE_BUCKET_RAW).download(audioStoragePath)
-        if (cachedData) {
-          const flacPath = join(tmp, 'cached.flac')
-          await writeFile(flacPath, Buffer.from(await cachedData.arrayBuffer()))
-          await execFileAsync('ffmpeg', ['-i', flacPath, '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', audioPath])
-          audioCached = true
-          console.log(`[transcribe] retranscribe: used cached audio (${audioStoragePath})`)
-        }
+        const cachedBuf = await r2Download(audioStoragePath)
+        const flacPath = join(tmp, 'cached.flac')
+        await writeFile(flacPath, cachedBuf)
+        await execFileAsync('ffmpeg', ['-i', flacPath, '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', audioPath])
+        audioCached = true
+        console.log(`[transcribe] retranscribe: used cached audio (${audioStoragePath})`)
       } catch { /* fall through to full video download */ }
     }
 
@@ -66,9 +78,7 @@ export async function handleTranscribeJob(job: Job) {
         // Clip or retranscribe job: download video from storage
         await setProgress(payload.video_id, 30)
         videoPath = join(tmp, 'video.mp4')
-        const { data, error } = await supabase.storage.from(STORAGE_BUCKET_RAW).download(storagePath)
-        if (error || !data) throw new Error(`Storage download failed: ${error?.message}`)
-        await writeFile(videoPath, Buffer.from(await data.arrayBuffer()))
+        await writeFile(videoPath, await r2Download(storagePath))
         await setProgress(payload.video_id, 55)
       }
 
@@ -92,7 +102,7 @@ export async function handleTranscribeJob(job: Job) {
           const flacOut = join(tmp, 'audio_cache.flac')
           execFileAsync('ffmpeg', ['-i', audioPath, '-compression_level', '5', '-y', flacOut])
             .then(() => readFile(flacOut))
-            .then(buf => supabase.storage.from(STORAGE_BUCKET_RAW).upload(cachePath, buf, { contentType: 'audio/flac', upsert: true }))
+            .then(buf => r2Upload(cachePath, buf, 'audio/flac'))
             .catch(e => console.warn('[transcribe] audio cache upload failed:', e))
         }
       }
@@ -292,17 +302,13 @@ async function downloadWithYtDlp(videoId: string, tmp: string): Promise<{ localP
     })
   })
 
-  // ── Stage 3: Upload to storage (progress 55 → 58%) ────────────────────────
+  // ── Stage 3: Upload to R2 (progress 55 → 58%) ────────────────────────────
   await setProgress(videoId, 55)
-  const storagePath = `${video.user_id}/${videoId}.mp4`
+  const storagePath = `raw/${video.user_id}/${videoId}.mp4`
 
-  console.log(`[transcribe] uploading to storage: ${storagePath}`)
+  console.log(`[transcribe] uploading to R2: ${storagePath}`)
   const fileBuffer = await readFile(localPath)
-  const { error } = await supabase.storage
-    .from(STORAGE_BUCKET_RAW)
-    .upload(storagePath, fileBuffer, { contentType: 'video/mp4', upsert: true })
-
-  if (error) throw new Error(`Storage upload failed: ${error.message}`)
+  await r2Upload(storagePath, fileBuffer, 'video/mp4')
 
   await setProgress(videoId, 58)
   return { localPath, storagePath }
