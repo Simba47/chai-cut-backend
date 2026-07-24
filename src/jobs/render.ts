@@ -1,16 +1,26 @@
-import { execFile, spawn } from 'node:child_process'
-import { promisify } from 'node:util'
+import { spawn } from 'node:child_process'
 import { writeFile, readFile, mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3'
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
+import { r2, R2_BUCKET } from '../r2.js'
 import { supabase } from '../supabase.js'
 import type { Job, RenderJobPayload } from '@chai-cut/shared'
-import { STORAGE_BUCKET_RAW, STORAGE_BUCKET_CLIPS, STORAGE_BUCKET_OVERLAYS } from '@chai-cut/shared'
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
+
+async function r2Download(key: string): Promise<Buffer> {
+  const res = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }))
+  const chunks: Buffer[] = []
+  for await (const chunk of res.Body as AsyncIterable<Uint8Array>) {
+    chunks.push(Buffer.from(chunk))
+  }
+  return Buffer.concat(chunks)
+}
 
 export async function handleRenderJob(job: Job) {
   const payload = job.payload as unknown as RenderJobPayload
@@ -24,12 +34,9 @@ export async function handleRenderJob(job: Job) {
   const specPath = join(tmp, 'spec.json')
 
   try {
-    // Download primary source video
-    const { data, error } = await supabase.storage
-      .from(STORAGE_BUCKET_RAW)
-      .download(video_storage_path)
-    if (error || !data) throw new Error(`Storage download: ${error?.message}`)
-    await writeFile(videoLocalPath, Buffer.from(await data.arrayBuffer()))
+    // Download primary source video from R2
+    const videoBuffer = await r2Download(video_storage_path)
+    await writeFile(videoLocalPath, videoBuffer)
 
     // Download secondary source videos referenced by crop boxes
     const secondaryVideos: Record<string, string> = {}
@@ -48,37 +55,31 @@ export async function handleRenderJob(job: Job) {
 
         if (!vRow?.storage_path) continue
 
-        const { data: vData, error: vErr } = await supabase.storage
-          .from(STORAGE_BUCKET_RAW)
-          .download(vRow.storage_path)
-        if (vErr || !vData) {
-          console.warn(`[render] Failed to download secondary video ${box.source_video_id}: ${vErr?.message}`)
-          continue
+        try {
+          const vBuffer = await r2Download(vRow.storage_path)
+          const localPath = join(tmp, `secondary_${box.source_video_id}.mp4`)
+          await writeFile(localPath, vBuffer)
+          secondaryVideos[box.source_video_id] = localPath
+        } catch (e) {
+          console.warn(`[render] Failed to download secondary video ${box.source_video_id}:`, e)
         }
-
-        const localPath = join(tmp, `secondary_${box.source_video_id}.mp4`)
-        await writeFile(localPath, Buffer.from(await vData.arrayBuffer()))
-        secondaryVideos[box.source_video_id] = localPath
       }
     }
 
-    // Download overlay images
+    // Download overlay images from R2
     const overlayImages: Record<string, string> = {}
     for (const ov of (renderSpec.overlays ?? []) as Array<{ type?: string; storage_path?: string }>) {
       if (ov.type !== 'image' || !ov.storage_path) continue
 
-      const { data: ovData, error: ovErr } = await supabase.storage
-        .from(STORAGE_BUCKET_OVERLAYS)
-        .download(ov.storage_path)
-      if (ovErr || !ovData) {
-        console.warn(`[render] Failed to download overlay image ${ov.storage_path}: ${ovErr?.message}`)
-        continue
+      try {
+        const ovBuffer = await r2Download(ov.storage_path)
+        const ext = ov.storage_path.split('.').pop() ?? 'png'
+        const localPath = join(tmp, `overlay_${Buffer.from(ov.storage_path).toString('hex').slice(0, 16)}.${ext}`)
+        await writeFile(localPath, ovBuffer)
+        overlayImages[ov.storage_path] = localPath
+      } catch (e) {
+        console.warn(`[render] Failed to download overlay ${ov.storage_path}:`, e)
       }
-
-      const ext = ov.storage_path.split('.').pop() ?? 'png'
-      const localPath = join(tmp, `overlay_${Buffer.from(ov.storage_path).toString('hex').slice(0, 16)}.${ext}`)
-      await writeFile(localPath, Buffer.from(await ovData.arrayBuffer()))
-      overlayImages[ov.storage_path] = localPath
     }
 
     await writeFile(specPath, JSON.stringify(renderSpec, null, 2))
@@ -93,25 +94,24 @@ export async function handleRenderJob(job: Job) {
     ])
 
     const outputBuffer = await readFile(outputPath)
-    const outputStoragePath = `${clip_id}/output.mp4`
+    const outputStoragePath = `clips/${clip_id}/output.mp4`
 
-    const { error: upErr } = await supabase.storage
-      .from(STORAGE_BUCKET_CLIPS)
-      .upload(outputStoragePath, outputBuffer, { contentType: 'video/mp4', upsert: true })
+    await r2.send(new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: outputStoragePath,
+      Body: outputBuffer,
+      ContentType: 'video/mp4',
+    }))
 
-    if (upErr) throw new Error(`Output upload failed: ${upErr.message}`)
-
-    const { data: signedUrl } = await supabase.storage
-      .from(STORAGE_BUCKET_CLIPS)
-      .createSignedUrl(outputStoragePath, 60 * 60 * 24 * 7)
+    const output_url = await getSignedUrl(
+      r2,
+      new GetObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath }),
+      { expiresIn: 60 * 60 * 24 * 7 },
+    )
 
     await supabase
       .from('clips')
-      .update({
-        status: 'done',
-        output_url: signedUrl?.signedUrl,
-        output_storage_path: outputStoragePath,
-      })
+      .update({ status: 'done', output_url, output_storage_path: outputStoragePath })
       .eq('id', clip_id)
 
   } catch (err) {
