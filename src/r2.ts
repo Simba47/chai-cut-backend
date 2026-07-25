@@ -12,6 +12,8 @@ export const r2 = new S3Client({
   region: 'auto',
   endpoint,
   credentials: { accessKeyId, secretAccessKey },
+  requestChecksumCalculation: 'WHEN_REQUIRED',
+  responseChecksumValidation: 'WHEN_REQUIRED',
 })
 
 export const R2_BUCKET = process.env.R2_BUCKET ?? 'chai-cut-videos'

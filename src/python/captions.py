@@ -92,7 +92,7 @@ def burn_captions(
 
     out_w, out_h = pil_img.size
 
-    full_text = " ".join(w["word"] for w in active_words)
+    full_text = " ".join(w.get("word_roman") or w["word"] for w in active_words)
     bbox = draw.textbbox((0, 0), full_text, font=font)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]

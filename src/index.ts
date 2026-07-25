@@ -1,4 +1,4 @@
-import 'dotenv/config'
+import 'dotenv/config' // reload env
 import { registerHandler, startQueue } from './queue.js'
 import { handleTranscribeJob } from './jobs/transcribe.js'
 import { handleRenderJob } from './jobs/render.js'

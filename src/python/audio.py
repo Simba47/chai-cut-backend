@@ -32,14 +32,15 @@ def build_ffmpeg_audio_args(
     start_s = clip_start_ms / 1000.0
 
     if not audio_tracks:
-        # No background music — extract original speech audio directly
+        # Re-encode to AAC for sample-accurate seeking (acodec copy snaps to
+        # nearest audio keyframe, causing audio to arrive before the video).
         return [
             "ffmpeg", "-y",
             "-ss", str(start_s),
             "-t", str(duration_s),
             "-i", source_video,
             "-vn",
-            "-acodec", "copy",
+            "-acodec", "aac", "-b:a", "192k",
             output_audio,
         ]
 

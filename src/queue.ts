@@ -1,9 +1,8 @@
-import { supabase } from './supabase.js'
+import db from './db.js'
 import type { Job, JobType } from './types.js'
 import { JOB_POLL_INTERVAL_MS } from './types.js'
 
 type JobHandler = (job: Job) => Promise<void>
-
 const handlers = new Map<JobType, JobHandler>()
 
 export function registerHandler(type: JobType, handler: JobHandler) {
@@ -11,61 +10,34 @@ export function registerHandler(type: JobType, handler: JobHandler) {
 }
 
 export async function startQueue() {
-  // Reset any jobs left in `processing` from a previous crashed run
-  const { count } = await supabase
-    .from('jobs')
-    .update({ status: 'queued' }, { count: 'exact' })
-    .eq('status', 'processing')
-  if (count) console.log(`[queue] Reset ${count} stuck processing job(s) to queued`)
+  const stuck = await db`UPDATE jobs SET status = 'queued' WHERE status = 'processing' RETURNING id`
+  if (stuck.length) console.log(`[queue] Reset ${stuck.length} stuck processing job(s) to queued`)
 
   console.log('[queue] Worker started, polling for jobs…')
-
   while (true) {
-    try {
-      await tick()
-    } catch (err) {
-      console.error('[queue] Unexpected error in tick:', err)
-    }
+    try { await tick() } catch (err) { console.error('[queue] Unexpected error in tick:', err) }
     await sleep(JOB_POLL_INTERVAL_MS)
   }
 }
 
 async function tick() {
-  // Claim one queued job atomically using update + returning pattern
-  const { data: jobs } = await supabase
-    .from('jobs')
-    .select('*')
-    .eq('status', 'queued')
-    .order('created_at', { ascending: true })
-    .limit(1)
+  const [job] = await db<Job[]>`
+    SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1
+  `
+  if (!job) return
 
-  if (!jobs?.length) return
-
-  const job = jobs[0] as Job
-
-  // Mark as processing
-  const { error: claimError } = await supabase
-    .from('jobs')
-    .update({ status: 'processing' })
-    .eq('id', job.id)
-    .eq('status', 'queued')  // guard against double-claim
-
-  if (claimError) {
-    console.warn('[queue] Failed to claim job', job.id)
-    return
-  }
+  const claimed = await db`
+    UPDATE jobs SET status = 'processing' WHERE id = ${job.id} AND status = 'queued' RETURNING id
+  `
+  if (!claimed.length) return
 
   console.log(`[queue] Processing job ${job.id} (${job.type})`)
-
   const handler = handlers.get(job.type as JobType)
-  if (!handler) {
-    await fail(job.id, `No handler registered for type: ${job.type}`)
-    return
-  }
+  if (!handler) { await fail(job.id, `No handler for type: ${job.type}`); return }
 
   try {
     await handler(job)
-    await supabase.from('jobs').update({ status: 'done' }).eq('id', job.id)
+    await db`UPDATE jobs SET status = 'done' WHERE id = ${job.id}`
     console.log(`[queue] Job ${job.id} done`)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
@@ -75,9 +47,7 @@ async function tick() {
 }
 
 async function fail(jobId: string, error: string) {
-  await supabase.from('jobs').update({ status: 'failed', error }).eq('id', jobId)
+  await db`UPDATE jobs SET status = 'failed', error = ${error} WHERE id = ${jobId}`
 }
 
-function sleep(ms: number) {
-  return new Promise(resolve => setTimeout(resolve, ms))
-}
+function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)) }

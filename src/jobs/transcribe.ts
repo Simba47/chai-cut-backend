@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3'
 import { r2, R2_BUCKET } from '../r2.js'
-import { supabase } from '../supabase.js'
+import db from '../db.js'
 import type { Job, TranscribeJobPayload } from '../types.js'
 
 async function r2Download(key: string): Promise<Buffer> {
@@ -24,11 +24,12 @@ async function r2Upload(key: string, body: Buffer, contentType: string): Promise
 const execFileAsync = promisify(execFile)
 
 async function setProgress(videoId: string, pct: number) {
-  await supabase.from('videos').update({ download_progress: pct }).eq('id', videoId)
+  await db`UPDATE videos SET download_progress = ${pct} WHERE id = ${videoId}`
 }
 
 export async function handleTranscribeJob(job: Job) {
-  const payload = job.payload as unknown as TranscribeJobPayload
+  const raw = job.payload
+  const payload = (typeof raw === 'string' ? JSON.parse(raw) : raw) as TranscribeJobPayload
   const isLinkJob = !payload.storage_path
   const isRetranscribe = !!payload.is_retranscribe
   const isClipJob = !!payload.clip_id && payload.clip_start_ms !== undefined && payload.clip_end_ms !== undefined
@@ -36,13 +37,13 @@ export async function handleTranscribeJob(job: Job) {
   // Plain upload jobs (already in storage, no clip): just mark ready.
   // Transcription is deferred to clip creation now.
   if (!isLinkJob && !isClipJob && !isRetranscribe) {
-    await supabase.from('videos').update({ status: 'ready', download_progress: 100 }).eq('id', payload.video_id)
+    await db`UPDATE videos SET status = 'ready', download_progress = 100 WHERE id = ${payload.video_id}`
     console.log(`[transcribe] upload video ${payload.video_id} ready — transcription deferred to clip creation`)
     return
   }
 
   if (!isRetranscribe && !isClipJob) {
-    await supabase.from('videos').update({ status: 'transcribing', download_progress: 0 }).eq('id', payload.video_id)
+    await db`UPDATE videos SET status = 'transcribing', download_progress = 0 WHERE id = ${payload.video_id}`
   }
 
   const tmp = await mkdtemp(join(tmpdir(), 'chai-'))
@@ -73,7 +74,7 @@ export async function handleTranscribeJob(job: Job) {
         const result = await downloadWithYtDlp(payload.video_id, tmp)
         videoPath = result.localPath
         storagePath = result.storagePath
-        await supabase.from('videos').update({ storage_path: storagePath }).eq('id', payload.video_id)
+        await db`UPDATE videos SET storage_path = ${storagePath} WHERE id = ${payload.video_id}`
       } else {
         // Clip or retranscribe job: download video from storage
         await setProgress(payload.video_id, 30)
@@ -120,10 +121,7 @@ export async function handleTranscribeJob(job: Job) {
         if (!isNaN(secs)) durationMs = Math.round(secs * 1000)
       } catch { /* optional */ }
 
-      await supabase.from('videos').update({
-        status: 'ready', storage_path: storagePath, download_progress: 100,
-        ...(durationMs ? { duration_ms: durationMs } : {}),
-      }).eq('id', payload.video_id)
+      await db`UPDATE videos SET status = 'ready', storage_path = ${storagePath}, download_progress = 100, duration_ms = ${durationMs} WHERE id = ${payload.video_id}`
       console.log(`[transcribe] link video ${payload.video_id} ready — transcription deferred to clip creation`)
       return
     }
@@ -132,23 +130,17 @@ export async function handleTranscribeJob(job: Job) {
     const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob) ? payload.video_id : undefined, payload.language_code)
 
     if (isRetranscribe) {
-      await supabase.from('transcripts').delete().eq('video_id', payload.video_id)
+      await db`DELETE FROM transcripts WHERE video_id = ${payload.video_id}`
     }
 
-    const { data: transcript, error: tErr } = await supabase
-      .from('transcripts')
-      .insert({ video_id: payload.video_id, language: sarvamResult.language_code })
-      .select()
-      .single()
-
-    if (tErr || !transcript) throw new Error('Failed to insert transcript row')
+    const [transcript] = await db`
+      INSERT INTO transcripts (video_id, language) VALUES (${payload.video_id}, ${sarvamResult.language_code}) RETURNING id
+    `
+    if (!transcript) throw new Error('Failed to insert transcript row')
 
     const entries = sarvamResult.words
     if (entries.length > 0) {
-      // For clip jobs, Sarvam returns times 0-based from clip start — shift to absolute video timestamps
       const offsetMs = isClipJob ? payload.clip_start_ms! : 0
-
-      // Transliterate to Roman script (Tenglish/Hinglish etc.) in parallel
       const romanized = await transliterateToRoman(entries, sarvamResult.language_code, process.env.SARVAM_API_KEY)
 
       const words = entries.map((e, i) => ({
@@ -161,8 +153,7 @@ export async function handleTranscribeJob(job: Job) {
         confidence:  e.confidence ?? null,
       }))
       for (let i = 0; i < words.length; i += 500) {
-        const { error: wErr } = await supabase.from('transcript_words').insert(words.slice(i, i + 500))
-        if (wErr) throw new Error(`Failed to insert words chunk: ${wErr.message}`)
+        await db`INSERT INTO transcript_words ${db(words.slice(i, i + 500))}`
       }
     }
 
@@ -176,10 +167,7 @@ export async function handleTranscribeJob(job: Job) {
         const secs = parseFloat(stdout.trim())
         if (!isNaN(secs)) durationMs = Math.round(secs * 1000)
       } catch { /* optional */ }
-      await supabase.from('videos').update({
-        status: 'ready', storage_path: storagePath, download_progress: 100,
-        ...(durationMs ? { duration_ms: durationMs } : {}),
-      }).eq('id', payload.video_id)
+      await db`UPDATE videos SET status = 'ready', storage_path = ${storagePath}, download_progress = 100, duration_ms = ${durationMs} WHERE id = ${payload.video_id}`
     }
 
     console.log(`[transcribe] ${isClipJob ? `clip ${payload.clip_id}` : `video ${payload.video_id}`} done — ${entries.length} words`)
@@ -189,12 +177,7 @@ export async function handleTranscribeJob(job: Job) {
 }
 
 async function downloadWithYtDlp(videoId: string, tmp: string): Promise<{ localPath: string; storagePath: string }> {
-  const { data: video } = await supabase
-    .from('videos')
-    .select('source_url, user_id')
-    .eq('id', videoId)
-    .single()
-
+  const [video] = await db`SELECT source_url, user_id FROM videos WHERE id = ${videoId}`
   if (!video?.source_url) throw new Error('No source URL for video ' + videoId)
 
   const outputTemplate = join(tmp, 'video.%(ext)s')
@@ -682,6 +665,84 @@ async function callSarvamChunk(buf: Buffer, apiKey: string, languageCode?: strin
   throw lastErr
 }
 
+// ── Rule-based Telugu → Roman transliterator ──────────────────────────────────
+// Maps Unicode codepoints directly — no API, deterministic Tenglish output.
+const TE_CONSONANTS: Record<string, string> = {
+  'క':'k','ఖ':'kh','గ':'g','ఘ':'gh','ఙ':'ng',
+  'చ':'ch','ఛ':'chh','జ':'j','ఝ':'jh','ఞ':'ny',
+  'ట':'t','ఠ':'th','డ':'d','ఢ':'dh','ణ':'n',
+  'త':'t','థ':'th','ద':'d','ధ':'dh','న':'n',
+  'ప':'p','ఫ':'ph','బ':'b','భ':'bh','మ':'m',
+  'య':'y','ర':'r','ల':'l','వ':'v',
+  'శ':'sh','ష':'sh','స':'s','హ':'h',
+  'ళ':'l','ఱ':'r',  // ళ → 'l' (doubled naturally when clusters: ళ+్+ళ = 'll')
+}
+const TE_VOWELS: Record<string, string> = {
+  'అ':'a','ఆ':'aa','ఇ':'i','ఈ':'ee',
+  'ఉ':'u','ఊ':'oo','ఋ':'ru',
+  'ఎ':'e','ఏ':'e','ఐ':'ai',
+  'ఒ':'o','ఓ':'o','ఔ':'au',
+}
+// Vowel signs (matras) — excludes anusvara/visarga which are handled separately
+const TE_VOWEL_SIGNS: Record<string, string> = {
+  'ా':'aa','ి':'i','ీ':'ee','ు':'u','ూ':'oo','ృ':'ru',
+  'ె':'e','ే':'e','ై':'ai','ొ':'o','ో':'o','ౌ':'au',
+  '్':'',  // virama — suppress inherent vowel (handled inline)
+  'ఁ':'',
+}
+
+function transliterateTeluguWord(word: string): string {
+  const chars = [...word]
+  let out = ''
+  let i = 0
+
+  const peek = (offset = 1) => chars[i + offset] ?? ''
+
+  while (i < chars.length) {
+    const c = chars[i]
+
+    if (TE_CONSONANTS[c]) {
+      const base = TE_CONSONANTS[c]
+      const next = peek()
+      if (next === '్') {
+        // Virama: pure consonant cluster, no inherent vowel
+        out += base
+        i += 2
+      } else if (next in TE_VOWEL_SIGNS) {
+        // Explicit vowel matra
+        out += base + TE_VOWEL_SIGNS[next]
+        i += 2
+        // Anusvara/visarga after the matra
+        if (peek(0) === 'ం') { out += 'm'; i++ }
+        else if (peek(0) === 'ః') { out += 'h'; i++ }
+      } else {
+        // Inherent vowel 'a'
+        out += base + 'a'
+        i++
+        // Anusvara/visarga after inherent 'a'
+        if (peek(0) === 'ం') { out += 'm'; i++ }
+        else if (peek(0) === 'ః') { out += 'h'; i++ }
+      }
+    } else if (TE_VOWELS[c]) {
+      out += TE_VOWELS[c]
+      i++
+      if (peek(0) === 'ం') { out += 'm'; i++ }
+      else if (peek(0) === 'ః') { out += 'h'; i++ }
+    } else if (c === 'ం') {
+      out += 'm'; i++  // standalone anusvara
+    } else if (c === 'ః') {
+      out += 'h'; i++
+    } else if (c in TE_VOWEL_SIGNS) {
+      out += TE_VOWEL_SIGNS[c]; i++
+    } else if (/[a-zA-Z0-9\s.,!?'-]/.test(c)) {
+      out += c; i++
+    } else {
+      i++
+    }
+  }
+  return out.toLowerCase()
+}
+
 // ── Transliteration: Indian script → Roman (Tenglish / Hinglish / etc.) ─────
 // Maps short Whisper codes (te, hi, ta…) to Sarvam's xx-IN format
 const WHISPER_TO_SARVAM: Record<string, string> = {
@@ -778,6 +839,85 @@ Example: ["నేను", "విలన్", "హీరో"] → ["nenu", "villa
   return result
 }
 
+// Strip IAST diacritics → plain ASCII so captions read as normal English letters.
+function stripDiacritics(s: string): string {
+  return s.normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')  // remove all combining marks
+    .replace(/ḍ/g, 'd').replace(/ṭ/g, 't').replace(/ṇ/g, 'n')
+    .replace(/ṣ/g, 's').replace(/ś/g, 'sh').replace(/ñ/g, 'n')
+    .replace(/ṅ/g, 'ng').replace(/ḷ/g, 'l').replace(/ṃ/g, 'm').replace(/ḥ/g, 'h')
+    .replace(/Ḍ/g, 'D').replace(/Ṭ/g, 'T')
+}
+
+// Sarvam transliterate API — sends words as a sentence with numeric markers
+// so Sarvam gets full phonetic context, then splits back on the markers.
+async function transliterateWithSarvam(
+  entries: SarvamWord[],
+  languageCode: string,
+  apiKey: string,
+): Promise<(string | undefined)[]> {
+  const BATCH = 20   // words per sentence call
+  const result: (string | undefined)[] = new Array(entries.length).fill(undefined)
+
+  for (let i = 0; i < entries.length; i += BATCH) {
+    const batch = entries.slice(i, i + BATCH)
+
+    // Separate ASCII words from Indian-script words so ASCII passes through unchanged
+    const isAscii = (w: string) => !/[^\x00-\x7F]/.test(w.replace(/[.,!?।]/g, ''))
+
+    // Build a sentence with [N] markers between words so we can re-split after
+    // transliteration.  Sarvam leaves digit tokens like [0] intact.
+    const input = batch.map((e, j) => `[${j}] ${e.word.trim()}`).join(' ')
+
+    try {
+      const res = await fetchWithTimeout('https://api.sarvam.ai/transliterate', {
+        method: 'POST',
+        headers: { 'api-subscription-key': apiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input, source_language_code: languageCode, target_language_code: 'en-IN' }),
+      }, 20_000)
+      if (!res.ok) throw new Error(`${res.status}`)
+      const data = await res.json() as { transliterated_text?: string }
+      const text = data.transliterated_text ?? ''
+
+      // Split on [N] markers to recover per-word text
+      const segments = text.split(/\[\d+\]/).map(s => s.trim())
+      // segments[0] is before [0] (usually empty), segments[1] is after [0], etc.
+      for (let j = 0; j < batch.length; j++) {
+        const raw = segments[j + 1] ?? ''
+        const word = batch[j].word.trim()
+
+        // If the original was ASCII, keep it lowercased directly
+        const roman = isAscii(word)
+          ? word.toLowerCase().replace(/[.,!?।]/g, '').trim()
+          : stripDiacritics(raw).replace(/[.,!?।\[\]]/g, '').trim()
+
+        if (roman && /[a-zA-Z]/.test(roman)) result[i + j] = roman
+      }
+    } catch (err) {
+      // Fall back to per-word calls on failure
+      console.warn(`[transliterate] Sarvam sentence batch ${i} failed (${err}), falling back to per-word`)
+      await Promise.all(batch.map(async (entry, j) => {
+        const word = entry.word.trim()
+        if (isAscii(word)) { result[i + j] = word.toLowerCase().replace(/[.,!?।]/g, '') || undefined; return }
+        try {
+          const res2 = await fetchWithTimeout('https://api.sarvam.ai/transliterate', {
+            method: 'POST',
+            headers: { 'api-subscription-key': apiKey, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ input: word, source_language_code: languageCode, target_language_code: 'en-IN' }),
+          }, 12_000)
+          if (!res2.ok) return
+          const d2 = await res2.json() as { transliterated_text?: string }
+          const r2 = stripDiacritics((d2.transliterated_text ?? '').trim()).replace(/[.,!?।]/g, '').trim()
+          if (r2 && /[a-zA-Z]/.test(r2)) result[i + j] = r2
+        } catch { /* skip */ }
+      }))
+    }
+  }
+
+  console.log(`[transliterate] ${languageCode} → Roman via Sarvam for ${entries.length} word(s)`)
+  return result
+}
+
 async function transliterateToRoman(
   entries: SarvamWord[],
   languageCode: string,
@@ -791,6 +931,20 @@ async function transliterateToRoman(
   if (!resolvedLang) return entries.map(() => undefined)
   const lang = resolvedLang
 
-  if (!OPENAI_API_KEY) return entries.map(() => undefined)
-  return transliterateWithLLM(entries, lang, OPENAI_API_KEY)
+  // Prefer OpenAI GPT (most natural phrasing)
+  if (OPENAI_API_KEY) return transliterateWithLLM(entries, lang, OPENAI_API_KEY)
+
+  // For Telugu: use rule-based transliterator — deterministic, no API drift
+  if (lang === 'te-IN' || lang === 'te') {
+    return entries.map(e => {
+      const word = e.word.trim()
+      if (!word || !/[ఀ-౿]/.test(word)) return /[a-zA-Z]/.test(word) ? word.toLowerCase() : undefined
+      const roman = transliterateTeluguWord(word).replace(/[.,!?।]/g, '').trim()
+      return roman || undefined
+    })
+  }
+
+  // Other Indian languages: fall back to Sarvam transliterate API
+  if (sarvamApiKey) return transliterateWithSarvam(entries, lang, sarvamApiKey)
+  return entries.map(() => undefined)
 }

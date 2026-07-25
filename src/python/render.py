@@ -149,11 +149,13 @@ def main(video_path: str, spec_path: str, output_path: str,
 
     # Per-quality encode settings — maxrate kept conservative so output stays under 45MB
     # for typical 1–2 min clips (Supabase free plan has a 50MB object limit).
+    # Higher bitrates compensate for the double-encode (OpenCV decode → Python
+    # crop/resize → raw pipe → ffmpeg encode).  fast preset reduces blocking artefacts.
     _quality_settings = {
-        480:  dict(crf=23, maxrate="1.5M", bufsize="3M",  preset="medium", audio_br="128k"),
-        720:  dict(crf=21, maxrate="3M",   bufsize="6M",  preset="medium", audio_br="192k"),
-        1080: dict(crf=22, maxrate="5M",   bufsize="10M", preset="medium", audio_br="192k"),
-        2160: dict(crf=18, maxrate="8M",   bufsize="16M", preset="slow",   audio_br="256k"),
+        480:  dict(crf=20, maxrate="3M",   bufsize="6M",   preset="fast", audio_br="128k"),
+        720:  dict(crf=18, maxrate="6M",   bufsize="12M",  preset="fast", audio_br="192k"),
+        1080: dict(crf=18, maxrate="10M",  bufsize="20M",  preset="fast", audio_br="192k"),
+        2160: dict(crf=16, maxrate="20M",  bufsize="40M",  preset="fast", audio_br="256k"),
     }
     _qs = _quality_settings.get(out_w, _quality_settings[1080])
     segments: list     = sorted(spec["segments"], key=lambda s: s["sort_order"])
@@ -244,8 +246,12 @@ def main(video_path: str, spec_path: str, output_path: str,
 
             abs_frame = start_frame + frame_idx
             t_ms = int((abs_frame / fps) * 1000)
+            # Segment start/end and keyframe t_ms are stored relative to clip start;
+            # caption word timestamps are stored absolute — use rel_t_ms only for
+            # segment lookup and keyframe interpolation.
+            rel_t_ms = t_ms - clip_start_ms
 
-            seg = find_active_segment(segments, t_ms)
+            seg = find_active_segment(segments, rel_t_ms)
             canvas = canvas_black.copy()
 
             if seg:
@@ -255,7 +261,7 @@ def main(video_path: str, spec_path: str, output_path: str,
 
                 for box in boxes:
                     kf = box.get("box_keyframes", [])
-                    pos = get_box_position_at(t_ms, kf)
+                    pos = get_box_position_at(rel_t_ms, kf)
                     positions.append(pos)
 
                 # Determine source frames per slot
