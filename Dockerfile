@@ -15,7 +15,7 @@ RUN pip3 install --no-cache-dir -r /tmp/req.txt --break-system-packages
 
 # Node deps
 COPY package.json package-lock.json* ./
-RUN npm install -g pnpm && pnpm install --frozen-lockfile
+RUN npm install -g pnpm && pnpm install --no-frozen-lockfile
 
 # Source
 COPY . .
