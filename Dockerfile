@@ -15,11 +15,11 @@ RUN pip3 install --no-cache-dir -r /tmp/req.txt --break-system-packages
 
 # Node deps
 COPY package.json package-lock.json* ./
-RUN npm install -g pnpm && pnpm install --no-frozen-lockfile
+RUN npm install
 
 # Source
 COPY . .
-RUN pnpm build
+RUN npm run build
 
 # Download fonts so caption burn-in works without a volume mount
 RUN mkdir -p /app/src/python/fonts && \
