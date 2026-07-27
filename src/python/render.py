@@ -325,6 +325,28 @@ def main(video_path: str, spec_path: str, output_path: str,
     print(f"[render] Done — {processed} frames → {output_path}", flush=True)
 
 
+def _strip_letterbox(img: np.ndarray, threshold: int = 10) -> np.ndarray:
+    """Remove consecutive black rows from top/bottom of a frame (letterbox removal).
+    Only strips if bars are ≥5% of height and content is ≥50% of original height."""
+    if img.size == 0:
+        return img
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    row_max = np.max(gray, axis=1)
+    top = 0
+    while top < len(row_max) and row_max[top] <= threshold:
+        top += 1
+    bottom = len(row_max)
+    while bottom > top and row_max[bottom - 1] <= threshold:
+        bottom -= 1
+    content_h = bottom - top
+    min_bar = img.shape[0] * 0.05
+    if top < min_bar and bottom > img.shape[0] - min_bar:
+        return img  # no significant letterbox
+    if content_h < img.shape[0] * 0.5:
+        return img  # too little content — probably a black frame, leave alone
+    return img[top:bottom, :]
+
+
 def _cover_crop(src: np.ndarray, dst_w: int, dst_h: int) -> np.ndarray:
     """Scale src to cover (dst_w, dst_h) maintaining aspect ratio, center-crop excess."""
     src_h, src_w = src.shape[:2]
@@ -367,14 +389,14 @@ def compose_multi_source(
         result = canvas.copy()
         slot_h = out_h // 2
         for i, (pos, frame) in enumerate(zip(positions[:2], slot_frames[:2])):
-            crop = _crop(frame, pos)
+            crop = _strip_letterbox(_crop(frame, pos))
             result[i * slot_h : (i + 1) * slot_h, :] = _cover_crop(crop, out_w, slot_h)
         return result
     elif layout == "trio":
         result = canvas.copy()
         slot_h = out_h // 3
         for i, (pos, frame) in enumerate(zip(positions[:3], slot_frames[:3])):
-            crop = _crop(frame, pos)
+            crop = _strip_letterbox(_crop(frame, pos))
             result[i * slot_h : (i + 1) * slot_h, :] = _cover_crop(crop, out_w, slot_h)
         return result
     else:
