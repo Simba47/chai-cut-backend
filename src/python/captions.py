@@ -172,6 +172,11 @@ def burn_captions(
     out_w, out_h = pil_img.size
 
     full_text = " ".join(_word_display(w) for w in active_words)
+    if not full_text:
+        return frame_bgr
+    # NotoSansTelugu has poor Latin glyph coverage — switch to Roboto for romanized text
+    if full_text.isascii():
+        font = _find_font("roboto", size)
     bbox = draw.textbbox((0, 0), full_text, font=font)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
