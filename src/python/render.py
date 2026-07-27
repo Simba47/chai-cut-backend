@@ -351,11 +351,11 @@ def compose_multi_source(
         return cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
     elif layout == "split":
         result = canvas.copy()
-        slot_h = out_h // 2
+        slot_w = out_w // 2
         for i, (pos, frame) in enumerate(zip(positions[:2], slot_frames[:2])):
             crop = _crop(frame, pos)
-            resized = cv2.resize(crop, (out_w, slot_h), interpolation=cv2.INTER_LINEAR)
-            result[i * slot_h : (i + 1) * slot_h, :] = resized
+            resized = cv2.resize(crop, (slot_w, out_h), interpolation=cv2.INTER_LINEAR)
+            result[:, i * slot_w : (i + 1) * slot_w] = resized
         return result
     elif layout == "trio":
         result = canvas.copy()
