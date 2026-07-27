@@ -177,17 +177,49 @@ def burn_captions(
     # NotoSansTelugu has poor Latin glyph coverage — switch to Roboto for romanized text
     if full_text.isascii():
         font = _find_font("roboto", size)
-    bbox = draw.textbbox((0, 0), full_text, font=font)
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
 
-    x, y = _get_text_origin(position, out_w, out_h, text_w, text_h, position_y)
+    padding = 60
+    max_text_w = out_w - padding * 2
 
-    # Shadow
-    draw.text((x + 2, y + 2), full_text, font=font, fill=(0, 0, 0, 180))
-    draw.text((x, y), full_text, font=font, fill=text_color)
+    # Wrap text so it never overflows the frame width
+    lines = _wrap_text(draw, full_text, font, max_text_w)
+
+    line_bbox = draw.textbbox((0, 0), "Ay", font=font)
+    line_h = line_bbox[3] - line_bbox[1]
+    line_gap = int(line_h * 0.25)
+    total_h = line_h * len(lines) + line_gap * (len(lines) - 1)
+
+    # position_y = None means user never dragged; use 0.84 to match editor default
+    effective_position_y = position_y if position_y is not None else 0.84
+    block_top = int(effective_position_y * out_h) - total_h // 2
+    block_top = max(padding, min(out_h - total_h - padding, block_top))
+
+    for i, line in enumerate(lines):
+        lb = draw.textbbox((0, 0), line, font=font)
+        lw = lb[2] - lb[0]
+        x = max(padding, (out_w - lw) // 2)
+        y = block_top + i * (line_h + line_gap)
+        draw.text((x + 2, y + 2), line, font=font, fill=(0, 0, 0, 180))
+        draw.text((x, y), line, font=font, fill=text_color)
 
     return pil_to_cv2(np.array(pil_img))
+
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
+    words = text.split()
+    lines: list[str] = []
+    current: list[str] = []
+    for word in words:
+        test = ' '.join(current + [word])
+        w = draw.textbbox((0, 0), test, font=font)[2]
+        if w > max_width and current:
+            lines.append(' '.join(current))
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        lines.append(' '.join(current))
+    return lines or [text]
 
 
 def _get_visible_words(t_ms: int, words: list[dict], animation: str) -> list[dict]:
