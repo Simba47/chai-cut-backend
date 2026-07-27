@@ -103,21 +103,30 @@ SEARCH_DIRS = [
 ]
 
 
+_font_cache: dict[tuple, ImageFont.FreeTypeFont] = {}
+
 def _find_font(font_id: str, size: int) -> ImageFont.FreeTypeFont:
+    key = (font_id, size)
+    if key in _font_cache:
+        return _font_cache[key]
     filename = FONT_FILES.get(font_id, FONT_FILES["roboto"])
     for directory in SEARCH_DIRS:
         if directory is None:
             continue
         for path in directory.rglob(filename):
             try:
-                return ImageFont.truetype(str(path), size)
+                font = ImageFont.truetype(str(path), size)
+                _font_cache[key] = font
+                return font
             except Exception:
                 pass
     # Fallback: PIL default (Latin only, safe across Pillow versions)
     try:
-        return ImageFont.load_default(size=size)
+        font = ImageFont.load_default(size=size)
     except TypeError:
-        return ImageFont.load_default()
+        font = ImageFont.load_default()
+    _font_cache[key] = font
+    return font
 
 
 def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:

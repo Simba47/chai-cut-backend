@@ -104,7 +104,7 @@ def burn_image_overlays(
         y2 = int((o["y"] + o["h"]) * out_h)
         dw, dh = max(1, x2 - x1), max(1, y2 - y1)
 
-        resized = cv2.resize(img, (dw, dh), interpolation=cv2.INTER_LANCZOS4)
+        resized = cv2.resize(img, (dw, dh), interpolation=cv2.INTER_LINEAR)
 
         if resized.shape[2] == 4:
             # Alpha blending
@@ -280,9 +280,9 @@ def main(video_path: str, spec_path: str, output_path: str,
                 if positions:
                     canvas = compose_multi_source(layout, canvas, slot_frames, positions, out_w, out_h)
                 else:
-                    canvas = cv2.resize(primary_frame, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+                    canvas = cv2.resize(primary_frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
             else:
-                canvas = cv2.resize(primary_frame, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+                canvas = cv2.resize(primary_frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
             if brightness != 100 or contrast != 100 or saturation != 100:
                 canvas = apply_filters(canvas, brightness, contrast, saturation)
@@ -347,13 +347,13 @@ def compose_multi_source(
     if layout in ("vertical", "spotlight", "centered", "horizontal"):
         frame = slot_frames[0] if slot_frames else canvas
         crop = _crop(frame, positions[0])
-        return cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+        return cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
     elif layout == "split":
         result = canvas.copy()
         slot_h = out_h // 2
         for i, (pos, frame) in enumerate(zip(positions[:2], slot_frames[:2])):
             crop = _crop(frame, pos)
-            resized = cv2.resize(crop, (out_w, slot_h), interpolation=cv2.INTER_LANCZOS4)
+            resized = cv2.resize(crop, (out_w, slot_h), interpolation=cv2.INTER_LINEAR)
             result[i * slot_h : (i + 1) * slot_h, :] = resized
         return result
     elif layout == "trio":
@@ -364,15 +364,15 @@ def compose_multi_source(
         for i, (pos, frame) in enumerate(zip(positions[:3], slot_frames[:3])):
             crop = _crop(frame, pos)
             if i == 0:
-                result[:top_h, :] = cv2.resize(crop, (out_w, top_h), interpolation=cv2.INTER_LANCZOS4)
+                result[:top_h, :] = cv2.resize(crop, (out_w, top_h), interpolation=cv2.INTER_LINEAR)
             else:
-                resized = cv2.resize(crop, (half_w, bot_h), interpolation=cv2.INTER_LANCZOS4)
+                resized = cv2.resize(crop, (half_w, bot_h), interpolation=cv2.INTER_LINEAR)
                 result[top_h:, (i - 1) * half_w : i * half_w] = resized
         return result
     else:
         if slot_frames:
             crop = _crop(slot_frames[0], positions[0])
-            return cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+            return cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
         return canvas
 
 
