@@ -228,8 +228,8 @@ def _get_text_origin(
 ) -> tuple[int, int]:
     padding = 60
     if position_y is not None:
-        # position_y is fraction 0-1 representing bottom edge of text block
-        y = int(position_y * frame_h) - text_h
+        # position_y is fraction 0-1 representing the CENTER of the text block (matches editor drag handle)
+        y = int(position_y * frame_h) - text_h // 2
         y = max(padding, min(frame_h - text_h - padding, y))
     elif "bottom" in position:
         y = frame_h - text_h - padding
