@@ -61,7 +61,8 @@ export async function handleRenderJob(job: Job) {
     }
 
     await writeFile(specPath, JSON.stringify(renderSpec, null, 2))
-    const pythonScript = join(__dirname, '../python/render.py')
+    // __dirname is dist/jobs/ at runtime; Python files live in src/python/ (not copied by tsc)
+    const pythonScript = join(__dirname, '../../src/python/render.py')
     await runPython(pythonScript, [
       '--video', videoLocalPath, '--spec', specPath, '--output', outputPath,
       '--secondary-videos', JSON.stringify(secondaryVideos),
