@@ -21,16 +21,7 @@ RUN npm install
 COPY . .
 RUN npm run build
 
-# Download fonts so caption burn-in works without a volume mount
-RUN mkdir -p /app/src/python/fonts && \
-    curl -fsSL -o /app/src/python/fonts/NotoSansTelugu-Regular.ttf \
-      "https://github.com/notofonts/notofonts.github.io/raw/main/fonts/NotoSansTelugu/unhinted/ttf/NotoSansTelugu-Regular.ttf" && \
-    curl -fsSL -o /app/src/python/fonts/NotoSansDevanagari-Regular.ttf \
-      "https://github.com/notofonts/notofonts.github.io/raw/main/fonts/NotoSansDevanagari/unhinted/ttf/NotoSansDevanagari-Regular.ttf" && \
-    curl -fsSL -o /app/src/python/fonts/Roboto-Regular.ttf \
-      "https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Regular.ttf" && \
-    curl -fsSL -o /app/src/python/fonts/Montserrat-Bold.ttf \
-      "https://github.com/JulietaUla/Montserrat/raw/master/fonts/ttf/Montserrat-Bold.ttf"
+# Fonts are committed to src/python/fonts/ — no download needed.
 
 ENV NODE_ENV=production
 
