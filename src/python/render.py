@@ -372,15 +372,10 @@ def compose_multi_source(
         return result
     elif layout == "trio":
         result = canvas.copy()
-        top_h = int(out_h * 0.55)
-        bot_h = out_h - top_h
-        half_w = out_w // 2
+        slot_h = out_h // 3
         for i, (pos, frame) in enumerate(zip(positions[:3], slot_frames[:3])):
             crop = _crop(frame, pos)
-            if i == 0:
-                result[:top_h, :] = _cover_crop(crop, out_w, top_h)
-            else:
-                result[top_h:, (i - 1) * half_w : i * half_w] = _cover_crop(crop, half_w, bot_h)
+            result[i * slot_h : (i + 1) * slot_h, :] = _cover_crop(crop, out_w, slot_h)
         return result
     else:
         if slot_frames:
