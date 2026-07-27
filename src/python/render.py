@@ -281,9 +281,9 @@ def main(video_path: str, spec_path: str, output_path: str,
                 if positions:
                     canvas = compose_multi_source(layout, canvas, slot_frames, positions, out_w, out_h)
                 else:
-                    canvas = cv2.resize(primary_frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+                    canvas = _cover_crop(primary_frame, out_w, out_h)
             else:
-                canvas = cv2.resize(primary_frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+                canvas = _cover_crop(primary_frame, out_w, out_h)
 
             if brightness != 100 or contrast != 100 or saturation != 100:
                 canvas = apply_filters(canvas, brightness, contrast, saturation)
@@ -325,6 +325,20 @@ def main(video_path: str, spec_path: str, output_path: str,
     print(f"[render] Done — {processed} frames → {output_path}", flush=True)
 
 
+def _cover_crop(src: np.ndarray, dst_w: int, dst_h: int) -> np.ndarray:
+    """Scale src to cover (dst_w, dst_h) maintaining aspect ratio, center-crop excess."""
+    src_h, src_w = src.shape[:2]
+    if src_w == 0 or src_h == 0:
+        return np.zeros((dst_h, dst_w, 3), dtype=np.uint8)
+    scale = max(dst_w / src_w, dst_h / src_h)
+    sw = max(int(src_w * scale), 1)
+    sh = max(int(src_h * scale), 1)
+    scaled = cv2.resize(src, (sw, sh), interpolation=cv2.INTER_LINEAR)
+    x0 = (sw - dst_w) // 2
+    y0 = (sh - dst_h) // 2
+    return scaled[y0:y0 + dst_h, x0:x0 + dst_w]
+
+
 def _crop(frame: np.ndarray, pos: dict) -> np.ndarray:
     h, w = frame.shape[:2]
     x1 = max(0, int(pos["x"] * w))
@@ -348,14 +362,13 @@ def compose_multi_source(
     if layout in ("vertical", "spotlight", "centered", "horizontal"):
         frame = slot_frames[0] if slot_frames else canvas
         crop = _crop(frame, positions[0])
-        return cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+        return _cover_crop(crop, out_w, out_h)
     elif layout == "split":
         result = canvas.copy()
-        slot_w = out_w // 2
+        slot_h = out_h // 2
         for i, (pos, frame) in enumerate(zip(positions[:2], slot_frames[:2])):
             crop = _crop(frame, pos)
-            resized = cv2.resize(crop, (slot_w, out_h), interpolation=cv2.INTER_LINEAR)
-            result[:, i * slot_w : (i + 1) * slot_w] = resized
+            result[i * slot_h : (i + 1) * slot_h, :] = _cover_crop(crop, out_w, slot_h)
         return result
     elif layout == "trio":
         result = canvas.copy()
@@ -365,15 +378,13 @@ def compose_multi_source(
         for i, (pos, frame) in enumerate(zip(positions[:3], slot_frames[:3])):
             crop = _crop(frame, pos)
             if i == 0:
-                result[:top_h, :] = cv2.resize(crop, (out_w, top_h), interpolation=cv2.INTER_LINEAR)
+                result[:top_h, :] = _cover_crop(crop, out_w, top_h)
             else:
-                resized = cv2.resize(crop, (half_w, bot_h), interpolation=cv2.INTER_LINEAR)
-                result[top_h:, (i - 1) * half_w : i * half_w] = resized
+                result[top_h:, (i - 1) * half_w : i * half_w] = _cover_crop(crop, half_w, bot_h)
         return result
     else:
         if slot_frames:
-            crop = _crop(slot_frames[0], positions[0])
-            return cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+            return _cover_crop(_crop(slot_frames[0], positions[0]), out_w, out_h)
         return canvas
 
 
