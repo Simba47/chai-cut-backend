@@ -22,9 +22,9 @@ async function r2Download(key: string): Promise<Buffer> {
 
 export async function handleRenderJob(job: Job) {
   const payload = job.payload as unknown as RenderJobPayload
-  const { clip_id, video_storage_path, quality = '1080p' } = payload
+  const { clip_id, video_storage_path } = payload
 
-  const renderSpec = await buildRenderSpec(clip_id, video_storage_path, quality)
+  const renderSpec = await buildRenderSpec(clip_id, video_storage_path, '2160p')
   const tmp = await mkdtemp(join(tmpdir(), 'render-'))
   const videoLocalPath = join(tmp, 'source.mp4')
   const outputPath = join(tmp, 'output.mp4')
@@ -89,7 +89,7 @@ const QUALITY_DIMS: Record<string, { w: number; h: number }> = {
   '1080p': { w: 1080, h: 1920 }, '2160p': { w: 2160, h: 3840 },
 }
 
-async function buildRenderSpec(clipId: string, videoStoragePath: string, quality = '1080p') {
+async function buildRenderSpec(clipId: string, videoStoragePath: string, quality = '2160p') {
   const [clip] = await db`SELECT * FROM clips WHERE id = ${clipId}`
 
   const segments = await db`
