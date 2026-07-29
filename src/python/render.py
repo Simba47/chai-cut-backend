@@ -192,7 +192,7 @@ def main(video_path: str, spec_path: str, output_path: str,
     _tp = subprocess.run(
         [
             "ffmpeg", "-y",
-            "-fflags", "+genpts+discardcorrupt",
+            "-fflags", "+genpts",
             "-i", video_path,
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "17",
             "-g", "1", "-bf", "0",
