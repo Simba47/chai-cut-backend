@@ -181,10 +181,25 @@ def main(video_path: str, spec_path: str, output_path: str,
     speech_ranges = extract_speech_ranges(clip_words)
     caption_style = caption_styles[0] if caption_styles else {}
 
+    # Transcode source to intra-frame MJPEG so OpenCV never hits H264
+    # reference-frame errors (mmco: unref short failure) that corrupt P-frames.
+    _tmp_src = tempfile.NamedTemporaryFile(suffix=".avi", delete=False)
+    _tmp_src.close()
+    decode_path = _tmp_src.name
+    print("[render] Transcoding source to intra-frame…", flush=True)
+    _tp = subprocess.run(
+        ["ffmpeg", "-y", "-i", video_path, "-c:v", "mjpeg", "-q:v", "2", "-an", decode_path],
+        capture_output=True,
+    )
+    if _tp.returncode != 0:
+        Path(decode_path).unlink(missing_ok=True)
+        print("[render] Transcode stderr:", _tp.stderr.decode(), flush=True)
+        raise RuntimeError("Source video transcode failed")
+
     # Open primary video capture
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(decode_path)
     if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video: {video_path}")
+        raise RuntimeError(f"Cannot open video: {decode_path}")
 
     fps          = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -319,6 +334,11 @@ def main(video_path: str, spec_path: str, output_path: str,
 
     try:
         os.unlink(tmp_audio.name)
+    except Exception:
+        pass
+
+    try:
+        Path(decode_path).unlink(missing_ok=True)
     except Exception:
         pass
 
