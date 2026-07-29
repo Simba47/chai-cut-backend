@@ -181,14 +181,23 @@ def main(video_path: str, spec_path: str, output_path: str,
     speech_ranges = extract_speech_ranges(clip_words)
     caption_style = caption_styles[0] if caption_styles else {}
 
-    # Transcode source to intra-frame MJPEG so OpenCV never hits H264
-    # reference-frame errors (mmco: unref short failure) that corrupt P-frames.
-    _tmp_src = tempfile.NamedTemporaryFile(suffix=".avi", delete=False)
+    # Transcode source to all-intra H264 (keyint=1, no B-frames).
+    # -fflags +discardcorrupt: drop corrupt packets before they reach the decoder,
+    # preventing mmco/reference-frame errors from producing stripe artifacts.
+    # All-intra output means every frame is independently decodable by OpenCV.
+    _tmp_src = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     _tmp_src.close()
     decode_path = _tmp_src.name
-    print("[render] Transcoding source to intra-frame…", flush=True)
+    print("[render] Transcoding source to all-intra for clean decode…", flush=True)
     _tp = subprocess.run(
-        ["ffmpeg", "-y", "-i", video_path, "-c:v", "mjpeg", "-q:v", "2", "-an", decode_path],
+        [
+            "ffmpeg", "-y",
+            "-fflags", "+genpts+discardcorrupt",
+            "-i", video_path,
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "17",
+            "-g", "1", "-bf", "0",
+            "-an", decode_path,
+        ],
         capture_output=True,
     )
     if _tp.returncode != 0:
