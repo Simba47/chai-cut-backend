@@ -181,39 +181,36 @@ def main(video_path: str, spec_path: str, output_path: str,
     speech_ranges = extract_speech_ranges(clip_words)
     caption_style = caption_styles[0] if caption_styles else {}
 
-    # Transcode source to all-intra H264 (keyint=1, no B-frames).
-    # -fflags +discardcorrupt: drop corrupt packets before they reach the decoder,
-    # preventing mmco/reference-frame errors from producing stripe artifacts.
-    # All-intra output means every frame is independently decodable by OpenCV.
-    _tmp_src = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    _tmp_src.close()
-    decode_path = _tmp_src.name
-    print("[render] Transcoding source to all-intra for clean decode…", flush=True)
-    _tp = subprocess.run(
+    # Probe source metadata without decoding any frames
+    _probe = cv2.VideoCapture(video_path)
+    if not _probe.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+    fps          = _probe.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(_probe.get(cv2.CAP_PROP_FRAME_COUNT))
+    src_w        = int(_probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h        = int(_probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    _probe.release()
+
+    # Pipe clip frames directly from ffmpeg instead of using OpenCV to decode.
+    # ffmpeg's H264 decoder conceals mmco/reference-frame errors with freeze-frame
+    # substitution; OpenCV's decoder produces teal/green stripe artifacts instead.
+    # -ss before -i: fast keyframe seek; -t: exact duration; fps filter: CFR output.
+    clip_duration_s = (clip_end_ms - clip_start_ms) / 1000.0
+    ffmpeg_src = subprocess.Popen(
         [
             "ffmpeg", "-y",
-            "-fflags", "+genpts",
+            "-ss", f"{clip_start_ms / 1000.0:.3f}",
             "-i", video_path,
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "17",
-            "-g", "1", "-bf", "0",
-            "-an", decode_path,
+            "-t", f"{clip_duration_s:.3f}",
+            "-vf", f"fps={fps:.6f}",
+            "-pix_fmt", "bgr24",
+            "-f", "rawvideo",
+            "pipe:1",
         ],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
     )
-    if _tp.returncode != 0:
-        Path(decode_path).unlink(missing_ok=True)
-        print("[render] Transcode stderr:", _tp.stderr.decode(), flush=True)
-        raise RuntimeError("Source video transcode failed")
-
-    # Open primary video capture
-    cap = cv2.VideoCapture(decode_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video: {decode_path}")
-
-    fps          = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    src_w        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    src_h        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    _frame_bytes = src_w * src_h * 3
 
     print(f"[render] Source: {src_w}x{src_h} @ {fps:.2f}fps, {total_frames} frames", flush=True)
     print(f"[render] Clip: {clip_start_ms}ms – {clip_end_ms}ms → {out_w}x{out_h}", flush=True)
@@ -229,9 +226,7 @@ def main(video_path: str, spec_path: str, output_path: str,
 
     image_cache: dict[str, np.ndarray | None] = {}
 
-    start_frame = int((clip_start_ms / 1000.0) * fps)
-    end_frame   = int((clip_end_ms   / 1000.0) * fps)
-    clip_frames = end_frame - start_frame
+    clip_frames = int(clip_duration_s * fps) + 2  # +2 guards against off-by-one at end
 
     import os
     tmp_audio = tempfile.NamedTemporaryFile(suffix=".aac", delete=False)
@@ -260,21 +255,24 @@ def main(video_path: str, spec_path: str, output_path: str,
     ffmpeg = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     canvas_black = np.zeros((out_h, out_w, 3), dtype=np.uint8)
 
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     processed = 0
 
     try:
         for frame_idx in range(clip_frames):
-            ret, primary_frame = cap.read()
-            if not ret:
+            raw = b""
+            while len(raw) < _frame_bytes:
+                chunk = ffmpeg_src.stdout.read(_frame_bytes - len(raw))
+                if not chunk:
+                    break
+                raw += chunk
+            if len(raw) < _frame_bytes:
                 break
+            primary_frame = np.frombuffer(raw, dtype=np.uint8).reshape(src_h, src_w, 3).copy()
 
-            abs_frame = start_frame + frame_idx
-            t_ms = int((abs_frame / fps) * 1000)
-            # Segment start/end and keyframe t_ms are stored relative to clip start;
-            # caption word timestamps are stored absolute — use rel_t_ms only for
-            # segment lookup and keyframe interpolation.
-            rel_t_ms = t_ms - clip_start_ms
+            # rel_t_ms: clip-relative (0 = clip start) — used for segment/keyframe lookup
+            # t_ms: absolute — used for caption word matching
+            rel_t_ms = int((frame_idx / fps) * 1000)
+            t_ms     = clip_start_ms + rel_t_ms
 
             seg = find_active_segment(segments, rel_t_ms)
             canvas = canvas_black.copy()
@@ -295,7 +293,7 @@ def main(video_path: str, spec_path: str, output_path: str,
                     src_vid_id = box.get("source_video_id")
                     if src_vid_id and src_vid_id in secondary_caps:
                         src_offset = box.get("source_offset_ms", 0)
-                        elapsed = t_ms - seg["start_ms"]
+                        elapsed = rel_t_ms - seg["start_ms"]
                         src_t_ms = src_offset + elapsed
                         frame = get_frame_from_cap(secondary_caps[src_vid_id], src_t_ms)
                         slot_frames.append(frame if frame is not None else primary_frame)
@@ -330,7 +328,9 @@ def main(video_path: str, spec_path: str, output_path: str,
                 print(f"[render] {processed}/{clip_frames} frames ({pct:.1f}%)", flush=True)
 
     finally:
-        cap.release()
+        if ffmpeg_src.stdout:
+            ffmpeg_src.stdout.close()
+        ffmpeg_src.wait()
         for c in secondary_caps.values():
             c.release()
         if ffmpeg.stdin:
@@ -343,11 +343,6 @@ def main(video_path: str, spec_path: str, output_path: str,
 
     try:
         os.unlink(tmp_audio.name)
-    except Exception:
-        pass
-
-    try:
-        Path(decode_path).unlink(missing_ok=True)
     except Exception:
         pass
 
