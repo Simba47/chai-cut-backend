@@ -361,6 +361,22 @@ def _cover_crop(src: np.ndarray, dst_w: int, dst_h: int) -> np.ndarray:
     return scaled[y0:y0 + dst_h, x0:x0 + dst_w]
 
 
+def _fit_letterbox(src: np.ndarray, dst_w: int, dst_h: int) -> np.ndarray:
+    """Scale src to fit inside (dst_w, dst_h) preserving AR, black-pad the remainder."""
+    src_h, src_w = src.shape[:2]
+    if src_w == 0 or src_h == 0:
+        return np.zeros((dst_h, dst_w, 3), dtype=np.uint8)
+    scale = min(dst_w / src_w, dst_h / src_h)
+    sw = max(int(src_w * scale), 1)
+    sh = max(int(src_h * scale), 1)
+    scaled = cv2.resize(src, (sw, sh), interpolation=cv2.INTER_LINEAR)
+    result = np.zeros((dst_h, dst_w, 3), dtype=np.uint8)
+    x0 = (dst_w - sw) // 2
+    y0 = (dst_h - sh) // 2
+    result[y0:y0 + sh, x0:x0 + sw] = scaled
+    return result
+
+
 def _crop(frame: np.ndarray, pos: dict) -> np.ndarray:
     h, w = frame.shape[:2]
     x1 = max(0, int(pos["x"] * w))
@@ -381,7 +397,11 @@ def compose_multi_source(
     out_h: int,
 ) -> np.ndarray:
     """Like layouts.compose but each slot can have its own source frame."""
-    if layout in ("vertical", "spotlight", "centered", "horizontal"):
+    if layout == "horizontal":
+        frame = slot_frames[0] if slot_frames else canvas
+        crop = _crop(frame, positions[0])
+        return _fit_letterbox(crop, out_w, out_h)
+    elif layout in ("vertical", "spotlight", "centered"):
         frame = slot_frames[0] if slot_frames else canvas
         crop = _crop(frame, positions[0])
         return _cover_crop(crop, out_w, out_h)
