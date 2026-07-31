@@ -1,3 +1,3 @@
-opencv-python-headless>=4.9.0
-numpy>=1.26.0
-Pillow>=10.3.0
+# No Python packages needed — render pipeline is now FFmpeg-native.
+# audio.py, interpolation.py use only stdlib.
+# captions.py / layouts.py are retained as dead code but not called at runtime.
