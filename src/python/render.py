@@ -391,7 +391,7 @@ def main(
                 scale = _scale_fit(dst_w, dst_h) if fit else _scale_cover(dst_w, dst_h)
                 fp.append(
                     f"{src}trim=start={ts:.3f}:end={te:.3f},setpts=PTS-STARTPTS,"
-                    f"{crop},{scale}{lbl}"
+                    f"{crop},{scale},setsar=1{lbl}"
                 )
 
             if layout in ("vertical", "spotlight", "centered"):
