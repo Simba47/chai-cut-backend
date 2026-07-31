@@ -200,10 +200,10 @@ def _step_expr(kf_list: list[dict], attr: str, seg_start_ms: int) -> str:
 
 def _crop_filter(box: dict | None, seg_start_ms: int) -> str:
     kf = box.get("box_keyframes", []) if box else []
-    w = f"max(2,{_step_expr(kf, 'w', seg_start_ms)})"
-    h = f"max(2,{_step_expr(kf, 'h', seg_start_ms)})"
-    x = f"min(iw-2,{_step_expr(kf, 'x', seg_start_ms)})"
-    y = f"min(ih-2,{_step_expr(kf, 'y', seg_start_ms)})"
+    w = _esc_expr(f"max(2,{_step_expr(kf, 'w', seg_start_ms)})")
+    h = _esc_expr(f"max(2,{_step_expr(kf, 'h', seg_start_ms)})")
+    x = _esc_expr(f"min(iw-2,{_step_expr(kf, 'x', seg_start_ms)})")
+    y = _esc_expr(f"min(ih-2,{_step_expr(kf, 'y', seg_start_ms)})")
     return f"crop=w={w}:h={h}:x={x}:y={y}"
 
 
@@ -225,6 +225,16 @@ def _scale_fit(w: int, h: int) -> str:
 
 def _escape_drawtext(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:").replace("%", "\\%")
+
+
+def _esc_expr(s: str) -> str:
+    """Escape an expression for FFmpeg filter_complex option values.
+
+    The filter_complex parser splits on ',' to find filter chain boundaries.
+    It does NOT track parenthesis depth, so commas inside if()/max()/min()/lt()
+    must be backslash-escaped so they aren't mistaken for filter separators.
+    """
+    return s.replace("\\", "\\\\").replace(",", "\\,")
 
 
 # ── Main compositor ────────────────────────────────────────────────────────────
