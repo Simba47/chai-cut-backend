@@ -404,14 +404,11 @@ def main(
                 trim_slot(1, out_w, slot_h, False, f"[sp{si}b]")
                 fp.append(f"[sp{si}a][sp{si}b]vstack=inputs=2{out_lbl}")
             elif layout == "trio":
-                top_h  = int(out_h * 0.55)
-                bot_h  = out_h - top_h
-                half_w = out_w // 2
-                trim_slot(0, out_w,  top_h, False, f"[tr{si}a]")
-                trim_slot(1, half_w, bot_h, False, f"[tr{si}b]")
-                trim_slot(2, half_w, bot_h, False, f"[tr{si}c]")
-                fp.append(f"[tr{si}b][tr{si}c]hstack=inputs=2[tr{si}bot]")
-                fp.append(f"[tr{si}a][tr{si}bot]vstack=inputs=2{out_lbl}")
+                slot_h = out_h // 3
+                trim_slot(0, out_w, slot_h, False, f"[tr{si}a]")
+                trim_slot(1, out_w, slot_h, False, f"[tr{si}b]")
+                trim_slot(2, out_w, slot_h, False, f"[tr{si}c]")
+                fp.append(f"[tr{si}a][tr{si}b][tr{si}c]vstack=inputs=3{out_lbl}")
             else:
                 trim_slot(0, out_w, out_h, False, out_lbl)
 
