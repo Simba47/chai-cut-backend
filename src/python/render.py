@@ -87,16 +87,33 @@ def _is_sentence_end(word: str) -> bool:
     return bool(stripped) and stripped[-1] in ".!?।"
 
 
+_PHRASE_GAP_MS   = 300  # silence gap longer than this → new subtitle line
+_MAX_PHRASE_WORDS = 5   # also break at this many words even with no gap
+
+
 def _group_sentences(words: list[dict]) -> list[list[dict]]:
+    """Split words into subtitle phrases using gap + word-count, not punctuation.
+
+    Punctuation-only splitting silently merges entire clips into one event when
+    the transcript has no .!? marks (common for Telugu lyrics / dubbed dialogue).
+    Gap-based splitting mirrors the editor preview (CAPTION_GAP_MS / MAX_WORDS).
+    """
     sentences: list[list[dict]] = []
     current: list[dict] = []
-    for w in words:
+    for i, w in enumerate(words):
         current.append(w)
-        if _is_sentence_end(w.get("word", "")):
+        is_last = i == len(words) - 1
+        if is_last:
+            sentences.append(current)
+            break
+        gap = words[i + 1]["start_ms"] - w["end_ms"]
+        if (
+            _is_sentence_end(w.get("word", ""))
+            or gap > _PHRASE_GAP_MS
+            or len(current) >= _MAX_PHRASE_WORDS
+        ):
             sentences.append(current)
             current = []
-    if current:
-        sentences.append(current)
     return sentences
 
 
@@ -245,6 +262,7 @@ def main(
     output_path: str,
     secondary_videos: dict[str, str] | None = None,
     overlay_images: dict[str, str] | None = None,
+    watermark: bool = False,
 ) -> None:
     secondary_videos = secondary_videos or {}
     overlay_images   = overlay_images   or {}
@@ -483,6 +501,19 @@ def main(
             )
             cur = olbl
 
+        # ── Watermark (free plan only) ─────────────────────────────────────────
+        if watermark:
+            wm_font = _find_font_path("roboto")
+            wm_text = _escape_drawtext("Chai Cut")
+            if wm_font:
+                fp.append(
+                    f"{cur}drawtext=fontfile={wm_font}:text='{wm_text}'"
+                    f":fontsize={max(24, out_w // 36)}:fontcolor=white@0.55"
+                    f":x=w-tw-{max(16, out_w // 60)}:y=h-th-{max(16, out_h // 120)}"
+                    f":shadowx=1:shadowy=1:shadowcolor=black@0.5[vwm]"
+                )
+                cur = "[vwm]"
+
         # Rename final label to [vout]
         fp.append(f"{cur}copy[vout]")
 
@@ -523,9 +554,11 @@ if __name__ == "__main__":
     parser.add_argument("--output",           required=True)
     parser.add_argument("--secondary-videos", default="{}", help="JSON: video_id → local_path")
     parser.add_argument("--overlay-images",   default="{}", help="JSON: storage_path → local_path")
+    parser.add_argument("--watermark",        action="store_true", help="Burn in Chai Cut watermark")
     args = parser.parse_args()
     main(
         args.video, args.spec, args.output,
         secondary_videos=json.loads(args.secondary_videos),
         overlay_images=json.loads(args.overlay_images),
+        watermark=args.watermark,
     )
