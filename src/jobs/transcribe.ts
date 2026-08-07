@@ -467,7 +467,8 @@ async function transcribeAudio(audioPath: string, videoId?: string, languageCode
     const [sarvam, groqResult] = await Promise.all([
       callSarvamChunk(buf, sarvamKey!, sarvamLang),
       groqKey
-        ? callWhisperChunk(buf, groqKey, groqLang ?? '', 'https://api.groq.com/openai/v1', 'whisper-large-v3').catch(() => null)
+        ? withRetry(() => callWhisperChunk(buf, groqKey, groqLang ?? '', 'https://api.groq.com/openai/v1', 'whisper-large-v3'), 3, 1000)
+            .catch(err => { console.error(`[groq] all 3 retries failed, falling back to Sarvam timing: ${err instanceof Error ? err.message : err}`); return null })
         : Promise.resolve(null),
     ])
 
@@ -566,6 +567,20 @@ function toWhisperLang(code: string): string {
   return LANG_TO_WHISPER[code.toLowerCase()] ?? code.split('-')[0].toLowerCase()
 }
 
+async function withRetry<T>(fn: () => Promise<T>, retries = 3, baseDelayMs = 1000): Promise<T> {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn()
+    } catch (err) {
+      if (attempt === retries) throw err
+      const delay = baseDelayMs * Math.pow(2, attempt - 1)
+      console.warn(`[groq] attempt ${attempt} failed, retrying in ${delay}ms: ${err instanceof Error ? err.message : err}`)
+      await new Promise(resolve => setTimeout(resolve, delay))
+    }
+  }
+  throw new Error('unreachable')
+}
+
 async function callWhisperChunk(
   buf: Buffer, apiKey: string, languageCode?: string,
   baseUrl = 'https://api.openai.com/v1', model = 'whisper-1',
@@ -624,45 +639,37 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 
 async function callSarvamChunk(buf: Buffer, apiKey: string, languageCode?: string): Promise<SarvamResponse> {
   const TIMEOUT_MS = 90_000
-  const MAX_TRIES = 2
 
-  let lastErr: Error = new Error('unreachable')
-  for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+  return withRetry(async () => {
     const formData = new FormData()
     formData.append('file', new Blob([buf], { type: 'audio/wav' }), 'audio.wav')
     formData.append('model', 'saaras:v3')
     formData.append('language_code', languageCode ?? 'unknown')
     formData.append('with_timestamps', 'true')
 
-    try {
-      const res = await fetchWithTimeout('https://api.sarvam.ai/speech-to-text', {
-        method: 'POST',
-        headers: { 'api-subscription-key': apiKey },
-        body: formData,
-      }, TIMEOUT_MS)
+    const res = await fetchWithTimeout('https://api.sarvam.ai/speech-to-text', {
+      method: 'POST',
+      headers: { 'api-subscription-key': apiKey },
+      body: formData,
+    }, TIMEOUT_MS)
 
-      if (!res.ok) throw new Error(`Sarvam API ${res.status}: ${await res.text()}`)
+    if (!res.ok) throw new Error(`Sarvam API ${res.status}: ${await res.text()}`)
 
-      const raw = await res.json() as SarvamRawResponse
-      const ts = raw.timestamps
-      const words: SarvamWord[] = ts?.words?.map((w, i) => ({
-        word: w,
-        start: ts.start_time_seconds[i] ?? 0,
-        end: ts.end_time_seconds[i] ?? 0,
-      })) ?? []
+    const raw = await res.json() as SarvamRawResponse
+    const ts = raw.timestamps
+    const words: SarvamWord[] = ts?.words?.map((w, i) => ({
+      word: w,
+      start: ts.start_time_seconds[i] ?? 0,
+      end: ts.end_time_seconds[i] ?? 0,
+    })) ?? []
 
-      if (words.length > 0) {
-        const sample = words.slice(0, 3).map(w => `"${w.word}"(${w.start.toFixed(2)}-${w.end.toFixed(2)}s)`).join(', ')
-        console.log(`[sarvam] ${words.length} tokens in ${(words[words.length-1]?.end ?? 0).toFixed(1)}s. Sample: ${sample}`)
-      }
-
-      return { language_code: raw.language_code, transcript: raw.transcript, words }
-    } catch (err) {
-      lastErr = err instanceof Error ? err : new Error(String(err))
-      if (attempt < MAX_TRIES) console.warn(`[sarvam] attempt ${attempt} failed, retrying: ${lastErr.message}`)
+    if (words.length > 0) {
+      const sample = words.slice(0, 3).map(w => `"${w.word}"(${w.start.toFixed(2)}-${w.end.toFixed(2)}s)`).join(', ')
+      console.log(`[sarvam] ${words.length} tokens in ${(words[words.length-1]?.end ?? 0).toFixed(1)}s. Sample: ${sample}`)
     }
-  }
-  throw lastErr
+
+    return { language_code: raw.language_code, transcript: raw.transcript, words }
+  }, 3, 1000)
 }
 
 // ── Rule-based Telugu → Roman transliterator ──────────────────────────────────

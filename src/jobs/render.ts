@@ -63,11 +63,13 @@ export async function handleRenderJob(job: Job) {
     await writeFile(specPath, JSON.stringify(renderSpec, null, 2))
     // __dirname is dist/jobs/ at runtime; Python files live in src/python/ (not copied by tsc)
     const pythonScript = join(__dirname, '../../src/python/render.py')
-    await runPython(pythonScript, [
+    const pythonArgs = [
       '--video', videoLocalPath, '--spec', specPath, '--output', outputPath,
       '--secondary-videos', JSON.stringify(secondaryVideos),
       '--overlay-images', JSON.stringify(overlayImages),
-    ])
+    ]
+    if (payload.watermark) pythonArgs.push('--watermark')
+    await runPython(pythonScript, pythonArgs)
 
     const outputBuffer = await readFile(outputPath)
     const outputStoragePath = `clips/${clip_id}/output.mp4`

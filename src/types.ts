@@ -28,6 +28,7 @@ export interface RenderJobPayload {
   clip_id: string
   video_storage_path: string
   quality?: RenderQuality
+  watermark?: boolean
 }
 
 export const JOB_POLL_INTERVAL_MS = 2000
