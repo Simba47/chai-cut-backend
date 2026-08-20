@@ -184,6 +184,8 @@ def _write_ass(
 
 # ── FFmpeg crop expression builder ────────────────────────────────────────────
 
+_MAX_KF_PER_ATTR = 50  # FFmpeg expression parser depth limit
+
 def _step_expr(kf_list: list[dict], attr: str, seg_start_ms: int) -> str:
     """
     Build an FFmpeg filter expression for a step-interpolated crop coordinate.
@@ -201,6 +203,19 @@ def _step_expr(kf_list: list[dict], attr: str, seg_start_ms: int) -> str:
         return f"{dim}*{defaults[attr]:.6f}"
 
     sk = sorted(kf_list, key=lambda k: k["t_ms"])
+
+    # Drop keyframes where this attribute didn't change — smooth drag recording
+    # stores one keyframe per animation frame, many with identical values.
+    deduped: list[dict] = [sk[0]]
+    for kf in sk[1:]:
+        if abs(kf[attr] - deduped[-1][attr]) > 1e-6:
+            deduped.append(kf)
+    sk = deduped
+
+    # Hard cap: deeply nested if() expressions overflow FFmpeg's expression parser.
+    if len(sk) > _MAX_KF_PER_ATTR:
+        step = (len(sk) - 1) / (_MAX_KF_PER_ATTR - 1)
+        sk = [sk[round(i * step)] for i in range(_MAX_KF_PER_ATTR)]
 
     if len(sk) == 1:
         return f"{dim}*{sk[0][attr]:.6f}"
@@ -262,10 +277,12 @@ def main(
     output_path: str,
     secondary_videos: dict[str, str] | None = None,
     overlay_images: dict[str, str] | None = None,
+    overlay_videos: dict[str, str] | None = None,
     watermark: bool = False,
 ) -> None:
     secondary_videos = secondary_videos or {}
     overlay_images   = overlay_images   or {}
+    overlay_videos   = overlay_videos   or {}
 
     spec           = json.load(open(spec_path))
     clip_start_ms  = int(spec["start_ms"])
@@ -280,9 +297,13 @@ def main(
     audio_tracks   = spec.get("audio_tracks", [])
     filters_cfg    = spec.get("filters", {})
     img_overlays   = [o for o in spec.get("overlays", []) if o.get("type") == "image"]
+    vid_overlays   = [o for o in spec.get("overlays", []) if o.get("type") == "video"]
 
     for ov in img_overlays:
         ov["local_path"] = overlay_images.get(ov.get("storage_path", ""), "")
+
+    for ov in vid_overlays:
+        ov["local_path"] = overlay_videos.get(ov.get("source_video_id", ""), "")
 
     clip_words    = [w for w in words if w["end_ms"] >= clip_start_ms and w["start_ms"] <= clip_end_ms]
     caption_style = caption_styles[0] if caption_styles else {}
@@ -347,6 +368,14 @@ def main(
             if lp and os.path.exists(lp):
                 inputs += ["-i", lp]
                 valid_img.append((ov, f"[{img_base + len(valid_img)}:v]"))
+
+        vid_base = img_base + len(valid_img)
+        valid_vid: list[tuple[dict, str]] = []
+        for ov in vid_overlays:
+            lp = ov.get("local_path", "")
+            if lp and os.path.exists(lp):
+                inputs += ["-i", lp]
+                valid_vid.append((ov, f"[{vid_base + len(valid_vid)}:v]"))
 
         # ── Build filter_complex ───────────────────────────────────────────────
         fp: list[str] = []
@@ -501,6 +530,31 @@ def main(
             )
             cur = olbl
 
+        # ── Video (PiP) overlays ───────────────────────────────────────────────
+        for vi, (ov, vid_lbl) in enumerate(valid_vid):
+            vw     = max(1, int(ov.get("w", 0.25) * out_w))
+            vh     = max(1, int(ov.get("h", 0.25) * out_h))
+            vx     = int(ov.get("x", 0.05) * out_w)
+            vy     = int(ov.get("y", 0.05) * out_h)
+            t0     = ov.get("start_ms", 0) / 1000.0
+            t1     = ov.get("end_ms", clip_dur_ms) / 1000.0
+            off_s  = ov.get("source_offset_ms", 0) / 1000.0
+            pip_dur = t1 - t0
+            tslbl  = f"[pip{vi}t]"
+            sclbl  = f"[pip{vi}s]"
+            olbl   = f"[vpip{vi}]"
+            # Trim overlay video to the display window starting at source_offset_ms
+            fp.append(
+                f"{vid_lbl}trim=start={off_s:.3f}:duration={pip_dur:.3f},"
+                f"setpts=PTS-STARTPTS{tslbl}"
+            )
+            fp.append(f"{tslbl}scale={vw}:{vh}:flags=lanczos{sclbl}")
+            fp.append(
+                f"{cur}{sclbl}overlay=x={vx}:y={vy}"
+                f":enable='between(t,{t0:.3f},{t1:.3f})'{olbl}"
+            )
+            cur = olbl
+
         # ── Watermark (free plan only) ─────────────────────────────────────────
         if watermark:
             wm_font = _find_font_path("roboto")
@@ -554,11 +608,13 @@ if __name__ == "__main__":
     parser.add_argument("--output",           required=True)
     parser.add_argument("--secondary-videos", default="{}", help="JSON: video_id → local_path")
     parser.add_argument("--overlay-images",   default="{}", help="JSON: storage_path → local_path")
+    parser.add_argument("--overlay-videos",   default="{}", help="JSON: source_video_id → local_path")
     parser.add_argument("--watermark",        action="store_true", help="Burn in Chai Cut watermark")
     args = parser.parse_args()
     main(
         args.video, args.spec, args.output,
         secondary_videos=json.loads(args.secondary_videos),
         overlay_images=json.loads(args.overlay_images),
+        overlay_videos=json.loads(args.overlay_videos),
         watermark=args.watermark,
     )

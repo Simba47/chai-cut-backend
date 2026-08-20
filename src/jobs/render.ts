@@ -60,6 +60,20 @@ export async function handleRenderJob(job: Job) {
       } catch (e) { console.warn(`[render] Failed to download overlay:`, e) }
     }
 
+    const overlayVideos: Record<string, string> = {}
+    const seenOverlayVideoIds = new Set<string>()
+    for (const ov of (renderSpec.overlays ?? []) as Array<{ type?: string; source_video_id?: string }>) {
+      if (ov.type !== 'video' || !ov.source_video_id || seenOverlayVideoIds.has(ov.source_video_id)) continue
+      seenOverlayVideoIds.add(ov.source_video_id)
+      const [vRow] = await db`SELECT storage_path FROM videos WHERE id = ${ov.source_video_id}`
+      if (!vRow?.storage_path) continue
+      try {
+        const localPath = join(tmp, `overlay_video_${ov.source_video_id}.mp4`)
+        await writeFile(localPath, await r2Download(vRow.storage_path))
+        overlayVideos[ov.source_video_id] = localPath
+      } catch (e) { console.warn(`[render] Failed to download overlay video:`, e) }
+    }
+
     await writeFile(specPath, JSON.stringify(renderSpec, null, 2))
     // __dirname is dist/jobs/ at runtime; Python files live in src/python/ (not copied by tsc)
     const pythonScript = join(__dirname, '../../src/python/render.py')
@@ -67,6 +81,7 @@ export async function handleRenderJob(job: Job) {
       '--video', videoLocalPath, '--spec', specPath, '--output', outputPath,
       '--secondary-videos', JSON.stringify(secondaryVideos),
       '--overlay-images', JSON.stringify(overlayImages),
+      '--overlay-videos', JSON.stringify(overlayVideos),
     ]
     if (payload.watermark) pythonArgs.push('--watermark')
     await runPython(pythonScript, pythonArgs)
