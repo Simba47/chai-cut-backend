@@ -24,7 +24,7 @@ export async function handleRenderJob(job: Job) {
   const payload = job.payload as unknown as RenderJobPayload
   const { clip_id, video_storage_path } = payload
 
-  const renderSpec = await buildRenderSpec(clip_id, video_storage_path, '2160p')
+  const renderSpec = await buildRenderSpec(clip_id, video_storage_path, '1080p')
   const tmp = await mkdtemp(join(tmpdir(), 'render-'))
   const videoLocalPath = join(tmp, 'source.mp4')
   const outputPath = join(tmp, 'output.mp4')
@@ -147,6 +147,36 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
     segments, caption_styles: captionStyles, text_overlays: textOverlays,
     audio_tracks: audioTracks, transitions, overlays, words,
     output_width: dims.w, output_height: dims.h,
+  }
+}
+
+export async function renderClipWithLocalVideo(
+  clipId: string,
+  videoLocalPath: string,
+  videoStoragePath: string,
+): Promise<void> {
+  const renderSpec = await buildRenderSpec(clipId, videoStoragePath, '1080p')
+  const tmp = await mkdtemp(join(tmpdir(), 'render-'))
+  const outputPath = join(tmp, 'output.mp4')
+  const specPath = join(tmp, 'spec.json')
+  try {
+    await writeFile(specPath, JSON.stringify(renderSpec, null, 2))
+    const pythonScript = join(__dirname, '../../src/python/render.py')
+    await runPython(pythonScript, [
+      '--video', videoLocalPath, '--spec', specPath, '--output', outputPath,
+      '--secondary-videos', '{}', '--overlay-images', '{}', '--overlay-videos', '{}',
+    ])
+    const outputBuffer = await readFile(outputPath)
+    const outputStoragePath = `clips/${clipId}/output.mp4`
+    await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath, Body: outputBuffer, ContentType: 'video/mp4' }))
+    const output_url = await getSignedUrl(r2, new GetObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath }), { expiresIn: 60 * 60 * 24 * 7 })
+    await db`UPDATE clips SET status = 'done', output_url = ${output_url}, output_storage_path = ${outputStoragePath} WHERE id = ${clipId}`
+    console.log(`[render] Clip ${clipId} done`)
+  } catch (err) {
+    await db`UPDATE clips SET status = 'failed' WHERE id = ${clipId}`
+    throw err
+  } finally {
+    await rm(tmp, { recursive: true, force: true })
   }
 }
 
