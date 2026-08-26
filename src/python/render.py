@@ -22,7 +22,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from audio import build_ffmpeg_audio_args, extract_speech_ranges
+from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges
 
 # ── Quality presets (identical to previous version) ───────────────────────────
 _QUALITY: dict[int, dict] = {
@@ -187,14 +187,41 @@ def _write_ass(
 _MAX_KF_PER_ATTR = 50  # FFmpeg expression parser depth limit
 
 def _step_expr(kf_list: list[dict], attr: str, seg_start_ms: int) -> str:
-    """
-    Build an FFmpeg filter expression for a step-interpolated crop coordinate.
+    """Step-interpolated crop coordinate (holds value until next keyframe fires)."""
+    dim = "iw" if attr in ("x", "w") else "ih"
+    defaults = {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
 
-    attr        one of 'x','y','w','h' (stored as fractions 0-1 of source frame)
-    seg_start_ms  clip-relative ms at which this segment begins
-    t           FFmpeg variable = seconds since start of the trimmed segment
-                (valid after trim+setpts=PTS-STARTPTS)
-    keyframes   stored with clip-relative t_ms → convert to seg-relative by subtracting
+    if not kf_list:
+        return f"{dim}*{defaults[attr]:.6f}"
+
+    sk = sorted(kf_list, key=lambda k: k["t_ms"])
+
+    deduped: list[dict] = [sk[0]]
+    for kf in sk[1:]:
+        if abs(kf[attr] - deduped[-1][attr]) > 1e-6:
+            deduped.append(kf)
+    sk = deduped
+
+    if len(sk) > _MAX_KF_PER_ATTR:
+        step = (len(sk) - 1) / (_MAX_KF_PER_ATTR - 1)
+        sk = [sk[round(i * step)] for i in range(_MAX_KF_PER_ATTR)]
+
+    if len(sk) == 1:
+        return f"{dim}*{sk[0][attr]:.6f}"
+
+    result = f"{dim}*{sk[-1][attr]:.6f}"
+    for i in range(len(sk) - 2, -1, -1):
+        t_switch = (sk[i + 1]["t_ms"] - seg_start_ms) / 1000.0
+        result = f"if(lt(t,{t_switch:.3f}),{dim}*{sk[i][attr]:.6f},{result})"
+
+    return result
+
+
+def _linear_expr(kf_list: list[dict], attr: str, seg_start_ms: int) -> str:
+    """
+    Linear-interpolated crop coordinate — smoothly pans between keyframes.
+    Used for motion-tracked crops so the crop follows the subject continuously
+    instead of jumping every N seconds.
     """
     dim = "iw" if attr in ("x", "w") else "ih"
     defaults = {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
@@ -204,15 +231,13 @@ def _step_expr(kf_list: list[dict], attr: str, seg_start_ms: int) -> str:
 
     sk = sorted(kf_list, key=lambda k: k["t_ms"])
 
-    # Drop keyframes where this attribute didn't change — smooth drag recording
-    # stores one keyframe per animation frame, many with identical values.
+    # Deduplicate unchanged values to shrink the expression
     deduped: list[dict] = [sk[0]]
     for kf in sk[1:]:
-        if abs(kf[attr] - deduped[-1][attr]) > 1e-6:
+        if abs(kf[attr] - deduped[-1][attr]) > 1e-4:
             deduped.append(kf)
     sk = deduped
 
-    # Hard cap: deeply nested if() expressions overflow FFmpeg's expression parser.
     if len(sk) > _MAX_KF_PER_ATTR:
         step = (len(sk) - 1) / (_MAX_KF_PER_ATTR - 1)
         sk = [sk[round(i * step)] for i in range(_MAX_KF_PER_ATTR)]
@@ -220,22 +245,30 @@ def _step_expr(kf_list: list[dict], attr: str, seg_start_ms: int) -> str:
     if len(sk) == 1:
         return f"{dim}*{sk[0][attr]:.6f}"
 
-    # Build right-to-left: position from kf[i] holds until kf[i+1] fires
+    # Build right-to-left: each segment linearly interpolates from kf[i] to kf[i+1]
     result = f"{dim}*{sk[-1][attr]:.6f}"
     for i in range(len(sk) - 2, -1, -1):
-        # t_switch is the seg-relative time when we transition to the next position
-        t_switch = (sk[i + 1]["t_ms"] - seg_start_ms) / 1000.0
-        result = f"if(lt(t,{t_switch:.3f}),{dim}*{sk[i][attr]:.6f},{result})"
+        t0 = (sk[i]["t_ms"] - seg_start_ms) / 1000.0
+        t1 = (sk[i + 1]["t_ms"] - seg_start_ms) / 1000.0
+        v0 = sk[i][attr]
+        v1 = sk[i + 1][attr]
+        dt = max(t1 - t0, 0.001)
+        # lerp: v0 + (v1-v0) * (t-t0) / dt
+        lerp = f"{dim}*({v0:.6f}+({v1:.6f}-{v0:.6f})*(t-{t0:.3f})/{dt:.3f})"
+        result = f"if(lt(t,{t1:.3f}),{lerp},{result})"
 
     return result
 
 
 def _crop_filter(box: dict | None, seg_start_ms: int) -> str:
     kf = box.get("box_keyframes", []) if box else []
-    w = _esc_expr(f"max(2,{_step_expr(kf, 'w', seg_start_ms)})")
-    h = _esc_expr(f"max(2,{_step_expr(kf, 'h', seg_start_ms)})")
-    x = _esc_expr(f"min(iw-2,{_step_expr(kf, 'x', seg_start_ms)})")
-    y = _esc_expr(f"min(ih-2,{_step_expr(kf, 'y', seg_start_ms)})")
+    # Use linear interpolation when there are multiple keyframes (motion tracking)
+    # so the crop smoothly follows the subject instead of jumping at each keyframe.
+    expr = _linear_expr if len(kf) > 1 else _step_expr
+    w = _esc_expr(f"max(2,{expr(kf, 'w', seg_start_ms)})")
+    h = _esc_expr(f"max(2,{expr(kf, 'h', seg_start_ms)})")
+    x = _esc_expr(f"min(iw-2,{expr(kf, 'x', seg_start_ms)})")
+    y = _esc_expr(f"min(ih-2,{expr(kf, 'y', seg_start_ms)})")
     return f"crop=w={w}:h={h}:x={x}:y={y}"
 
 
@@ -317,8 +350,9 @@ def main(
         audio_path    = os.path.join(tmp, "audio.aac")
         speech_ranges = extract_speech_ranges(clip_words)
         ar = subprocess.run(
-            build_ffmpeg_audio_args(
-                video_path, clip_start_ms, clip_end_ms, audio_tracks, speech_ranges, audio_path
+            build_segment_audio_args(
+                video_path, clip_start_ms, clip_end_ms,
+                segments, secondary_videos, audio_tracks, speech_ranges, audio_path,
             ),
             capture_output=True,
         )
@@ -413,11 +447,14 @@ def main(
         for si, seg in enumerate(segments):
             boxes   = sorted(seg.get("crop_boxes", []), key=lambda b: b.get("slot_index", 0))
             layout  = seg.get("layout", "vertical")
-            smss    = int(seg["start_ms"])   # clip-relative ms
+            smss    = int(seg["start_ms"])   # timeline ms (may differ from video ms after INSERT)
             emss    = int(seg["end_ms"])
             dur_ms  = emss - smss
-            start_s = smss / 1000.0
-            end_s   = emss / 1000.0
+            # video_offset_ms is set when this segment was pushed forward by a true INSERT.
+            # Use it as the actual clip-relative video position; start_ms is the timeline position.
+            vid_start_ms = int(seg["video_offset_ms"]) if seg.get("video_offset_ms") is not None else smss
+            start_s = vid_start_ms / 1000.0
+            end_s   = (vid_start_ms + dur_ms) / 1000.0
             out_lbl = f"[seg{si}]"
 
             def trim_slot(slot_i: int, dst_w: int, dst_h: int, fit: bool, lbl: str) -> None:
@@ -434,7 +471,7 @@ def main(
                     src    = pop_src(None)
                     ts, te = start_s, end_s
 
-                crop  = _crop_filter(box, smss)
+                crop  = _crop_filter(box, vid_start_ms)
                 scale = _scale_fit(dst_w, dst_h) if fit else _scale_cover(dst_w, dst_h)
                 fp.append(
                     f"{src}trim=start={ts:.3f}:end={te:.3f},setpts=PTS-STARTPTS,"
