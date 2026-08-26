@@ -122,7 +122,7 @@ def build_segment_audio_args(
     Falls back to the simple single-clip extraction when there are no B-roll
     segments with available secondary video files.
     """
-    sorted_segs = sorted(segments, key=lambda s: s.get("sort_order", 0))
+    sorted_segs = sorted(segments, key=lambda s: (s.get("sort_order", 0), s.get("start_ms", 0)))
 
     # Check whether any B-roll segment has an available secondary file
     has_broll_audio = any(
@@ -163,9 +163,18 @@ def build_segment_audio_args(
             seg_labels.append(f"[{n_inputs}:a]")
             n_inputs += 1
 
-    # Concatenate all segment audio pieces
-    concat_in = "".join(seg_labels)
-    fp: list[str] = [f"{concat_in}concat=n={n_inputs}:v=0:a=1[speech]"]
+    # Normalize each segment to stereo 48 kHz before concat so the filter
+    # handles mixed sample-rates / channel layouts (e.g. 44.1kHz B-roll + 48kHz main).
+    fp: list[str] = []
+    norm_labels: list[str] = []
+    for i, raw_lbl in enumerate(seg_labels):
+        norm_lbl = f"[an{i}]"
+        fp.append(
+            f"{raw_lbl}aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo{norm_lbl}"
+        )
+        norm_labels.append(norm_lbl)
+    concat_in = "".join(norm_labels)
+    fp.append(f"{concat_in}concat=n={n_inputs}:v=0:a=1[speech]")
 
     if not audio_tracks:
         return [
