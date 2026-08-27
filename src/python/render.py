@@ -371,9 +371,15 @@ def main(
         for seg in segments:
             boxes   = sorted(seg.get("crop_boxes", []), key=lambda b: b.get("slot_index", 0))
             n_slots = {"split": 2, "trio": 3}.get(seg.get("layout", "vertical"), 1)
+            # For B-roll INSERT segments, remember the primary (slot-0) source so empty
+            # extra slots fall back to it instead of the main video.
+            primary_vid = (boxes[0].get("source_video_id") if boxes else None)
+            primary_vid = primary_vid if (primary_vid and primary_vid in secondary_videos) else None
             for i in range(n_slots):
                 box    = boxes[i] if i < len(boxes) else None
                 vid_id = box.get("source_video_id") if box else None
+                if not (vid_id and vid_id in secondary_videos) and i > 0 and primary_vid:
+                    vid_id = primary_vid
                 if vid_id and vid_id in secondary_videos:
                     slot_counts[vid_id] = slot_counts.get(vid_id, 0) + 1
                 else:
@@ -457,9 +463,20 @@ def main(
             end_s   = (vid_start_ms + dur_ms) / 1000.0
             out_lbl = f"[seg{si}]"
 
+            # Primary (slot-0) B-roll source for this segment, used as fallback for empty slots.
+            _primary_broll = (boxes[0].get("source_video_id") if boxes else None)
+            _primary_broll = _primary_broll if (_primary_broll and _primary_broll in secondary_videos) else None
+
             def trim_slot(slot_i: int, dst_w: int, dst_h: int, fit: bool, lbl: str) -> None:
                 box    = boxes[slot_i] if slot_i < len(boxes) else None
                 vid_id = box.get("source_video_id") if box else None
+
+                # If this extra slot has no B-roll source but the primary slot does, inherit
+                # the primary B-roll so the split renders the INSERT video everywhere (matching
+                # the editor preview, which paints brollVid for all slots).
+                if not (vid_id and vid_id in secondary_videos) and slot_i > 0 and _primary_broll:
+                    box    = boxes[0]
+                    vid_id = _primary_broll
 
                 if vid_id and vid_id in secondary_videos:
                     # Secondary: trim from source_offset_ms for segment duration

@@ -126,55 +126,102 @@ def build_segment_audio_args(
 
     # Check whether any B-roll segment has an available secondary file
     has_broll_audio = any(
-        (box := (s.get("crop_boxes") or [{}])[0]).get("source_video_id") in secondary_videos
+        (s.get("crop_boxes") or [{}])[0].get("source_video_id") in secondary_videos
         for s in sorted_segs
         if (s.get("crop_boxes") or [{}])[0].get("source_video_id")
     )
 
     if not has_broll_audio:
-        # No inserts with available audio — use simple single-clip extraction
         return build_ffmpeg_audio_args(
             source_video, clip_start_ms, clip_end_ms,
             audio_tracks, speech_ranges, output_audio,
         )
 
-    inputs: list[str] = ["ffmpeg", "-y"]
-    seg_labels: list[str] = []
-    n_inputs = 0
+    # ── Accurate sync approach: use atrim in filter_complex ──────────────────
+    # Opening the pre-seeked source once (same as the video pipeline) and using
+    # atrim=start=X:end=Y,asetpts=PTS-STARTPTS is sample-accurate — no frame-
+    # alignment drift from repeated -ss -t -i pairs.
 
+    clip_start_s = clip_start_ms / 1000.0
+
+    # Collect which B-roll video IDs are actually used and count their uses
+    broll_uses: dict[str, int] = {}
+    main_uses = 0
     for seg in sorted_segs:
-        boxes = seg.get("crop_boxes") or []
-        box = boxes[0] if boxes else {}
-        vid_id = box.get("source_video_id")
-        dur_ms = int(seg["end_ms"]) - int(seg["start_ms"])
-        dur_s = dur_ms / 1000.0
-
+        box = (seg.get("crop_boxes") or [{}])[0]
+        vid_id = box.get("source_video_id") if box else None
         if vid_id and vid_id in secondary_videos:
-            # B-roll INSERT: pull audio from the secondary file
-            off_s = int(box.get("source_offset_ms") or 0) / 1000.0
-            inputs += ["-ss", f"{off_s:.3f}", "-t", f"{dur_s:.3f}", "-i", secondary_videos[vid_id]]
-            seg_labels.append(f"[{n_inputs}:a]")
-            n_inputs += 1
+            broll_uses[vid_id] = broll_uses.get(vid_id, 0) + 1
         else:
-            # Main segment: resolve clip-relative video position
-            vid_off_ms = int(seg["video_offset_ms"]) if seg.get("video_offset_ms") is not None else int(seg["start_ms"])
-            abs_start_s = (clip_start_ms + vid_off_ms) / 1000.0
-            inputs += ["-ss", f"{abs_start_s:.3f}", "-t", f"{dur_s:.3f}", "-i", source_video]
-            seg_labels.append(f"[{n_inputs}:a]")
-            n_inputs += 1
+            main_uses += 1
 
-    # Normalize each segment to stereo 48 kHz before concat so the filter
-    # handles mixed sample-rates / channel layouts (e.g. 44.1kHz B-roll + 48kHz main).
+    # Build inputs: main source pre-seeked, then each needed B-roll file
+    inputs: list[str] = [
+        "ffmpeg", "-y",
+        "-ss", f"{clip_start_s:.3f}",
+        "-i", source_video,   # index 0
+    ]
+    broll_idx: dict[str, int] = {}
+    for vid_id in broll_uses:
+        broll_idx[vid_id] = len(broll_idx) + 1
+        inputs += ["-i", secondary_videos[vid_id]]
+
+    # Build filter_complex
     fp: list[str] = []
+
+    # Pre-split streams that appear more than once
+    main_pool: list[str] = []
+    if main_uses > 1:
+        lbls = [f"[ma{i}]" for i in range(main_uses)]
+        fp.append(f"[0:a]asplit={main_uses}{''.join(lbls)}")
+        main_pool = lbls
+    elif main_uses == 1:
+        main_pool = ["[0:a]"]
+
+    broll_pools: dict[str, list[str]] = {}
+    for vid_id, count in broll_uses.items():
+        idx = broll_idx[vid_id]
+        safe = vid_id.replace("-", "_").replace(":", "_")
+        if count > 1:
+            lbls = [f"[br{safe}{i}]" for i in range(count)]
+            fp.append(f"[{idx}:a]asplit={count}{''.join(lbls)}")
+            broll_pools[vid_id] = lbls
+        else:
+            broll_pools[vid_id] = [f"[{idx}:a]"]
+
+    main_it = iter(main_pool)
+    broll_its: dict[str, "Iterator[str]"] = {v: iter(p) for v, p in broll_pools.items()}
+
     norm_labels: list[str] = []
-    for i, raw_lbl in enumerate(seg_labels):
-        norm_lbl = f"[an{i}]"
-        fp.append(
-            f"{raw_lbl}aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo{norm_lbl}"
-        )
+    n_segs = len(sorted_segs)
+    for i, seg in enumerate(sorted_segs):
+        box = (seg.get("crop_boxes") or [{}])[0]
+        vid_id = box.get("source_video_id") if box else None
+        dur_ms = int(seg["end_ms"]) - int(seg["start_ms"])
+        dur_s  = dur_ms / 1000.0
+        raw_lbl  = f"[sa{i}]"
+        norm_lbl = f"[san{i}]"
+
+        if vid_id and vid_id in broll_pools:
+            off_s  = int(box.get("source_offset_ms") or 0) / 1000.0
+            end_s  = off_s + dur_s
+            src    = next(broll_its[vid_id])
+            fp.append(f"{src}atrim=start={off_s:.3f}:end={end_s:.3f},asetpts=PTS-STARTPTS{raw_lbl}")
+        else:
+            vid_off_ms   = int(seg["video_offset_ms"]) if seg.get("video_offset_ms") is not None else int(seg["start_ms"])
+            trim_start   = vid_off_ms / 1000.0   # relative to pre-seeked clip_start
+            trim_end     = trim_start + dur_s
+            src          = next(main_it)
+            fp.append(f"{src}atrim=start={trim_start:.3f}:end={trim_end:.3f},asetpts=PTS-STARTPTS{raw_lbl}")
+
+        # Normalise each piece to stereo 48 kHz to handle mixed formats (e.g. B-roll at 44.1 kHz)
+        fp.append(f"{raw_lbl}aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo{norm_lbl}")
         norm_labels.append(norm_lbl)
+
     concat_in = "".join(norm_labels)
-    fp.append(f"{concat_in}concat=n={n_inputs}:v=0:a=1[speech]")
+    fp.append(f"{concat_in}concat=n={n_segs}:v=0:a=1[speech]")
+
+    n_broll_inputs = len(broll_idx)
 
     if not audio_tracks:
         return [
@@ -188,7 +235,7 @@ def build_segment_audio_args(
     # Mix concatenated speech with background music tracks
     music_labels: list[str] = []
     for i, track in enumerate(audio_tracks):
-        track_idx = n_inputs + i
+        track_idx = 1 + n_broll_inputs + i
         inputs += ["-ss", str(track.get("start_ms", 0) / 1000.0), "-i", track["storage_path"]]
         base_vol = float(track.get("volume", 0.5))
         label = f"[music{i}]"
