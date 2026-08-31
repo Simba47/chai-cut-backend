@@ -26,10 +26,10 @@ from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_spe
 
 # ── Quality presets (identical to previous version) ───────────────────────────
 _QUALITY: dict[int, dict] = {
-    480:  dict(crf=20, maxrate="3M",  bufsize="6M",  preset="fast", audio_br="128k"),
-    720:  dict(crf=18, maxrate="6M",  bufsize="12M", preset="fast", audio_br="192k"),
-    1080: dict(crf=18, maxrate="10M", bufsize="20M", preset="fast", audio_br="192k"),
-    2160: dict(crf=16, maxrate="20M", bufsize="40M", preset="fast", audio_br="256k"),
+    480:  dict(crf=20, maxrate="3M",  bufsize="6M",  preset="veryfast", audio_br="128k"),
+    720:  dict(crf=18, maxrate="6M",  bufsize="12M", preset="veryfast", audio_br="192k"),
+    1080: dict(crf=18, maxrate="10M", bufsize="20M", preset="veryfast", audio_br="192k"),
+    2160: dict(crf=16, maxrate="20M", bufsize="40M", preset="veryfast", audio_br="256k"),
 }
 
 # ── Font lookup ────────────────────────────────────────────────────────────────
