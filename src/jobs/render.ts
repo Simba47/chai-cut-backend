@@ -1,5 +1,8 @@
 import { spawn } from 'node:child_process'
-import { writeFile, readFile, mkdtemp, rm } from 'node:fs/promises'
+import { createReadStream, createWriteStream } from 'node:fs'
+import { writeFile, mkdtemp, rm } from 'node:fs/promises'
+import { pipeline } from 'node:stream/promises'
+import { Readable } from 'node:stream'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3'
@@ -13,11 +16,10 @@ import { dirname } from 'node:path'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 
-async function r2Download(key: string): Promise<Buffer> {
+// Stream R2 object directly to a local file — never buffers the whole file in memory.
+async function r2DownloadToFile(key: string, filePath: string): Promise<void> {
   const res = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }))
-  const chunks: Buffer[] = []
-  for await (const chunk of res.Body as AsyncIterable<Uint8Array>) chunks.push(Buffer.from(chunk))
-  return Buffer.concat(chunks)
+  await pipeline(Readable.from(res.Body as AsyncIterable<Uint8Array>), createWriteStream(filePath))
 }
 
 export async function handleRenderJob(job: Job) {
@@ -31,7 +33,7 @@ export async function handleRenderJob(job: Job) {
   const specPath = join(tmp, 'spec.json')
 
   try {
-    await writeFile(videoLocalPath, await r2Download(video_storage_path))
+    await r2DownloadToFile(video_storage_path, videoLocalPath)
 
     const secondaryVideos: Record<string, string> = {}
     const seenVideoIds = new Set<string>()
@@ -43,7 +45,7 @@ export async function handleRenderJob(job: Job) {
         if (!vRow?.storage_path) continue
         try {
           const localPath = join(tmp, `secondary_${box.source_video_id}.mp4`)
-          await writeFile(localPath, await r2Download(vRow.storage_path))
+          await r2DownloadToFile(vRow.storage_path, localPath)
           secondaryVideos[box.source_video_id] = localPath
         } catch (e) { console.warn(`[render] Failed to download secondary video:`, e) }
       }
@@ -55,7 +57,7 @@ export async function handleRenderJob(job: Job) {
       try {
         const ext = ov.storage_path.split('.').pop() ?? 'png'
         const localPath = join(tmp, `overlay_${Buffer.from(ov.storage_path).toString('hex').slice(0, 16)}.${ext}`)
-        await writeFile(localPath, await r2Download(ov.storage_path))
+        await r2DownloadToFile(ov.storage_path, localPath)
         overlayImages[ov.storage_path] = localPath
       } catch (e) { console.warn(`[render] Failed to download overlay:`, e) }
     }
@@ -69,7 +71,7 @@ export async function handleRenderJob(job: Job) {
       if (!vRow?.storage_path) continue
       try {
         const localPath = join(tmp, `overlay_video_${ov.source_video_id}.mp4`)
-        await writeFile(localPath, await r2Download(vRow.storage_path))
+        await r2DownloadToFile(vRow.storage_path, localPath)
         overlayVideos[ov.source_video_id] = localPath
       } catch (e) { console.warn(`[render] Failed to download overlay video:`, e) }
     }
@@ -86,9 +88,8 @@ export async function handleRenderJob(job: Job) {
     if (payload.watermark) pythonArgs.push('--watermark')
     await runPython(pythonScript, pythonArgs)
 
-    const outputBuffer = await readFile(outputPath)
     const outputStoragePath = `clips/${clip_id}/output.mp4`
-    await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath, Body: outputBuffer, ContentType: 'video/mp4' }))
+    await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath, Body: createReadStream(outputPath), ContentType: 'video/mp4' }))
 
     const output_url = await getSignedUrl(r2, new GetObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath }), { expiresIn: 60 * 60 * 24 * 7 })
     await db`UPDATE clips SET status = 'done', output_url = ${output_url}, output_storage_path = ${outputStoragePath} WHERE id = ${clip_id}`
@@ -166,9 +167,8 @@ export async function renderClipWithLocalVideo(
       '--video', videoLocalPath, '--spec', specPath, '--output', outputPath,
       '--secondary-videos', '{}', '--overlay-images', '{}', '--overlay-videos', '{}',
     ])
-    const outputBuffer = await readFile(outputPath)
     const outputStoragePath = `clips/${clipId}/output.mp4`
-    await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath, Body: outputBuffer, ContentType: 'video/mp4' }))
+    await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath, Body: createReadStream(outputPath), ContentType: 'video/mp4' }))
     const output_url = await getSignedUrl(r2, new GetObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath }), { expiresIn: 60 * 60 * 24 * 7 })
     await db`UPDATE clips SET status = 'done', output_url = ${output_url}, output_storage_path = ${outputStoragePath} WHERE id = ${clipId}`
     console.log(`[render] Clip ${clipId} done`)
