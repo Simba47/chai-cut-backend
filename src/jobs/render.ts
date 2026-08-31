@@ -27,14 +27,18 @@ export async function handleRenderJob(job: Job) {
   const { clip_id, video_storage_path } = payload
 
   const renderSpec = await buildRenderSpec(clip_id, video_storage_path, '1080p')
+  // Sign the source URL so FFmpeg can stream directly from R2 via HTTP range requests.
+  // This avoids downloading the full source file (can be 1GB+) to Railway's disk
+  // when we only need a 60-second window of it.
+  const videoSignedUrl = await getSignedUrl(
+    r2, new GetObjectCommand({ Bucket: R2_BUCKET, Key: video_storage_path }), { expiresIn: 7200 }
+  )
   const tmp = await mkdtemp(join(tmpdir(), 'render-'))
-  const videoLocalPath = join(tmp, 'source.mp4')
   const outputPath = join(tmp, 'output.mp4')
   const specPath = join(tmp, 'spec.json')
 
   try {
-    await r2DownloadToFile(video_storage_path, videoLocalPath)
-
+    const t0 = Date.now()
     const secondaryVideos: Record<string, string> = {}
     const seenVideoIds = new Set<string>()
     for (const seg of (renderSpec.segments ?? []) as Array<{ crop_boxes?: Array<{ source_video_id?: string }> }>) {
@@ -44,12 +48,15 @@ export async function handleRenderJob(job: Job) {
         const [vRow] = await db`SELECT storage_path FROM videos WHERE id = ${box.source_video_id}`
         if (!vRow?.storage_path) continue
         try {
+          const t1 = Date.now()
           const localPath = join(tmp, `secondary_${box.source_video_id}.mp4`)
           await r2DownloadToFile(vRow.storage_path, localPath)
+          console.log(`[render] B-roll download: ${((Date.now()-t1)/1000).toFixed(1)}s`)
           secondaryVideos[box.source_video_id] = localPath
         } catch (e) { console.warn(`[render] Failed to download secondary video:`, e) }
       }
     }
+    console.log(`[render] Downloads done: ${((Date.now()-t0)/1000).toFixed(1)}s`)
 
     const overlayImages: Record<string, string> = {}
     for (const ov of (renderSpec.overlays ?? []) as Array<{ type?: string; storage_path?: string }>) {
@@ -80,13 +87,15 @@ export async function handleRenderJob(job: Job) {
     // __dirname is dist/jobs/ at runtime; Python files live in src/python/ (not copied by tsc)
     const pythonScript = join(__dirname, '../../src/python/render.py')
     const pythonArgs = [
-      '--video', videoLocalPath, '--spec', specPath, '--output', outputPath,
+      '--video', videoSignedUrl, '--spec', specPath, '--output', outputPath,
       '--secondary-videos', JSON.stringify(secondaryVideos),
       '--overlay-images', JSON.stringify(overlayImages),
       '--overlay-videos', JSON.stringify(overlayVideos),
     ]
     if (payload.watermark) pythonArgs.push('--watermark')
+    const tPy = Date.now()
     await runPython(pythonScript, pythonArgs)
+    console.log(`[render] Python done: ${((Date.now()-tPy)/1000).toFixed(1)}s`)
 
     const outputStoragePath = `clips/${clip_id}/output.mp4`
     await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath, Body: createReadStream(outputPath), ContentType: 'video/mp4' }))
