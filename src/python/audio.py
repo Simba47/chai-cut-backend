@@ -122,7 +122,15 @@ def build_segment_audio_args(
     Falls back to the simple single-clip extraction when there are no B-roll
     segments with available secondary video files.
     """
-    sorted_segs = sorted(segments, key=lambda s: (s.get("sort_order", 0), s.get("start_ms", 0)))
+    sorted_segs = sorted(segments, key=lambda s: (s.get("start_ms", 0), s.get("sort_order", 0)))
+    # Skip overlapping segments — same rule as the preview (first/lowest-sort_order wins)
+    _filtered: list[dict] = []
+    _next_start = -1
+    for _s in sorted_segs:
+        if _s.get("start_ms", 0) >= _next_start:
+            _filtered.append(_s)
+            _next_start = _s.get("end_ms", 0)
+    sorted_segs = _filtered
 
     # Check whether any B-roll segment has an available secondary file
     has_broll_audio = any(
@@ -169,14 +177,19 @@ def build_segment_audio_args(
     # Build filter_complex
     fp: list[str] = []
 
-    # Pre-split streams that appear more than once
+    # Pre-split streams that appear more than once.
+    # Normalize PTS first (mirrors video's setpts=PTS-STARTPTS): after input-level -ss clip_start_s
+    # the audio stream's PTS starts at ~clip_start_s, not 0, so atrim=start=0:end=5 would find no
+    # frames for clips with non-zero start_ms.
     main_pool: list[str] = []
-    if main_uses > 1:
-        lbls = [f"[ma{i}]" for i in range(main_uses)]
-        fp.append(f"[0:a]asplit={main_uses}{''.join(lbls)}")
-        main_pool = lbls
-    elif main_uses == 1:
-        main_pool = ["[0:a]"]
+    if main_uses > 0:
+        fp.append("[0:a]asetpts=PTS-STARTPTS[main_a_n]")
+        if main_uses > 1:
+            lbls = [f"[ma{i}]" for i in range(main_uses)]
+            fp.append(f"[main_a_n]asplit={main_uses}{''.join(lbls)}")
+            main_pool = lbls
+        else:
+            main_pool = ["[main_a_n]"]
 
     broll_pools: dict[str, list[str]] = {}
     for vid_id, count in broll_uses.items():
@@ -208,7 +221,8 @@ def build_segment_audio_args(
             src    = next(broll_its[vid_id])
             fp.append(f"{src}atrim=start={off_s:.3f}:end={end_s:.3f},asetpts=PTS-STARTPTS{raw_lbl}")
         else:
-            vid_off_ms   = int(seg["video_offset_ms"]) if seg.get("video_offset_ms") is not None else int(seg["start_ms"])
+            _cb_off = box.get("source_offset_ms") if box and not (vid_id and vid_id in broll_pools) else None
+            vid_off_ms   = int(seg["video_offset_ms"]) if seg.get("video_offset_ms") is not None else (int(_cb_off) if _cb_off is not None else int(seg["start_ms"]))
             trim_start   = vid_off_ms / 1000.0   # relative to pre-seeked clip_start
             trim_end     = trim_start + dur_s
             src          = next(main_it)

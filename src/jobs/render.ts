@@ -121,7 +121,7 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
         ) ORDER BY cb.slot_index)
         FROM crop_boxes cb WHERE cb.segment_id = s.id
       ), '[]') AS crop_boxes
-    FROM segments s WHERE s.clip_id = ${clipId} ORDER BY s.sort_order
+    FROM segments s WHERE s.clip_id = ${clipId} ORDER BY s.start_ms, s.sort_order
   `
 
   const [captionStyles, textOverlays, audioTracks, transitions, overlays] = await Promise.all([

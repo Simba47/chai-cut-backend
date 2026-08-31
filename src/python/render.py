@@ -323,7 +323,23 @@ def main(
     clip_dur_ms    = clip_end_ms - clip_start_ms
     out_w          = int(spec.get("output_width",  1080))
     out_h          = int(spec.get("output_height", 1920))
-    segments       = sorted(spec["segments"], key=lambda s: s["sort_order"])
+    # Sort by (start_ms, sort_order) — sort_order breaks ties so the "primary" segment
+    # (lower sort_order) always wins when two segments share the same start_ms.
+    segments = sorted(spec["segments"], key=lambda s: (s["start_ms"], s.get("sort_order", 0)))
+    # Mirror the preview's "first match wins" rule: skip any segment that starts before
+    # the previous one ended (overlapping segments are invisible in the editor preview).
+    _filtered: list[dict] = []
+    _next_start = -1
+    for _s in segments:
+        if _s["start_ms"] >= _next_start:
+            _filtered.append(_s)
+            _next_start = _s["end_ms"]
+        else:
+            print(f"[render] SKIP overlapping seg: start={_s['start_ms']}ms end={_s['end_ms']}ms sort_order={_s.get('sort_order')}", flush=True)
+    segments = _filtered
+    for _s in segments:
+        broll = bool((_s.get("crop_boxes") or [{}])[0].get("source_video_id"))
+        print(f"[render] seg: start={_s['start_ms']}ms end={_s['end_ms']}ms video_offset={_s.get('video_offset_ms')} broll={broll}", flush=True)
     words          = spec.get("words", [])
     caption_styles = spec.get("caption_styles", [])
     text_overlays  = spec.get("text_overlays", [])
@@ -457,15 +473,24 @@ def main(
             emss    = int(seg["end_ms"])
             dur_ms  = emss - smss
             # video_offset_ms is set when this segment was pushed forward by a true INSERT.
-            # Use it as the actual clip-relative video position; start_ms is the timeline position.
-            vid_start_ms = int(seg["video_offset_ms"]) if seg.get("video_offset_ms") is not None else smss
+            # For non-pushed main-video segments, fall back to crop_box[0].source_offset_ms,
+            # which stores the correct video position (e.g. after Part B, the continuation
+            # starts at the video position where Part B left off, not at start_ms).
+            _primary_box = boxes[0] if boxes else None
+            _primary_box_vid_id = _primary_box.get("source_video_id") if _primary_box else None
+            _is_main_video = not (_primary_box_vid_id and _primary_box_vid_id in secondary_videos)
+            if seg.get("video_offset_ms") is not None:
+                vid_start_ms = int(seg["video_offset_ms"])
+            elif _is_main_video and _primary_box and _primary_box.get("source_offset_ms") is not None:
+                vid_start_ms = int(_primary_box["source_offset_ms"])
+            else:
+                vid_start_ms = smss
             start_s = vid_start_ms / 1000.0
             end_s   = (vid_start_ms + dur_ms) / 1000.0
             out_lbl = f"[seg{si}]"
 
             # Primary (slot-0) B-roll source for this segment, used as fallback for empty slots.
-            _primary_broll = (boxes[0].get("source_video_id") if boxes else None)
-            _primary_broll = _primary_broll if (_primary_broll and _primary_broll in secondary_videos) else None
+            _primary_broll = _primary_box_vid_id if (_primary_box_vid_id and _primary_box_vid_id in secondary_videos) else None
 
             def trim_slot(slot_i: int, dst_w: int, dst_h: int, fit: bool, lbl: str) -> None:
                 box    = boxes[slot_i] if slot_i < len(boxes) else None
@@ -488,7 +513,9 @@ def main(
                     src    = pop_src(None)
                     ts, te = start_s, end_s
 
-                crop  = _crop_filter(box, vid_start_ms)
+                # Keyframes are stored at composite currentTimeMs (smss-relative for each segment),
+                # so use smss as the base — not vid_start_ms, which differs for Part B segments.
+                crop  = _crop_filter(box, smss)
                 scale = _scale_fit(dst_w, dst_h) if fit else _scale_cover(dst_w, dst_h)
                 fp.append(
                     f"{src}trim=start={ts:.3f}:end={te:.3f},setpts=PTS-STARTPTS,"
@@ -537,9 +564,11 @@ def main(
 
         # ── Subtitles (ASS captions) ───────────────────────────────────────────
         if ass_path:
-            # Escape path for FFmpeg filter option (colons are option separators)
-            esc_ass   = ass_path.replace("\\", "\\\\").replace(":", "\\:")
-            esc_fonts = _FONTS_DIR.replace("\\", "\\\\").replace(":", "\\:")
+            # Escape path for FFmpeg filter option (colons and spaces are separators)
+            def _esc_path(p: str) -> str:
+                return p.replace("\\", "\\\\").replace(":", "\\:").replace(" ", "\\ ")
+            esc_ass   = _esc_path(ass_path)
+            esc_fonts = _esc_path(_FONTS_DIR)
             fp.append(f"{cur}subtitles={esc_ass}:fontsdir={esc_fonts}[vcap]")
             cur = "[vcap]"
 

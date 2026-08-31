@@ -1,3 +1,4 @@
-# No Python packages needed — render pipeline is now FFmpeg-native.
-# audio.py, interpolation.py use only stdlib.
-# captions.py / layouts.py are retained as dead code but not called at runtime.
+# Render pipeline is FFmpeg-native; audio.py, interpolation.py use only stdlib.
+# OpenCV is required for AI editing face detection (face_detect.py).
+# haarcascade_frontalface_default.xml must be present in this directory (checked in).
+opencv-python-headless

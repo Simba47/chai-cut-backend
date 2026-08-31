@@ -27,9 +27,16 @@ async function runLoop(id: number) {
   }
 }
 
+// Railway sets RAILWAY_ENVIRONMENT automatically. If present, skip jobs that require
+// a residential IP (yt-dlp YouTube downloads) — those must run on the local worker.
+const isRailway = !!process.env.RAILWAY_ENVIRONMENT
+
 async function tick() {
   const [job] = await db<Job[]>`
-    SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1
+    SELECT * FROM jobs
+    WHERE status = 'queued'
+    ${isRailway ? db`AND NOT (type = 'transcribe' AND payload @> '{"requires_ytdlp":true}'::jsonb) AND type != 'ai_edit'` : db``}
+    ORDER BY created_at ASC LIMIT 1
   `
   if (!job) return
 

@@ -171,6 +171,13 @@ export async function handleTranscribeJob(job: Job) {
     }
 
     console.log(`[transcribe] ${isClipJob ? `clip ${payload.clip_id}` : `video ${payload.video_id}`} done — ${entries.length} words`)
+  } catch (err) {
+    // Only mark failed for fresh download jobs — retranscribe is called inline from ai_edit
+    // on an already-ready video, so corrupting its status there would be wrong.
+    if (!isClipJob && !isRetranscribe) {
+      await db`UPDATE videos SET status = 'failed' WHERE id = ${payload.video_id}`.catch(() => {})
+    }
+    throw err
   } finally {
     await rm(tmp, { recursive: true, force: true })
   }
@@ -186,16 +193,19 @@ async function downloadWithYtDlp(videoId: string, tmp: string): Promise<{ localP
   console.log(`[transcribe] yt-dlp downloading ${video.source_url}`)
   await setProgress(videoId, 5)
 
+  const cookiesPath = process.env.YOUTUBE_COOKIES_PATH
+  const ytdlpArgs = [
+    '-f', 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+    '--merge-output-format', 'mp4',
+    '-o', outputTemplate,
+    '--no-playlist',
+    '--newline',
+    ...(cookiesPath ? ['--cookies', cookiesPath] : ['--extractor-args', 'youtube:player_client=android']),
+    video.source_url!,
+  ]
+
   await new Promise<void>((resolve, reject) => {
-    const proc = spawn('yt-dlp', [
-      '-f', 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-      '--merge-output-format', 'mp4',
-      '-o', outputTemplate,
-      '--no-playlist',
-      '--newline',  // one progress line per update
-      '--extractor-args', 'youtube:player_client=android',
-      video.source_url!,
-    ])
+    const proc = spawn('yt-dlp', ytdlpArgs)
 
     let lastUpdate = 0
     proc.stdout.on('data', (chunk: Buffer) => {
@@ -214,11 +224,16 @@ async function downloadWithYtDlp(videoId: string, tmp: string): Promise<{ localP
         }
       }
     })
-    proc.stderr.on('data', () => {}) // drain
+    const stderrLines: string[] = []
+    proc.stderr.on('data', (chunk: Buffer) => {
+      const text = chunk.toString()
+      stderrLines.push(text)
+      process.stderr.write(text)
+    })
     proc.on('close', code => {
       process.stdout.write('\n')
       if (code === 0) resolve()
-      else reject(new Error(`yt-dlp exited with code ${code}`))
+      else reject(new Error(`yt-dlp exited with code ${code}: ${stderrLines.join('').slice(0, 500)}`))
     })
   })
 
@@ -228,23 +243,16 @@ async function downloadWithYtDlp(videoId: string, tmp: string): Promise<{ localP
 
   const rawPath = join(tmp, videoFile)
 
-  // ── Stage 2: Transcode (progress 45 → 55%) ────────────────────────────────
-  // Cap at 30 minutes so the output fits in Supabase's 50 MB storage limit
-  const MAX_DURATION_SEC = 1800
+  // ── Stage 2: Remux to MP4 (progress 45 → 55%) ───────────────────────────────
+  // Stream-copy video (no quality loss, no duration cap) and encode audio to AAC.
+  // R2 has no meaningful size limit, so the old 30-min / 480p budget is gone.
   const { stdout: durOut } = await execFileAsync('ffprobe', [
     '-v', 'error', '-show_entries', 'format=duration',
     '-of', 'default=noprint_wrappers=1:nokey=1', rawPath,
   ])
   const sourceDurationSec = parseFloat(durOut.trim()) || 60
-  const encodeDurationSec = Math.min(sourceDurationSec, MAX_DURATION_SEC)
-  const targetSizeKbits = 44 * 8 * 1024  // 44 MB budget (safely under 50 MB)
-  const audioBitrate = 96
-  const videoBitrate = Math.max(80, Math.floor(targetSizeKbits / encodeDurationSec) - audioBitrate)
 
-  if (sourceDurationSec > MAX_DURATION_SEC) {
-    console.log(`[transcribe] video is ${(sourceDurationSec / 60).toFixed(0)} min — trimming to first 30 min`)
-  }
-  console.log(`[transcribe] transcoding ${encodeDurationSec.toFixed(0)}s → 480p at ${videoBitrate}kbps…`)
+  console.log(`[transcribe] remuxing full video (${(sourceDurationSec / 60).toFixed(1)} min) to MP4…`)
   await setProgress(videoId, 47)
 
   const localPath = join(tmp, 'video_final.mp4')
@@ -253,14 +261,9 @@ async function downloadWithYtDlp(videoId: string, tmp: string): Promise<{ localP
   await new Promise<void>((resolve, reject) => {
     const proc = spawn('ffmpeg', [
       '-i', rawPath,
-      '-t', String(MAX_DURATION_SEC),   // trim to 30 min max
-      '-vf', 'scale=-2:480',
-      '-c:v', 'libx264',
-      '-b:v', `${videoBitrate}k`,
-      '-maxrate', `${Math.round(videoBitrate * 1.5)}k`,
-      '-bufsize', `${videoBitrate * 3}k`,
-      '-preset', 'fast',
-      '-c:a', 'aac', '-b:a', `${audioBitrate}k`,
+      '-c:v', 'copy',          // copy video stream — original quality, fast
+      '-c:a', 'aac',
+      '-b:a', '192k',
       '-movflags', '+faststart',
       '-progress', 'pipe:1',
       '-y', localPath,
@@ -272,7 +275,7 @@ async function downloadWithYtDlp(videoId: string, tmp: string): Promise<{ localP
       const m = text.match(/out_time_ms=(\d+)/)
       if (m) {
         outTime = parseInt(m[1]) / 1_000_000  // seconds
-        const pct = Math.min(1, outTime / encodeDurationSec)
+        const pct = Math.min(1, outTime / sourceDurationSec)
         // Map ffmpeg 0-100% → overall 47-55%
         const overall = Math.round(47 + pct * 8)
         setProgress(videoId, overall).catch(() => {})
@@ -311,7 +314,7 @@ interface SarvamResponse { language_code: string; transcript?: string; words: Sa
 
 const CHUNK_SEC = 25  // Sarvam max is 30s; keep at 25s for safety
 
-const PARALLEL = 10   // concurrent ffmpeg extractions AND Sarvam API calls
+const PARALLEL = 3    // concurrent ffmpeg extractions AND Sarvam API calls (higher → 429 rate limit)
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY
 const GROQ_API_KEY   = process.env.GROQ_API_KEY
@@ -653,6 +656,10 @@ async function callSarvamChunk(buf: Buffer, apiKey: string, languageCode?: strin
       body: formData,
     }, TIMEOUT_MS)
 
+    if (res.status === 429) {
+      await new Promise(r => setTimeout(r, 5000))
+      throw new Error(`Sarvam API 429: rate limit`)
+    }
     if (!res.ok) throw new Error(`Sarvam API ${res.status}: ${await res.text()}`)
 
     const raw = await res.json() as SarvamRawResponse
@@ -937,6 +944,14 @@ async function transliterateToRoman(
 
   if (!resolvedLang) return entries.map(() => undefined)
   const lang = resolvedLang
+
+  // English is already Roman — return words directly, no API needed
+  if (lang.startsWith('en')) {
+    return entries.map(e => {
+      const word = e.word.trim().toLowerCase().replace(/[.,!?।]/g, '')
+      return word || undefined
+    })
+  }
 
   // Prefer OpenAI GPT (most natural phrasing)
   if (OPENAI_API_KEY) return transliterateWithLLM(entries, lang, OPENAI_API_KEY)

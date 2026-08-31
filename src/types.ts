@@ -1,6 +1,6 @@
 export type VideoStatus = 'uploaded' | 'transcribing' | 'ready' | 'failed'
 export type ClipStatus = 'draft' | 'rendering' | 'done' | 'failed'
-export type JobType = 'transcribe' | 'render'
+export type JobType = 'transcribe' | 'render' | 'ai_edit'
 export type JobStatus = 'queued' | 'processing' | 'done' | 'failed'
 export type RenderQuality = '480p' | '720p' | '1080p' | '2160p'
 
@@ -29,6 +29,12 @@ export interface RenderJobPayload {
   video_storage_path: string
   quality?: RenderQuality
   watermark?: boolean
+}
+
+export interface AiEditJobPayload {
+  ai_edit_job_id: string
+  video_id: string
+  clip_count: number
 }
 
 export const JOB_POLL_INTERVAL_MS = 2000
