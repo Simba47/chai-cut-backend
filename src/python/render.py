@@ -184,7 +184,39 @@ def _write_ass(
 
 # ── FFmpeg crop expression builder ────────────────────────────────────────────
 
-_MAX_KF_PER_ATTR = 50  # FFmpeg expression parser depth limit
+_MAX_KF_PER_ATTR = 20  # FFmpeg expression depth limit — lower = faster eval
+
+
+def _rdp_simplify(kfs: list[dict], tol: float = 0.005) -> list[dict]:
+    """
+    Ramer-Douglas-Peucker simplification over all crop attributes simultaneously.
+    Removes keyframes whose x/y/w/h values are within `tol` of linear interpolation
+    between their neighbours. tol=0.005 = 0.5% of normalized [0,1] range (< 6px at 1080p).
+    """
+    if len(kfs) <= 2:
+        return kfs[:]
+
+    first, last = kfs[0], kfs[-1]
+    t0, t1 = first["t_ms"], last["t_ms"]
+    if t1 == t0:
+        return [first, last]
+
+    max_dev, max_i = 0.0, 0
+    for i in range(1, len(kfs) - 1):
+        alpha = (kfs[i]["t_ms"] - t0) / (t1 - t0)
+        dev = max(
+            abs(kfs[i][a] - (first[a] + alpha * (last[a] - first[a])))
+            for a in ("x", "y", "w", "h")
+        )
+        if dev > max_dev:
+            max_dev, max_i = dev, i
+
+    if max_dev <= tol:
+        return [first, last]
+
+    left  = _rdp_simplify(kfs[:max_i + 1], tol)
+    right = _rdp_simplify(kfs[max_i:], tol)
+    return left[:-1] + right
 
 def _step_expr(kf_list: list[dict], attr: str, seg_start_ms: int) -> str:
     """Step-interpolated crop coordinate (holds value until next keyframe fires)."""
@@ -194,7 +226,7 @@ def _step_expr(kf_list: list[dict], attr: str, seg_start_ms: int) -> str:
     if not kf_list:
         return f"{dim}*{defaults[attr]:.6f}"
 
-    sk = sorted(kf_list, key=lambda k: k["t_ms"])
+    sk = _rdp_simplify(sorted(kf_list, key=lambda k: k["t_ms"]))
 
     deduped: list[dict] = [sk[0]]
     for kf in sk[1:]:
@@ -229,7 +261,7 @@ def _linear_expr(kf_list: list[dict], attr: str, seg_start_ms: int) -> str:
     if not kf_list:
         return f"{dim}*{defaults[attr]:.6f}"
 
-    sk = sorted(kf_list, key=lambda k: k["t_ms"])
+    sk = _rdp_simplify(sorted(kf_list, key=lambda k: k["t_ms"]))
 
     # Deduplicate unchanged values to shrink the expression
     deduped: list[dict] = [sk[0]]
