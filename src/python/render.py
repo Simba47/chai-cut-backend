@@ -134,10 +134,13 @@ def _write_ass(
     primary = _hex_to_ass(color_hex, 0)
     shadow  = "&H80000000"
 
+    # Editor preview shows a word at video time = word time + timing_offset_ms
+    offset_ms = int(style.get("timing_offset_ms") or 0)
+
     # Rebase word timestamps to clip-relative (0 = first frame of clip)
     clip_words = [
-        {**w, "start_ms": w["start_ms"] - clip_start_ms,
-               "end_ms":   w["end_ms"]   - clip_start_ms}
+        {**w, "start_ms": w["start_ms"] - clip_start_ms + offset_ms,
+               "end_ms":   w["end_ms"]   - clip_start_ms + offset_ms}
         for w in words
     ]
 
@@ -163,11 +166,39 @@ def _write_ass(
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
 
-    for sentence in _group_sentences(clip_words):
-        if not sentence:
+    sentences = [s for s in _group_sentences(clip_words) if s]
+    # max(): transcription occasionally returns a word whose end is before its start
+    spans = [[s[0]["start_ms"], max(s[0]["start_ms"], s[-1]["end_ms"])] for s in sentences]
+
+    # Transcription sometimes stamps several lines with the same start time
+    # (zero-length words). Spread each such run evenly up to the next line.
+    i = 0
+    while i < len(spans):
+        j = i
+        while j + 1 < len(spans) and spans[j + 1][0] <= spans[i][0]:
+            j += 1
+        if j > i:
+            run_start = spans[i][0]
+            run_end = spans[j + 1][0] if j + 1 < len(spans) else run_start + 1500 * (j - i + 1)
+            run_end = max(run_end, max(e for _, e in spans[i:j + 1]))
+            slot = (run_end - run_start) / (j - i + 1)
+            for k in range(i, j + 1):
+                spans[k] = [round(run_start + (k - i) * slot), round(run_start + (k - i + 1) * slot)]
+        i = j + 1
+
+    for i, sentence in enumerate(sentences):
+        start_ms = max(0, spans[i][0])
+        end_ms   = spans[i][1] + 200
+        # Only one line on screen at a time (all lines share the same \pos, so any
+        # overlap draws them on top of each other). Like the editor preview, bridge
+        # sub-500ms gaps to the next line and never run past its start.
+        if i + 1 < len(spans):
+            next_start = spans[i + 1][0]
+            if next_start - spans[i][1] < 500:
+                end_ms = next_start
+            end_ms = min(end_ms, next_start)
+        if end_ms <= start_ms:
             continue
-        start_ms = max(0, sentence[0]["start_ms"])
-        end_ms   = sentence[-1]["end_ms"] + 200
         text     = " ".join(_word_display(w) for w in sentence if _word_display(w))
         if not text.strip():
             continue

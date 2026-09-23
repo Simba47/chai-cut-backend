@@ -60,7 +60,7 @@ async function detectFaces(tmp: string, videoPath: string, startMs: number, endM
 
   return new Promise((resolve) => {
     const script = join(__dirname, '../../src/python/face_detect.py')
-    const proc = spawn('python3', [script, '--frames-dir', framesDir], { stdio: ['ignore', 'pipe', 'pipe'] })
+    const proc = spawn('python3', [script, '--frames-dir', framesDir], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } })
     let stdout = ''
     let stderr = ''
     proc.stdout?.on('data', (d: Buffer) => { stdout += d.toString() })

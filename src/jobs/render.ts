@@ -191,7 +191,7 @@ export async function renderClipWithLocalVideo(
 
 function runPython(script: string, args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
-    const proc = spawn('python3', [script, ...args], { stdio: ['ignore', 'pipe', 'pipe'] })
+    const proc = spawn('python3', [script, ...args], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } })
     let stderr = ''
     proc.stdout?.on('data', (d: Buffer) => process.stdout.write(d))
     proc.stderr?.on('data', (d: Buffer) => { process.stderr.write(d); stderr += d.toString() })
