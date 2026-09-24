@@ -389,16 +389,29 @@ def main(
     # Sort by (start_ms, sort_order) — sort_order breaks ties so the "primary" segment
     # (lower sort_order) always wins when two segments share the same start_ms.
     segments = sorted(spec["segments"], key=lambda s: (s["start_ms"], s.get("sort_order", 0)))
-    # Mirror the preview's "first match wins" rule: skip any segment that starts before
-    # the previous one ended (overlapping segments are invisible in the editor preview).
+    # Mirror the preview's "first match wins" rule: where a segment starts before the
+    # previous one ended, only its overlapped part is hidden. Trim its start to the
+    # previous end (shifting its source position by the same amount) instead of dropping
+    # the whole segment — otherwise e.g. a main-video segment that starts under a B-roll
+    # insert loses everything after the insert, even though the preview plays it.
     _filtered: list[dict] = []
     _next_start = -1
     for _s in segments:
-        if _s["start_ms"] >= _next_start:
-            _filtered.append(_s)
-            _next_start = _s["end_ms"]
-        else:
-            print(f"[render] SKIP overlapping seg: start={_s['start_ms']}ms end={_s['end_ms']}ms sort_order={_s.get('sort_order')}", flush=True)
+        if _s["start_ms"] < _next_start:
+            if _s["end_ms"] <= _next_start:
+                print(f"[render] SKIP hidden seg: start={_s['start_ms']}ms end={_s['end_ms']}ms sort_order={_s.get('sort_order')}", flush=True)
+                continue
+            delta = _next_start - _s["start_ms"]
+            print(f"[render] TRIM overlapping seg: start={_s['start_ms']}ms → {_next_start}ms (end={_s['end_ms']}ms)", flush=True)
+            _s = {**_s, "start_ms": _next_start}
+            if _s.get("video_offset_ms") is not None:
+                _s["video_offset_ms"] = int(_s["video_offset_ms"]) + delta
+            _s["crop_boxes"] = [
+                {**b, "source_offset_ms": int(b["source_offset_ms"]) + delta} if b.get("source_offset_ms") is not None else b
+                for b in (_s.get("crop_boxes") or [])
+            ]
+        _filtered.append(_s)
+        _next_start = _s["end_ms"]
     segments = _filtered
     for _s in segments:
         broll = bool((_s.get("crop_boxes") or [{}])[0].get("source_video_id"))
@@ -723,6 +736,9 @@ def main(
             "-map", "[vout]",
             "-map", "1:a",
             "-c:v", "libx264",
+            # x264 defaults to ~1.5 threads per CPU core; on large Railway hosts that
+            # makes encoder startup allocate GBs and fail ("Error while opening encoder")
+            "-threads", "8",
             "-pix_fmt", "yuv420p",
             "-profile:v", "main",
             "-level", "4.0",
