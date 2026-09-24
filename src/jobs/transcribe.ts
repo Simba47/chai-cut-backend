@@ -312,14 +312,17 @@ interface SarvamRawResponse {
 }
 interface SarvamResponse { language_code: string; transcript?: string; words: SarvamWord[] }
 
-const CHUNK_SEC = 25  // Sarvam max is 30s; keep at 25s for safety
+// const CHUNK_SEC = 25  // Sarvam max is 30s; keep at 25s for safety   // old pipeline (disabled)
 
-const PARALLEL = 3    // concurrent ffmpeg extractions AND Sarvam API calls (higher → 429 rate limit)
+// const PARALLEL = 3    // concurrent ffmpeg extractions AND Sarvam API calls (higher → 429 rate limit)   // old pipeline (disabled)
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY
-const GROQ_API_KEY   = process.env.GROQ_API_KEY
-const SARVAM_API_KEY = process.env.SARVAM_API_KEY
+// const GROQ_API_KEY   = process.env.GROQ_API_KEY   // old pipeline (disabled)
+// const SARVAM_API_KEY = process.env.SARVAM_API_KEY   // old pipeline (disabled)
 
+/* ── OLD PIPELINE (disabled): Sarvam saaras:v3 + Groq whisper-large-v3 ──────────
+   Replaced by Gemini 3.5 Transcribe (see transcribeAudio below). Kept for rollback:
+   uncomment this block and delete the Gemini transcribeAudio to switch back.
 // Normalize a word for fuzzy matching: lowercase, strip punctuation.
 // Works across scripts (Telugu Unicode, Hindi Unicode, Latin) since we compare code-points.
 function normalizeWord(w: string): string {
@@ -628,8 +631,8 @@ async function callWhisperChunk(
 
   return { language_code: raw.language ?? languageCode ?? 'unknown', words }
 }
-
-// ── Sarvam: fallback when no OpenAI key ──────────────────────────────────────
+── end OLD PIPELINE ── */
+// ── fetch with timeout (used by Sarvam transliteration) ──────────────────────
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), timeoutMs)
@@ -640,6 +643,9 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   }
 }
 
+/* ── OLD PIPELINE (disabled): Sarvam saaras:v3 + Groq whisper-large-v3 ──────────
+   Replaced by Gemini 3.5 Transcribe (see transcribeAudio below). Kept for rollback:
+   uncomment this block and delete the Gemini transcribeAudio to switch back.
 async function callSarvamChunk(buf: Buffer, apiKey: string, languageCode?: string): Promise<SarvamResponse> {
   const TIMEOUT_MS = 90_000
 
@@ -677,6 +683,171 @@ async function callSarvamChunk(buf: Buffer, apiKey: string, languageCode?: strin
 
     return { language_code: raw.language_code, transcript: raw.transcript, words }
   }, 3, 1000)
+}
+── end OLD PIPELINE (callSarvamChunk) ── */
+
+// ── Gemini 3.5 Transcribe: words + word-level timestamps in one call ─────────
+// Audio is sent in 5-minute chunks: keeps each request under the Tier-1 limit of
+// 10k input tokens/min (~25 tokens per second of audio) and limits timestamp drift.
+// Each chunk is uploaded via the Files API, transcribed verbatim, then deleted.
+const GEMINI_API_KEY    = process.env.GEMINI_API_KEY
+const GEMINI_BASE       = 'https://generativelanguage.googleapis.com'
+const GEMINI_STT_MODEL  = 'gemini-3.5-transcribe'
+const GEMINI_CHUNK_SEC  = 300
+const GEMINI_MAX_TRIES  = 8
+
+// Our language codes (Sarvam style) → BCP-47 codes Gemini accepts
+function toGeminiLang(code: string): string {
+  return code === 'od-IN' ? 'or-IN' : code
+}
+
+async function geminiUploadAudio(buf: Buffer): Promise<{ name: string; uri: string }> {
+  const start = await fetchWithTimeout(`${GEMINI_BASE}/upload/v1beta/files`, {
+    method: 'POST',
+    headers: {
+      'x-goog-api-key': GEMINI_API_KEY!,
+      'X-Goog-Upload-Protocol': 'resumable',
+      'X-Goog-Upload-Command': 'start',
+      'X-Goog-Upload-Header-Content-Length': String(buf.length),
+      'X-Goog-Upload-Header-Content-Type': 'audio/wav',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ file: { display_name: `chai-cut-${Date.now()}` } }),
+  }, 60_000)
+  const uploadUrl = start.headers.get('x-goog-upload-url')
+  if (!uploadUrl) throw new Error(`Gemini upload start failed ${start.status}: ${await start.text()}`)
+
+  const up = await fetchWithTimeout(uploadUrl, {
+    method: 'POST',
+    headers: { 'X-Goog-Upload-Offset': '0', 'X-Goog-Upload-Command': 'upload, finalize' },
+    body: new Uint8Array(buf),
+  }, 180_000)
+  const { file } = await up.json() as { file?: { name: string; uri: string; state?: string } }
+  if (!file?.uri) throw new Error(`Gemini upload failed (${up.status})`)
+
+  // Audio files are usually ACTIVE immediately; poll briefly if still processing
+  for (let i = 0; i < 30 && file.state && file.state !== 'ACTIVE'; i++) {
+    await new Promise(r => setTimeout(r, 2000))
+    const s = await fetchWithTimeout(`${GEMINI_BASE}/v1beta/${file.name}`, { headers: { 'x-goog-api-key': GEMINI_API_KEY! } }, 30_000)
+    file.state = ((await s.json()) as { state?: string }).state
+  }
+  return { name: file.name, uri: file.uri }
+}
+
+async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promise<SarvamWord[]> {
+  for (let attempt = 1; ; attempt++) {
+    const file = await geminiUploadAudio(buf)
+    try {
+      const transcription_config: Record<string, unknown> = { mode: { type: 'verbatim', timestamp_granularities: ['word'] } }
+      if (languageCode) transcription_config.language_codes = [toGeminiLang(languageCode)]
+
+      const res = await fetchWithTimeout(`${GEMINI_BASE}/v1beta/interactions`, {
+        method: 'POST',
+        headers: { 'x-goog-api-key': GEMINI_API_KEY!, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: GEMINI_STT_MODEL,
+          input: [{ type: 'audio', uri: file.uri, mime_type: 'audio/wav' }],
+          generation_config: { transcription_config },
+        }),
+      }, 300_000)
+
+      if (res.ok) {
+        const raw = await res.json() as {
+          steps?: { content?: { annotations?: { type: string; text: string; start_offset: string; end_offset: string }[] }[] }[]
+        }
+        const words: SarvamWord[] = []
+        for (const step of raw.steps ?? []) {
+          for (const c of step.content ?? []) {
+            for (const a of c.annotations ?? []) {
+              if (a.type !== 'word_info' || !a.text?.trim()) continue
+              words.push({ word: a.text.trim(), start: parseFloat(a.start_offset), end: parseFloat(a.end_offset) })
+            }
+          }
+        }
+        return words
+      }
+
+      const body = await res.text()
+      const retryable = res.status === 429 || res.status >= 500
+      if (!retryable || attempt >= GEMINI_MAX_TRIES) throw new Error(`Gemini transcribe ${res.status}: ${body.slice(0, 300)}`)
+      // Rate limited (10k tokens/min on Tier 1) — wait for the window to reset
+      const hinted = parseFloat(body.match(/retry in ([\d.]+)s/i)?.[1] ?? '0')
+      const delaySec = Math.max(hinted, res.status === 429 ? 20 : 5 * attempt)
+      console.warn(`[gemini] ${res.status} on attempt ${attempt}, retrying in ${delaySec}s`)
+      await new Promise(r => setTimeout(r, delaySec * 1000))
+    } finally {
+      fetchWithTimeout(`${GEMINI_BASE}/v1beta/${file.name}`, { method: 'DELETE', headers: { 'x-goog-api-key': GEMINI_API_KEY! } }, 30_000)
+        .catch(() => {})
+    }
+  }
+}
+
+async function transcribeAudio(audioPath: string, videoId?: string, languageCode?: string): Promise<SarvamResponse> {
+  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not set')
+  console.log(`[transcribe] ${GEMINI_STT_MODEL} (verbatim, word timestamps)`)
+
+  const { stdout } = await execFileAsync('ffprobe', [
+    '-v', 'error', '-show_entries', 'format=duration',
+    '-of', 'default=noprint_wrappers=1:nokey=1', audioPath,
+  ])
+  const totalSec = parseFloat(stdout.trim())
+  const numChunks = Math.max(1, Math.ceil(totalSec / GEMINI_CHUNK_SEC))
+  console.log(`[transcribe] audio ${totalSec.toFixed(1)}s → ${numChunks} chunk(s)`)
+  if (videoId) await setProgress(videoId, 62)
+
+  async function chunkWords(i: number, lang: string | undefined): Promise<SarvamWord[]> {
+    const startSec = i * GEMINI_CHUNK_SEC
+    const chunkPath = audioPath.replace('.wav', `_gchunk${i}.wav`)
+    await execFileAsync('ffmpeg', [
+      '-i', audioPath, '-ss', String(startSec), '-t', String(GEMINI_CHUNK_SEC),
+      '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', chunkPath,
+    ])
+    const buf = await readFile(chunkPath)
+    await unlink(chunkPath).catch(() => {})
+    if (buf.length < 16_000) return []  // < 0.5s of audio — nothing to transcribe
+
+    const words = await geminiTranscribeChunk(buf, lang)
+    console.log(`[gemini] chunk ${i + 1}/${numChunks}: ${words.length} words${lang ? ` (${lang})` : ''}`)
+    return words.map(w => ({ ...w, start: w.start + startSec, end: w.end + startSec }))
+  }
+
+  // Auto-detect drops a lot of Telugu speech, so detect the language from the
+  // first chunk's script, then lock it for every chunk (re-running chunk 1).
+  let lang = (languageCode && languageCode !== 'unknown') ? languageCode : undefined
+  const allWords: SarvamWord[] = []
+  let probe: SarvamWord[] | null = null
+  if (!lang) {
+    probe = await chunkWords(0, undefined)
+    lang = detectSarvamLang(probe.map(w => w.word).join(' '))
+    if (lang) console.log(`[transcribe] detected language: ${lang} — locking for all chunks`)
+  }
+  for (let i = 0; i < numChunks; i++) {
+    if (i === 0 && probe && !lang) { allWords.push(...probe); continue }  // English / Latin script: keep auto result
+    if (videoId) await setProgress(videoId, Math.round(63 + (i / numChunks) * 33))
+    const words = await chunkWords(i, lang)
+    // Chunk 1 was transcribed twice (auto + locked) — keep whichever caught more speech
+    allWords.push(...(i === 0 && probe && probe.length > words.length ? probe : words))
+  }
+  const language = lang ?? (allWords.length ? 'en-IN' : 'unknown')
+
+  // Gemini occasionally returns a word slightly out of order — keep the timeline monotonic
+  allWords.sort((a, b) => a.start - b.start)
+
+  // Set each word's end to next word's start (removes gaps and overlaps),
+  // but cap at MAX_WORD_HOLD_SEC so captions disappear during long music/silence gaps
+  // rather than holding one word for 8-10 seconds.
+  const MAX_WORD_HOLD_SEC = 4.0
+  for (let i = 0; i < allWords.length - 1; i++) {
+    allWords[i] = {
+      ...allWords[i],
+      end: Math.min(allWords[i + 1].start, allWords[i].start + MAX_WORD_HOLD_SEC),
+    }
+  }
+  if (allWords.length > 0 && allWords[allWords.length - 1].end < totalSec) {
+    allWords[allWords.length - 1] = { ...allWords[allWords.length - 1], end: totalSec }
+  }
+
+  return { language_code: language, words: allWords }
 }
 
 // ── Rule-based Telugu → Roman transliterator ──────────────────────────────────
