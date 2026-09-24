@@ -107,8 +107,15 @@ def _group_sentences(words: list[dict]) -> list[list[dict]]:
             sentences.append(current)
             break
         gap = words[i + 1]["start_ms"] - w["end_ms"]
+        # A different speaker always starts a new line (never mix two people's words)
+        speaker_change = (
+            w.get("speaker_id") is not None
+            and words[i + 1].get("speaker_id") is not None
+            and words[i + 1]["speaker_id"] != w["speaker_id"]
+        )
         if (
             _is_sentence_end(w.get("word", ""))
+            or speaker_change
             or gap > _PHRASE_GAP_MS
             or len(current) >= _MAX_PHRASE_WORDS
         ):

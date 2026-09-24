@@ -24,6 +24,8 @@ export interface TranscribeJobPayload {
   clip_end_ms?: number
   // Re-render with fresh captions: this render job is queued once transcription finishes
   render_after?: RenderJobPayload
+  // Upload/link: caption the whole video in the background once it's ready
+  transcribe_full?: boolean
 }
 
 export interface RenderJobPayload {

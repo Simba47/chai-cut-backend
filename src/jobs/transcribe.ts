@@ -33,16 +33,24 @@ export async function handleTranscribeJob(job: Job) {
   const isLinkJob = !payload.storage_path
   const isRetranscribe = !!payload.is_retranscribe
   const isClipJob = !!payload.clip_id && payload.clip_start_ms !== undefined && payload.clip_end_ms !== undefined
+  // Full-video captions right after upload/download, so clips open with captions ready.
+  // The video is marked ready first — clipping never waits on this background transcription.
+  const isFullJob = !!payload.transcribe_full && !isClipJob && !isRetranscribe
+  let videoReady = false
 
-  // Plain upload jobs (already in storage, no clip): just mark ready.
-  // Transcription is deferred to clip creation now.
+  // Plain upload jobs (already in storage, no clip): mark ready. Without transcribe_full
+  // (older jobs) transcription is deferred to clip creation.
   if (!isLinkJob && !isClipJob && !isRetranscribe) {
     await db`UPDATE videos SET status = 'ready', download_progress = 100 WHERE id = ${payload.video_id}`
-    console.log(`[transcribe] upload video ${payload.video_id} ready — transcription deferred to clip creation`)
-    return
+    videoReady = true
+    if (!isFullJob) {
+      console.log(`[transcribe] upload video ${payload.video_id} ready — transcription deferred to clip creation`)
+      return
+    }
+    console.log(`[transcribe] upload video ${payload.video_id} ready — captioning full video in background`)
   }
 
-  if (!isRetranscribe && !isClipJob) {
+  if (isLinkJob && !isRetranscribe && !isClipJob) {
     await db`UPDATE videos SET status = 'transcribing', download_progress = 0 WHERE id = ${payload.video_id}`
   }
 
@@ -127,12 +135,17 @@ export async function handleTranscribeJob(job: Job) {
       } catch { /* optional */ }
 
       await db`UPDATE videos SET status = 'ready', storage_path = ${storagePath}, download_progress = 100, duration_ms = ${durationMs} WHERE id = ${payload.video_id}`
-      console.log(`[transcribe] link video ${payload.video_id} ready — transcription deferred to clip creation`)
-      return
+      videoReady = true
+      if (!isFullJob) {
+        console.log(`[transcribe] link video ${payload.video_id} ready — transcription deferred to clip creation`)
+        return
+      }
+      console.log(`[transcribe] link video ${payload.video_id} ready — captioning full video in background`)
     }
 
     // ── Transcription ─────────────────────────────────────────────────────────
-    const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob) ? payload.video_id : undefined, payload.language_code)
+    // Progress only matters while the video is still 'transcribing' (not for background full-video captions)
+    const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, payload.language_code)
 
     // Clip retranscribe: replace only this clip's time range in the latest transcript, so
     // other clips of the same video keep their captions. created_at is bumped so the
@@ -191,8 +204,8 @@ export async function handleTranscribeJob(job: Job) {
     console.log(`[transcribe] ${isClipJob ? `clip ${payload.clip_id}` : `video ${payload.video_id}`} done — ${entries.length} words`)
   } catch (err) {
     // Only mark failed for fresh download jobs — retranscribe is called inline from ai_edit
-    // on an already-ready video, so corrupting its status there would be wrong.
-    if (!isClipJob && !isRetranscribe) {
+    // on an already-ready video, and a failed background caption job leaves the video usable.
+    if (!isClipJob && !isRetranscribe && !videoReady) {
       await db`UPDATE videos SET status = 'failed' WHERE id = ${payload.video_id}`.catch(() => {})
     }
     throw err
@@ -767,7 +780,8 @@ async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promis
   for (let attempt = 1; ; attempt++) {
     const file = await geminiUploadAudio(buf)
     try {
-      const transcription_config: Record<string, unknown> = { mode: { type: 'verbatim', timestamp_granularities: ['word'] } }
+      // diarization: each word gets a speaker label, so caption lines never mix two speakers
+      const transcription_config: Record<string, unknown> = { mode: { type: 'verbatim', timestamp_granularities: ['word'], diarization_mode: 'speaker' } }
       if (languageCode) transcription_config.language_codes = [toGeminiLang(languageCode)]
 
       const res = await fetchWithTimeout(`${GEMINI_BASE}/v1beta/interactions`, {
@@ -782,14 +796,14 @@ async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promis
 
       if (res.ok) {
         const raw = await res.json() as {
-          steps?: { content?: { annotations?: { type: string; text: string; start_offset: string; end_offset: string }[] }[] }[]
+          steps?: { content?: { annotations?: { type: string; text: string; start_offset: string; end_offset: string; speaker?: string }[] }[] }[]
         }
         const words: SarvamWord[] = []
         for (const step of raw.steps ?? []) {
           for (const c of step.content ?? []) {
             for (const a of c.annotations ?? []) {
               if (a.type !== 'word_info' || !a.text?.trim()) continue
-              words.push({ word: a.text.trim(), start: parseFloat(a.start_offset), end: parseFloat(a.end_offset) })
+              words.push({ word: a.text.trim(), start: parseFloat(a.start_offset), end: parseFloat(a.end_offset), speaker: a.speaker })
             }
           }
         }
@@ -837,7 +851,8 @@ async function transcribeAudio(audioPath: string, videoId?: string, languageCode
 
     const words = await geminiTranscribeChunk(buf, lang)
     console.log(`[gemini] chunk ${i + 1}/${numChunks}: ${words.length} words${lang ? ` (${lang})` : ''}`)
-    return words.map(w => ({ ...w, start: w.start + startSec, end: w.end + startSec }))
+    // Speaker labels are only consistent within one request, so scope them to the chunk
+    return words.map(w => ({ ...w, start: w.start + startSec, end: w.end + startSec, speaker: w.speaker ? `c${i}:${w.speaker}` : undefined }))
   }
 
   // Auto-detect drops a lot of Telugu speech, so detect the language from the
@@ -862,18 +877,15 @@ async function transcribeAudio(audioPath: string, videoId?: string, languageCode
   // Gemini occasionally returns a word slightly out of order — keep the timeline monotonic
   allWords.sort((a, b) => a.start - b.start)
 
-  // Set each word's end to next word's start (removes gaps and overlaps),
-  // but cap at MAX_WORD_HOLD_SEC so captions disappear during long music/silence gaps
-  // rather than holding one word for 8-10 seconds.
-  const MAX_WORD_HOLD_SEC = 4.0
-  for (let i = 0; i < allWords.length - 1; i++) {
-    allWords[i] = {
-      ...allWords[i],
-      end: Math.min(allWords[i + 1].start, allWords[i].start + MAX_WORD_HOLD_SEC),
-    }
-  }
-  if (allWords.length > 0 && allWords[allWords.length - 1].end < totalSec) {
-    allWords[allWords.length - 1] = { ...allWords[allWords.length - 1], end: totalSec }
+  // Keep Gemini's real word end times so each caption ends when the voice ends — the
+  // old pipeline stretched every word to the next word's start (up to 4 s), which kept
+  // lines on screen through pauses and hid speaker turns. Only remove overlaps.
+  for (let i = 0; i < allWords.length; i++) {
+    const w = allWords[i]
+    const next = allWords[i + 1]
+    let end = Math.max(w.end, w.start + 0.08)
+    if (next && end > next.start) end = Math.max(w.start, next.start)
+    allWords[i] = { ...w, end: Math.min(end, totalSec) }
   }
 
   return { language_code: language, words: allWords }
@@ -1070,8 +1082,12 @@ async function transliterateWithGemini(
     const batch = entries.slice(i, i + BATCH)
     const words = batch.map(e => e.word.trim())
     try {
-      const res = await fetchWithTimeout(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`, {
+      // gemini-2.5-flash writes the most natural Tenglish in tests; Google has started retiring
+      // 2.5 models for new accounts, so fall back to the always-current Flash alias on 404
+      let res: Response | undefined
+      for (const model of ['gemini-2.5-flash', 'gemini-flash-latest']) {
+        res = await fetchWithTimeout(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
           method: 'POST',
           headers: { 'x-goog-api-key': GEMINI_API_KEY!, 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1080,7 +1096,7 @@ async function transliterateWithGemini(
 Rules:
 - Exactly one output string per input word, same order. Never merge, split, drop or add words.
 - Use common, natural spellings (e.g. నుంచి → "nunchi", నేను → "nenu", ఏమైంది → "emaindi", మనదే → "manade"), not academic transliteration and no diacritics.
-- English words written in ${langName} script get their normal English spelling (ఇట్స్ → "it's", ట్రూ → "true", కాటన్ → "cotton", యాక్టర్స్ → "actors").
+- English words written in ${langName} script get their normal English spelling (ఇట్స్ → "it's", ట్రూ → "true", కాటన్ → "cotton", యాక్టర్స్ → "actors", యాడ్ → "ad").
 - Numbers and words already in English letters stay as they are. Drop trailing punctuation.
 - Lowercase, except names and the pronoun "I".` }] },
             contents: [{ role: 'user', parts: [{ text: JSON.stringify(words) }] }],
@@ -1092,8 +1108,10 @@ Rules:
             },
           }),
         }, 60_000)
-      if (!res.ok) throw new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 200)}`)
-      const data = await res.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] }
+        if (res.status !== 404) break
+      }
+      if (!res!.ok) throw new Error(`Gemini ${res!.status}: ${(await res!.text()).slice(0, 200)}`)
+      const data = await res!.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] }
       const arr = JSON.parse(data.candidates?.[0]?.content?.parts?.[0]?.text ?? '[]') as unknown[]
       if (!Array.isArray(arr) || arr.length !== batch.length) {
         throw new Error(`expected ${batch.length} words, got ${Array.isArray(arr) ? arr.length : 'non-array'}`)
