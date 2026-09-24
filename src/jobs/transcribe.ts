@@ -62,7 +62,12 @@ export async function handleTranscribeJob(job: Job) {
         const cachedBuf = await r2Download(audioStoragePath)
         const flacPath = join(tmp, 'cached.flac')
         await writeFile(flacPath, cachedBuf)
-        await execFileAsync('ffmpeg', ['-i', flacPath, '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', audioPath])
+        // The cache holds the full video's audio — for clip jobs cut out just the clip's
+        // range, since word times are offset by clip_start_ms below
+        const clipRange = isClipJob
+          ? ['-ss', String(payload.clip_start_ms! / 1000), '-t', String((payload.clip_end_ms! - payload.clip_start_ms!) / 1000)]
+          : []
+        await execFileAsync('ffmpeg', [...clipRange, '-i', flacPath, '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', audioPath])
         audioCached = true
         console.log(`[transcribe] retranscribe: used cached audio (${audioStoragePath})`)
       } catch { /* fall through to full video download */ }
@@ -129,14 +134,27 @@ export async function handleTranscribeJob(job: Job) {
     // ── Transcription ─────────────────────────────────────────────────────────
     const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob) ? payload.video_id : undefined, payload.language_code)
 
-    if (isRetranscribe) {
-      await db`DELETE FROM transcripts WHERE video_id = ${payload.video_id}`
+    // Clip retranscribe: replace only this clip's time range in the latest transcript, so
+    // other clips of the same video keep their captions. created_at is bumped so the
+    // editor's "since" poll picks up the new words.
+    const [existing] = isRetranscribe && isClipJob
+      ? await db`SELECT id FROM transcripts WHERE video_id = ${payload.video_id} ORDER BY created_at DESC LIMIT 1`
+      : []
+    let transcript: { id: string }
+    if (existing) {
+      await db`DELETE FROM transcript_words WHERE transcript_id = ${existing.id} AND start_ms >= ${payload.clip_start_ms!} AND start_ms < ${payload.clip_end_ms!}`
+      await db`UPDATE transcripts SET language = ${sarvamResult.language_code}, created_at = now() WHERE id = ${existing.id}`
+      transcript = { id: existing.id as string }
+    } else {
+      if (isRetranscribe) {
+        await db`DELETE FROM transcripts WHERE video_id = ${payload.video_id}`
+      }
+      const [inserted] = await db`
+        INSERT INTO transcripts (video_id, language) VALUES (${payload.video_id}, ${sarvamResult.language_code}) RETURNING id
+      `
+      if (!inserted) throw new Error('Failed to insert transcript row')
+      transcript = { id: inserted.id as string }
     }
-
-    const [transcript] = await db`
-      INSERT INTO transcripts (video_id, language) VALUES (${payload.video_id}, ${sarvamResult.language_code}) RETURNING id
-    `
-    if (!transcript) throw new Error('Failed to insert transcript row')
 
     const entries = sarvamResult.words
     if (entries.length > 0) {
@@ -180,6 +198,17 @@ export async function handleTranscribeJob(job: Job) {
     throw err
   } finally {
     await rm(tmp, { recursive: true, force: true })
+    // Re-render requested: queue the render now that captions are updated. Also on
+    // failure, so the clip renders with its previous captions instead of staying stuck.
+    if (payload.render_after) {
+      const render = payload.render_after
+      await db`INSERT INTO jobs (type, payload, status) VALUES ('render', ${db.json(render as never)}, 'queued')`
+        .then(() => console.log(`[transcribe] queued render for clip ${render.clip_id}`))
+        .catch(async e => {
+          console.error(`[transcribe] failed to queue render for clip ${render.clip_id}:`, e)
+          await db`UPDATE clips SET status = 'failed' WHERE id = ${render.clip_id}`.catch(() => {})
+        })
+    }
   }
 }
 
@@ -1024,6 +1053,64 @@ Example: ["నేను", "విలన్", "హీరో"] → ["nenu", "villa
   return result
 }
 
+// Gemini batch transliteration → natural Tenglish / Hinglish (how people type it on
+// WhatsApp/YouTube), English loanwords in normal English spelling. One output per
+// input word, same order; any batch that doesn't come back 1:1 is left undefined so
+// the caller falls back to the rule-based / Sarvam transliterator for those words.
+async function transliterateWithGemini(
+  entries: SarvamWord[],
+  languageCode: string,
+): Promise<(string | undefined)[]> {
+  const langName = LANG_NAMES[languageCode] ?? 'Indian'
+  const style = langName === 'Telugu' ? 'Tenglish' : langName === 'Hindi' ? 'Hinglish' : `romanized ${langName}`
+  const BATCH = 80
+  const result: (string | undefined)[] = new Array(entries.length).fill(undefined)
+
+  for (let i = 0; i < entries.length; i += BATCH) {
+    const batch = entries.slice(i, i + BATCH)
+    const words = batch.map(e => e.word.trim())
+    try {
+      const res = await fetchWithTimeout(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`, {
+          method: 'POST',
+          headers: { 'x-goog-api-key': GEMINI_API_KEY!, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text:
+`You convert ${langName} caption words into ${style}: the way ${langName} speakers write their language in English letters on WhatsApp or YouTube comments.
+Rules:
+- Exactly one output string per input word, same order. Never merge, split, drop or add words.
+- Use common, natural spellings (e.g. నుంచి → "nunchi", నేను → "nenu", ఏమైంది → "emaindi", మనదే → "manade"), not academic transliteration and no diacritics.
+- English words written in ${langName} script get their normal English spelling (ఇట్స్ → "it's", ట్రూ → "true", కాటన్ → "cotton", యాక్టర్స్ → "actors").
+- Numbers and words already in English letters stay as they are. Drop trailing punctuation.
+- Lowercase, except names and the pronoun "I".` }] },
+            contents: [{ role: 'user', parts: [{ text: JSON.stringify(words) }] }],
+            generationConfig: {
+              temperature: 0,
+              responseMimeType: 'application/json',
+              responseSchema: { type: 'ARRAY', items: { type: 'STRING' } },
+              thinkingConfig: { thinkingBudget: 0 },
+            },
+          }),
+        }, 60_000)
+      if (!res.ok) throw new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 200)}`)
+      const data = await res.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] }
+      const arr = JSON.parse(data.candidates?.[0]?.content?.parts?.[0]?.text ?? '[]') as unknown[]
+      if (!Array.isArray(arr) || arr.length !== batch.length) {
+        throw new Error(`expected ${batch.length} words, got ${Array.isArray(arr) ? arr.length : 'non-array'}`)
+      }
+      for (let j = 0; j < batch.length; j++) {
+        const v = arr[j]
+        result[i + j] = typeof v === 'string' && v.trim() ? stripDiacritics(v.trim()).replace(/[.,!?।]+$/g, '') : undefined
+      }
+    } catch (err) {
+      console.warn(`[transliterate] Gemini batch ${i}-${i + batch.length} failed, using fallback:`, err)
+    }
+  }
+
+  console.log(`[transliterate] ${languageCode} → ${style} via Gemini for ${entries.length} word(s)`)
+  return result
+}
+
 // Strip IAST diacritics → plain ASCII so captions read as normal English letters.
 function stripDiacritics(s: string): string {
   return s.normalize('NFD')
@@ -1127,17 +1214,27 @@ async function transliterateToRoman(
   // Prefer OpenAI GPT (most natural phrasing)
   if (OPENAI_API_KEY) return transliterateWithLLM(entries, lang, OPENAI_API_KEY)
 
-  // For Telugu: use rule-based transliterator — deterministic, no API drift
-  if (lang === 'te-IN' || lang === 'te') {
-    return entries.map(e => {
-      const word = e.word.trim()
-      if (!word || !/[ఀ-౿]/.test(word)) return /[a-zA-Z]/.test(word) ? word.toLowerCase() : undefined
-      const roman = transliterateTeluguWord(word).replace(/[.,!?।]/g, '').trim()
-      return roman || undefined
-    })
+  // Deterministic fallbacks: rule-based for Telugu, Sarvam API for other languages
+  const fallback = async (): Promise<(string | undefined)[]> => {
+    if (lang === 'te-IN' || lang === 'te') {
+      return entries.map(e => {
+        const word = e.word.trim()
+        if (!word || !/[ఀ-౿]/.test(word)) return /[a-zA-Z]/.test(word) ? word.toLowerCase() : undefined
+        const roman = transliterateTeluguWord(word).replace(/[.,!?।]/g, '').trim()
+        return roman || undefined
+      })
+    }
+    if (sarvamApiKey) return transliterateWithSarvam(entries, lang, sarvamApiKey)
+    return entries.map(() => undefined)
   }
 
-  // Other Indian languages: fall back to Sarvam transliterate API
-  if (sarvamApiKey) return transliterateWithSarvam(entries, lang, sarvamApiKey)
-  return entries.map(() => undefined)
+  // Gemini gives natural Tenglish/Hinglish (e.g. "nunchi", not "numchi"); words it
+  // couldn't convert are filled from the fallback
+  if (GEMINI_API_KEY) {
+    const viaGemini = await transliterateWithGemini(entries, lang)
+    if (viaGemini.every(Boolean)) return viaGemini
+    const fb = await fallback()
+    return viaGemini.map((r, i) => r ?? fb[i])
+  }
+  return fallback()
 }
