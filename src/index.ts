@@ -1,6 +1,9 @@
 import 'dotenv/config' // reload env
 
-const REQUIRED_ENV = ['DATABASE_URL', 'SARVAM_API_KEY', 'GROQ_API_KEY', 'R2_ENDPOINT', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'GEMINI_API_KEY']
+// Captions now use Gemini 3.5 Transcribe. GROQ_API_KEY is no longer used; SARVAM_API_KEY is
+// optional (only romanizes Hindi and other non-Telugu Indian languages).
+// const REQUIRED_ENV = ['DATABASE_URL', 'SARVAM_API_KEY', 'GROQ_API_KEY', 'R2_ENDPOINT', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'GEMINI_API_KEY']
+const REQUIRED_ENV = ['DATABASE_URL', 'R2_ENDPOINT', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'GEMINI_API_KEY']
 const missing = REQUIRED_ENV.filter(k => !process.env[k])
 if (missing.length) {
   console.error(`[startup] Missing required env vars: ${missing.join(', ')}`)
