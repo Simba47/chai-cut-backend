@@ -420,6 +420,27 @@ def main(
         _filtered.append(_s)
         _next_start = _s["end_ms"]
     segments = _filtered
+    # Formats are independent in the editor, so parts of the clip can have no format. Those parts
+    # use the default framing: a full-frame box, which the cover scale crops to a centred 9:16
+    # (the same default the editor preview shows). Filling them keeps video, audio and captions
+    # the same length and in sync.
+    _filled: list[dict] = []
+    _cursor = 0
+    for _s in segments + [None]:
+        _gap_end = clip_dur_ms if _s is None else int(_s["start_ms"])
+        if _gap_end - _cursor >= 50:
+            print(f"[render] default framing for uncovered {_cursor}ms–{_gap_end}ms", flush=True)
+            _filled.append({
+                "start_ms": _cursor, "end_ms": _gap_end, "layout": "vertical", "sort_order": 0,
+                "crop_boxes": [{
+                    "slot_index": 0, "source_video_id": None, "source_offset_ms": _cursor,
+                    "box_keyframes": [{"t_ms": _cursor, "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}],
+                }],
+            })
+        if _s is not None:
+            _filled.append(_s)
+            _cursor = max(_cursor, int(_s["end_ms"]))
+    segments = _filled
     for _s in segments:
         broll = bool((_s.get("crop_boxes") or [{}])[0].get("source_video_id"))
         print(f"[render] seg: start={_s['start_ms']}ms end={_s['end_ms']}ms video_offset={_s.get('video_offset_ms')} broll={broll}", flush=True)
