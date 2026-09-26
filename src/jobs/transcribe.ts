@@ -147,11 +147,17 @@ export async function handleTranscribeJob(job: Job) {
     // Progress only matters while the video is still 'transcribing' (not for background full-video captions)
     const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, payload.language_code)
 
-    // Clip retranscribe: replace only this clip's time range in the latest transcript, so
-    // other clips of the same video keep their captions. created_at is bumped so the
-    // editor's "since" poll picks up the new words.
-    const [existing] = isRetranscribe && isClipJob
-      ? await db`SELECT id FROM transcripts WHERE video_id = ${payload.video_id} ORDER BY created_at DESC LIMIT 1`
+    // Clip jobs (first transcription or retranscribe): replace only this clip's time range in the
+    // video's transcript, so other clips of the same video keep their captions. The editor reads
+    // one transcript per video (the newest), so a clip job must never start a separate one —
+    // that hid every other clip's captions. created_at is bumped so the editor's "since" poll
+    // picks up the new words.
+    const [existing] = isClipJob
+      ? await db`
+          SELECT t.id FROM transcripts t
+          WHERE t.video_id = ${payload.video_id}
+            AND EXISTS (SELECT 1 FROM transcript_words w WHERE w.transcript_id = t.id)
+          ORDER BY t.created_at DESC LIMIT 1`
       : []
     let transcript: { id: string }
     if (existing) {
@@ -173,10 +179,13 @@ export async function handleTranscribeJob(job: Job) {
     if (entries.length > 0) {
       const offsetMs = isClipJob ? payload.clip_start_ms! : 0
       const romanized = await transliterateToRoman(entries, sarvamResult.language_code, process.env.SARVAM_API_KEY)
+      // English spoken inside a regional-language video: store it in that language's script too,
+      // so "Auto language" captions are all in one script (word_roman keeps the English spelling)
+      const native = await toNativeScript(entries, sarvamResult.language_code)
 
       const words = entries.map((e, i) => ({
         transcript_id: transcript.id,
-        word: e.word,
+        word: native[i] ?? e.word,
         word_roman: romanized[i] ?? null,
         start_ms: Math.round(e.start * 1000) + offsetMs,
         end_ms:   Math.round(e.end   * 1000) + offsetMs,
@@ -825,7 +834,7 @@ async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promis
   }
 }
 
-async function transcribeAudio(audioPath: string, videoId?: string, languageCode?: string): Promise<SarvamResponse> {
+export async function transcribeAudio(audioPath: string, videoId?: string, languageCode?: string): Promise<SarvamResponse> {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not set')
   console.log(`[transcribe] ${GEMINI_STT_MODEL} (verbatim, word timestamps)`)
 
@@ -849,8 +858,18 @@ async function transcribeAudio(audioPath: string, videoId?: string, languageCode
     await unlink(chunkPath).catch(() => {})
     if (buf.length < 16_000) return []  // < 0.5s of audio — nothing to transcribe
 
-    const words = await geminiTranscribeChunk(buf, lang)
+    let words = await geminiTranscribeChunk(buf, lang)
     console.log(`[gemini] chunk ${i + 1}/${numChunks}: ${words.length} words${lang ? ` (${lang})` : ''}`)
+    // Locked to an Indian language, Gemini drops sentences spoken purely in English — re-read
+    // the stretches it left empty as English and merge those words in
+    if (lang && !lang.startsWith('en')) {
+      const chunkSec = Math.min(GEMINI_CHUNK_SEC, Math.max(0, totalSec - startSec))
+      const extra = await englishGapPass(chunkPath, audioPath, startSec, chunkSec, words)
+      if (extra.length) {
+        console.log(`[gemini] chunk ${i + 1}/${numChunks}: +${extra.length} English words from untranscribed gaps`)
+        words = [...words, ...extra].sort((a, b) => a.start - b.start)
+      }
+    }
     // Speaker labels are only consistent within one request, so scope them to the chunk
     return words.map(w => ({ ...w, start: w.start + startSec, end: w.end + startSec, speaker: w.speaker ? `c${i}:${w.speaker}` : undefined }))
   }
@@ -889,6 +908,61 @@ async function transcribeAudio(audioPath: string, videoId?: string, languageCode
   }
 
   return { language_code: language, words: allWords }
+}
+
+// ── English re-pass for gaps ──────────────────────────────────────────────────
+// With language_codes locked to e.g. te-IN (auto-detect drops a lot of Telugu speech), a
+// sentence spoken entirely in English comes back with no words at all. Find the stretches of
+// the chunk with no words, stitch them into one clip (short silence between), transcribe that
+// once as English, and map the words back to their real times.
+const GAP_MIN_SEC = 1.8
+const GAP_PAD_SEC = 0.15
+const GAP_SEPARATOR_SEC = 0.6
+
+async function englishGapPass(chunkPathHint: string, audioPath: string, chunkStartSec: number, chunkSec: number, words: SarvamWord[]): Promise<SarvamWord[]> {
+  const gaps: [number, number][] = []
+  let cursor = 0
+  for (const w of [...words].sort((a, b) => a.start - b.start)) {
+    if (w.start - cursor >= GAP_MIN_SEC) gaps.push([cursor, w.start])
+    cursor = Math.max(cursor, w.end)
+  }
+  if (chunkSec - cursor >= GAP_MIN_SEC) gaps.push([cursor, chunkSec])
+  if (!gaps.length) return []
+
+  // Pieces of the full audio (absolute times) and where each lands in the stitched clip
+  const pieces = gaps.map(([a, b]) => ({ from: Math.max(0, a - GAP_PAD_SEC), to: Math.min(chunkSec, b + GAP_PAD_SEC) }))
+  let at = 0
+  const placed = pieces.map(p => { const out = { ...p, at }; at += (p.to - p.from) + GAP_SEPARATOR_SEC; return out })
+  const gapPath = chunkPathHint.replace('.wav', '_gaps.wav')
+  const fc: string[] = []
+  placed.forEach((p, k) => {
+    fc.push(`[0:a]atrim=start=${(chunkStartSec + p.from).toFixed(3)}:end=${(chunkStartSec + p.to).toFixed(3)},asetpts=PTS-STARTPTS[g${k}]`)
+    fc.push(`aevalsrc=0:d=${GAP_SEPARATOR_SEC}:s=16000[z${k}]`)
+  })
+  fc.push(`${placed.map((_, k) => `[g${k}][z${k}]`).join('')}concat=n=${placed.length * 2}:v=0:a=1[out]`)
+  try {
+    await execFileAsync('ffmpeg', ['-i', audioPath, '-filter_complex', fc.join(';'), '-map', '[out]',
+      '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', gapPath])
+    const buf = await readFile(gapPath)
+    if (buf.length < 16_000) return []
+    const found = await geminiTranscribeChunk(buf, 'en-IN')
+    const out: SarvamWord[] = []
+    for (const w of found) {
+      const p = placed.find(x => w.start >= x.at - 0.05 && w.start < x.at + (x.to - x.from))
+      if (!p) continue // landed in a separator
+      const start = p.from + (w.start - p.at)
+      const end = Math.min(p.to, p.from + (w.end - p.at))
+      // Only keep words inside a real gap, so nothing overlaps what the main pass found
+      if (!gaps.some(([a, b]) => start >= a - GAP_PAD_SEC && start < b)) continue
+      out.push({ ...w, start, end: Math.max(end, start + 0.08), speaker: w.speaker ? `en:${w.speaker}` : undefined })
+    }
+    return out
+  } catch (e) {
+    console.warn('[gemini] English gap pass failed, keeping the main pass only:', e)
+    return []
+  } finally {
+    await unlink(gapPath).catch(() => {})
+  }
 }
 
 // ── Rule-based Telugu → Roman transliterator ──────────────────────────────────
@@ -1127,6 +1201,78 @@ Rules:
 
   console.log(`[transliterate] ${languageCode} → ${style} via Gemini for ${entries.length} word(s)`)
   return result
+}
+
+/** Script ranges of the languages LANG_NAMES covers — a word containing any of these is already native */
+const NATIVE_SCRIPT = /[\u0900-\u0D7F\u0B00-\u0B7F]/
+const LATIN = /[A-Za-z]/
+
+/**
+ * Words in English letters inside a regional-language transcript (English phrases the speaker
+ * used, or sentences recovered by the English gap pass), written in that language's script the
+ * way its speakers spell English words: so → సో, think → థింక్. Returns one entry per input
+ * word: the native spelling, or undefined to keep the word as it is. Trailing punctuation is
+ * kept, since captions break lines at sentence ends.
+ */
+export async function toNativeScript(entries: SarvamWord[], languageCode: string): Promise<(string | undefined)[]> {
+  const out: (string | undefined)[] = new Array(entries.length).fill(undefined)
+  const langName = LANG_NAMES[languageCode]
+  if (!langName || !GEMINI_API_KEY) return out
+  const todo = entries
+    .map((e, i) => ({ i, word: e.word.trim() }))
+    .filter(x => LATIN.test(x.word) && !NATIVE_SCRIPT.test(x.word))
+  if (!todo.length) return out
+
+  const BATCH = 80
+  for (let b = 0; b < todo.length; b += BATCH) {
+    const batch = todo.slice(b, b + BATCH)
+    // Punctuation stays outside the conversion and goes back on afterwards
+    const split = batch.map(x => {
+      const m = x.word.match(/^(.*?)([.,!?।…:;"')\]]*)$/)!
+      return { core: m[1], tail: m[2] }
+    })
+    try {
+      let res: Response | undefined
+      for (const model of ['gemini-2.5-flash', 'gemini-flash-latest']) {
+        res = await fetchWithTimeout(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+            method: 'POST',
+            headers: { 'x-goog-api-key': GEMINI_API_KEY!, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text:
+`You write English words in ${langName} script, the way ${langName} captions and news write English words spoken in a ${langName} video (phonetically, as ${langName} speakers pronounce them).
+Rules:
+- Exactly one output string per input word, same order. Never merge, split, drop or add words.
+- Spell by sound in ${langName} script${langName === 'Telugu' ? ' (so → "సో", think → "థింక్", actually → "యాక్చువల్లీ", I → "ఐ", it\'s → "ఇట్స్", brand → "బ్రాండ్", YouTube → "యూట్యూబ్")' : ''}.
+- Numbers stay as digits. Keep capital-letter brand names readable by sound. No English letters in the output unless the input is only digits.` }] },
+              contents: [{ role: 'user', parts: [{ text: JSON.stringify(split.map(x => x.core)) }] }],
+              generationConfig: {
+                temperature: 0,
+                responseMimeType: 'application/json',
+                responseSchema: { type: 'ARRAY', items: { type: 'STRING' } },
+                thinkingConfig: { thinkingBudget: 0 },
+              },
+            }),
+          }, 60_000)
+        if (res.status !== 404) break
+      }
+      if (!res!.ok) throw new Error(`Gemini ${res!.status}: ${(await res!.text()).slice(0, 200)}`)
+      const data = await res!.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] }
+      const arr = JSON.parse(data.candidates?.[0]?.content?.parts?.[0]?.text ?? '[]') as unknown[]
+      if (!Array.isArray(arr) || arr.length !== batch.length) {
+        throw new Error(`expected ${batch.length} words, got ${Array.isArray(arr) ? arr.length : 'non-array'}`)
+      }
+      batch.forEach((x, j) => {
+        const v = arr[j]
+        // Only take real conversions; anything still in English letters keeps the original
+        if (typeof v === 'string' && v.trim() && NATIVE_SCRIPT.test(v) && !LATIN.test(v)) out[x.i] = v.trim() + split[j].tail
+      })
+    } catch (err) {
+      console.warn(`[native-script] batch ${b}-${b + batch.length} failed, keeping English letters:`, err)
+    }
+  }
+  console.log(`[native-script] ${todo.length} English word(s) → ${langName} script`)
+  return out
 }
 
 // Strip IAST diacritics → plain ASCII so captions read as normal English letters.
