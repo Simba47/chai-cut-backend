@@ -23,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges
+from frames import is_frame, frame_rows, wrap_band_text, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones
 
 # ── Quality presets (identical to previous version) ───────────────────────────
 _QUALITY: dict[int, dict] = {
@@ -78,8 +79,9 @@ def _ms_to_ass_ts(ms: int) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def _word_display(w: dict) -> str:
-    return w.get("word_roman") or w.get("word", "")
+def _word_display(w: dict, roman: bool = False) -> str:
+    """A caption word in the letters the user picked: English letters (word_roman) or its own script."""
+    return (w.get("word_roman") if roman else None) or w.get("word", "")
 
 
 def _is_sentence_end(word: str) -> bool:
@@ -131,12 +133,15 @@ def _write_ass(
     out_w: int,
     out_h: int,
     path: str,
+    band_zones: list[tuple[int, int, int]] | None = None,
 ) -> None:
     font_id   = style.get("font") or "noto-sans-telugu"
     font_name = _FONT_NAMES.get(font_id, "Roboto")
     font_size = int(style.get("size") or 52)
     color_hex = style.get("color") or "#ffffff"
     pos_y_frac = float(style.get("position_y") or 0.84)
+    # The editor's Caption language: 'roman' = English letters, anything else = the spoken script
+    roman     = style.get("language") == "roman"
 
     primary = _hex_to_ass(color_hex, 0)
     shadow  = "&H80000000"
@@ -206,18 +211,102 @@ def _write_ass(
             end_ms = min(end_ms, next_start)
         if end_ms <= start_ms:
             continue
-        text     = " ".join(_word_display(w) for w in sentence if _word_display(w))
+        text     = " ".join(_word_display(w, roman) for w in sentence if _word_display(w, roman))
         if not text.strip():
             continue
-        # Alignment=5 (center of screen); \pos pins the anchor to exact coordinates
-        tag = f"{{\\pos({pos_x},{pos_y})}}"
-        lines.append(
-            f"Dialogue: 0,{_ms_to_ass_ts(start_ms)},{_ms_to_ass_ts(end_ms)},"
-            f"Default,,0,0,0,,{tag}{text}"
-        )
+        # Alignment=5 (center of screen); \pos pins the anchor to exact coordinates. Where a
+        # frame shows captions in its text band, that part of the line is centred in the band.
+        for a, b, y in _split_by_zones(start_ms, end_ms, band_zones or [], pos_y):
+            tag = f"{{\\pos({pos_x},{y})}}"
+            lines.append(
+                f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},"
+                f"Default,,0,0,0,,{tag}{text}"
+            )
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+
+
+def _split_by_zones(start_ms: int, end_ms: int, zones: list[tuple[int, int, int]], default_y: int) -> list[tuple[int, int, int]]:
+    """Cut [start, end) where caption band zones begin/end: (start, end, y) pieces."""
+    cuts = {start_ms, end_ms}
+    for a, b, _ in zones:
+        if start_ms < a < end_ms:
+            cuts.add(a)
+        if start_ms < b < end_ms:
+            cuts.add(b)
+    pts = sorted(cuts)
+    out: list[tuple[int, int, int]] = []
+    for a, b in zip(pts, pts[1:]):
+        mid = (a + b) / 2
+        y = next((zy for za, zb, zy in zones if za <= mid < zb), default_y)
+        if out and out[-1][2] == y and out[-1][1] == a:
+            out[-1] = (out[-1][0], b, y)
+        else:
+            out.append((a, b, y))
+    return out
+
+
+# ── Frames ────────────────────────────────────────────────────────────────────
+
+_probe_cache: dict[str, tuple[float, bool]] = {}
+
+
+def _probe(path: str) -> tuple[float, bool]:
+    """(duration in s or 0 if unknown, has an audio stream) of a media file."""
+    if path in _probe_cache:
+        return _probe_cache[path]
+    dur, has_audio = 0.0, True
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type", "-of", "json", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        info = json.loads(r.stdout or "{}")
+        dur = float((info.get("format") or {}).get("duration") or 0)
+        has_audio = any(st.get("codec_type") == "audio" for st in info.get("streams") or [])
+    except Exception:
+        pass
+    _probe_cache[path] = (dur, has_audio)
+    return _probe_cache[path]
+
+
+def _hex6(v: str | None, fallback: str) -> str:
+    h = (v or "").lstrip("#")
+    return h[:6] if len(h) >= 6 and all(c in "0123456789abcdefABCDEF" for c in h[:6]) else fallback
+
+
+def _frame_text_font(text: str) -> str:
+    """Montserrat Bold for Latin text; Noto for Indian scripts Montserrat can't draw."""
+    if any("\u0c00" <= c <= "\u0c7f" for c in text):
+        path = _find_font_path("noto-sans-telugu")
+    elif any("\u0900" <= c <= "\u097f" for c in text):
+        path = _find_font_path("noto-sans-devanagari")
+    else:
+        path = _find_font_path("montserrat-bold")
+    path = path or _find_font_path("roboto")
+    # Quoted in the filter; inside the quotes ':' (Windows drive letters) still needs escaping
+    return path.replace("\\", "/").replace(":", "\\:") if path else ""
+
+
+def _frame_text_chain(text: str, bg: str, color: str, size_1080: int, w: int, h: int, dur_s: float) -> str:
+    """A solid w×h card with centred, wrapped text (the band or a text card in a slot)."""
+    chain = f"color=c=0x{bg}:s={w}x{h}:d={dur_s:.3f}:r=30,format=yuv420p"
+    text = (text or "").strip()
+    font = _frame_text_font(text) if text else ""
+    if text and font:
+        size = max(8, int(round(size_1080 * w / 1080)))
+        # Wrap at 1080-wide scale, like the editor preview, so lines break in the same places
+        lines = wrap_band_text(text, 1080, size_1080)
+        lh = int(size * 1.2)
+        top = (h - lh * len(lines)) / 2
+        for li, ln in enumerate(lines):
+            if not ln:
+                continue
+            y = int(top + li * lh + (lh - size) / 2)
+            chain += (f",drawtext=fontfile='{font}':text='{_escape_drawtext(ln)}':fontsize={size}"
+                      f":fontcolor=0x{color}:x=(w-tw)/2:y={y}")
+    return f"{chain},setsar=1"
 
 
 # ── FFmpeg crop expression builder ────────────────────────────────────────────
@@ -382,10 +471,12 @@ def main(
     overlay_images: dict[str, str] | None = None,
     overlay_videos: dict[str, str] | None = None,
     watermark: bool = False,
+    frame_images: dict[str, str] | None = None,
 ) -> None:
     secondary_videos = secondary_videos or {}
     overlay_images   = overlay_images   or {}
     overlay_videos   = overlay_videos   or {}
+    frame_images     = frame_images     or {}
 
     spec           = json.load(open(spec_path))
     clip_start_ms  = int(spec["start_ms"])
@@ -420,6 +511,27 @@ def main(
         _filtered.append(_s)
         _next_start = _s["end_ms"]
     segments = _filtered
+    # Formats are independent in the editor, so parts of the clip can have no format. Those parts
+    # use the default framing: a full-frame box, which the cover scale crops to a centred 9:16
+    # (the same default the editor preview shows). Filling them keeps video, audio and captions
+    # the same length and in sync.
+    _filled: list[dict] = []
+    _cursor = 0
+    for _s in segments + [None]:
+        _gap_end = clip_dur_ms if _s is None else int(_s["start_ms"])
+        if _gap_end - _cursor >= 50:
+            print(f"[render] default framing for uncovered {_cursor}ms–{_gap_end}ms", flush=True)
+            _filled.append({
+                "start_ms": _cursor, "end_ms": _gap_end, "layout": "vertical", "sort_order": 0,
+                "crop_boxes": [{
+                    "slot_index": 0, "source_video_id": None, "source_offset_ms": _cursor,
+                    "box_keyframes": [{"t_ms": _cursor, "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}],
+                }],
+            })
+        if _s is not None:
+            _filled.append(_s)
+            _cursor = max(_cursor, int(_s["end_ms"]))
+    segments = _filled
     for _s in segments:
         broll = bool((_s.get("crop_boxes") or [{}])[0].get("source_video_id"))
         print(f"[render] seg: start={_s['start_ms']}ms end={_s['end_ms']}ms video_offset={_s.get('video_offset_ms')} broll={broll}", flush=True)
@@ -462,13 +574,21 @@ def main(
         ass_path = None
         if clip_words and caption_style:
             ass_path = os.path.join(tmp, "captions.ass")
-            _write_ass(clip_words, caption_style, clip_start_ms, out_w, out_h, ass_path)
+            _write_ass(clip_words, caption_style, clip_start_ms, out_w, out_h, ass_path,
+                       band_zones=caption_band_zones(segments, out_h))
 
         # ── Count how many times each source video is needed ───────────────────
         # FFmpeg requires explicit split() when a stream is consumed more than once.
         slot_counts: dict[str | None, int] = {None: 0}
         for seg in segments:
             boxes   = sorted(seg.get("crop_boxes", []), key=lambda b: b.get("slot_index", 0))
+            if is_frame(seg.get("layout")):
+                # Only slots showing the main video read it; lane items are inputs of their own
+                main_slots = set(frame_state(seg).get("main_slots") or [])
+                for kind, slot, _ in frame_rows(seg["layout"], out_h, frame_band_shown(seg)):
+                    if kind == "slot" and slot in main_slots:
+                        slot_counts[None] = slot_counts.get(None, 0) + 1
+                continue
             n_slots = {"split": 2, "trio": 3}.get(seg.get("layout", "vertical"), 1)
             # For B-roll INSERT segments, remember the primary (slot-0) source so empty
             # extra slots fall back to it instead of the main video.
@@ -498,7 +618,7 @@ def main(
         sec_input_idx: dict[str, int] = {}
         for i, (vid_id, path) in enumerate(secondary_videos.items()):
             sec_input_idx[vid_id] = i + 2
-            inputs += ["-i", path]
+            inputs += ["-stream_loop", "-1", "-i", path]
 
         img_base = 2 + len(secondary_videos)
         valid_img: list[tuple[dict, str]] = []
@@ -515,6 +635,32 @@ def main(
             if lp and os.path.exists(lp):
                 inputs += ["-i", lp]
                 valid_vid.append((ov, f"[{vid_base + len(valid_vid)}:v]"))
+
+        # Frame lane items: every video and photo is an input of its own, opened at the point it
+        # starts, so nothing has to be buffered until the item appears
+        next_input = vid_base + len(valid_vid)
+        frame_item_in: dict[tuple[int, str], str] = {}
+        for si, seg in enumerate(segments):
+            if not is_frame(seg.get("layout")):
+                continue
+            st = frame_state(seg)
+            for kind, slot, _ in frame_rows(seg["layout"], out_h, frame_band_shown(seg)):
+                if kind != "slot":
+                    continue
+                for it in lane_items(seg, st, slot):
+                    if it.get("kind") == "video" and it.get("source_video_id") in secondary_videos:
+                        path = secondary_videos[it["source_video_id"]]
+                        off = it["off_ms"] / 1000.0
+                        length, _ = _probe(path)
+                        if length > 0:
+                            off = off % length  # videos loop: a start past the end wraps around
+                        inputs += ["-stream_loop", "-1", "-ss", f"{off:.3f}", "-i", path]
+                    elif it.get("kind") == "photo" and os.path.exists(frame_images.get(it.get("image_path") or "", "")):
+                        inputs += ["-loop", "1", "-framerate", "30", "-t", f"{it['dur_s']:.3f}", "-i", frame_images[it["image_path"]]]
+                    else:
+                        continue
+                    frame_item_in[(si, it["id"])] = f"[{next_input}:v]"
+                    next_input += 1
 
         # ── Build filter_complex ───────────────────────────────────────────────
         fp: list[str] = []
@@ -571,6 +717,68 @@ def main(
             start_s = vid_start_ms / 1000.0
             end_s   = (vid_start_ms + dur_ms) / 1000.0
             out_lbl = f"[seg{si}]"
+
+            if is_frame(layout):
+                dur_s = dur_ms / 1000.0
+                st = frame_state(seg)
+                main_slots = set(st.get("main_slots") or [])
+                band = st.get("band") or {}
+                band_bg = _hex6(band.get("bg"), "000000")
+                row_lbls: list[str] = []
+                for ri, (kind, slot, rh) in enumerate(frame_rows(layout, out_h, frame_band_shown(seg))):
+                    lbl = f"[fr{si}r{ri}]"
+                    cur_row = f"[fr{si}r{ri}b]"
+                    # Underneath: the band colour, the main video (framed by this slot's crop box), or an empty dark slot
+                    if kind == "band":
+                        fp.append(f"color=c=0x{band_bg}:s={out_w}x{rh}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{cur_row}")
+                    elif slot in main_slots:
+                        box = next((b for b in boxes if b.get("slot_index") == slot), None)
+                        off_ms = seg.get("video_offset_ms")
+                        if off_ms is None:
+                            off_ms = box.get("source_offset_ms") if box and box.get("source_offset_ms") is not None else smss
+                        ts = int(off_ms) / 1000.0
+                        fp.append(f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,"
+                                  f"{_crop_filter(box, smss)},{_scale_cover(out_w, rh)},setsar=1,format=yuv420p{cur_row}")
+                    else:
+                        fp.append(f"color=c=0x111111:s={out_w}x{rh}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{cur_row}")
+
+                    # On top: this lane's items, each only during its own time
+                    for ii, it in enumerate(lane_items(seg, st, "band" if kind == "band" else slot)):
+                        d, rel = it["dur_s"], it["rel_s"]
+                        ik = it.get("kind")
+                        if ik == "text":
+                            if it.get("captions"):
+                                continue  # the captions themselves are moved into the band (see _write_ass)
+                            chain = _frame_text_chain(
+                                it.get("text") or "", _hex6(it.get("bg"), band_bg if kind == "band" else "000000"),
+                                _hex6(it.get("color"), "ffffff"), int(it.get("size") or 64), out_w, rh, d)
+                        elif ik == "photo" and (si, it["id"]) in frame_item_in:
+                            src = frame_item_in[(si, it["id"])]
+                            zp = photo_motion_filter(it.get("motion") or "none", out_w, rh, d)
+                            if zp:
+                                chain = (f"{src}scale={out_w * 2}:{rh * 2}:force_original_aspect_ratio=increase,crop={out_w * 2}:{rh * 2},"
+                                         f"{zp},setsar=1,format=yuv420p,trim=duration={d:.3f},setpts=PTS-STARTPTS")
+                            else:
+                                chain = f"{src}{_scale_cover(out_w, rh)},setsar=1,format=yuv420p,trim=duration={d:.3f},setpts=PTS-STARTPTS"
+                        elif ik == "video" and (si, it["id"]) in frame_item_in:
+                            src = frame_item_in[(si, it["id"])]
+                            chain = f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{_scale_cover(out_w, rh)},setsar=1,format=yuv420p"
+                        else:
+                            print(f"[render] frame item skipped (media missing): {ik} {it.get('id')}", flush=True)
+                            continue
+                        il, ol = f"[fr{si}r{ri}i{ii}]", f"[fr{si}r{ri}o{ii}]"
+                        fp.append(f"{chain},setpts=PTS+{rel:.3f}/TB{il}")
+                        fp.append(f"{cur_row}{il}overlay=0:0:eof_action=pass:enable='between(t,{rel:.3f},{rel + d:.3f})'{ol}")
+                        cur_row = ol
+                    fp.append(f"{cur_row}null{lbl}")
+                    row_lbls.append(lbl)
+                # One row (e.g. Single with no text yet) is the whole frame; vstack needs two or more
+                if len(row_lbls) == 1:
+                    fp.append(f"{row_lbls[0]}null{out_lbl}")
+                else:
+                    fp.append(f"{''.join(row_lbls)}vstack=inputs={len(row_lbls)}{out_lbl}")
+                seg_labels.append(out_lbl)
+                continue
 
             # Primary (slot-0) B-roll source for this segment, used as fallback for empty slots.
             _primary_broll = _primary_box_vid_id if (_primary_box_vid_id and _primary_box_vid_id in secondary_videos) else None
@@ -647,12 +855,13 @@ def main(
 
         # ── Subtitles (ASS captions) ───────────────────────────────────────────
         if ass_path:
-            # Escape path for FFmpeg filter option (colons and spaces are separators)
+            # Escape path for FFmpeg filter option: quoted, forward slashes, and inside the quotes
+            # ':' (Windows drive letters) still needs escaping
             def _esc_path(p: str) -> str:
-                return p.replace("\\", "\\\\").replace(":", "\\:").replace(" ", "\\ ")
+                return "'" + p.replace("\\", "/").replace(":", "\\:").replace("'", "") + "'"
             esc_ass   = _esc_path(ass_path)
             esc_fonts = _esc_path(_FONTS_DIR)
-            fp.append(f"{cur}subtitles={esc_ass}:fontsdir={esc_fonts}[vcap]")
+            fp.append(f"{cur}subtitles=filename={esc_ass}:fontsdir={esc_fonts}[vcap]")
             cur = "[vcap]"
 
         # ── Text overlays (drawtext) ───────────────────────────────────────────
@@ -779,6 +988,7 @@ if __name__ == "__main__":
     parser.add_argument("--overlay-images",   default="{}", help="JSON: storage_path → local_path")
     parser.add_argument("--overlay-videos",   default="{}", help="JSON: source_video_id → local_path")
     parser.add_argument("--watermark",        action="store_true", help="Burn in Chai Cut watermark")
+    parser.add_argument("--frame-images",     default="{}", help="JSON: frame slot image_path → local_path")
     args = parser.parse_args()
     main(
         args.video, args.spec, args.output,
@@ -786,4 +996,5 @@ if __name__ == "__main__":
         overlay_images=json.loads(args.overlay_images),
         overlay_videos=json.loads(args.overlay_videos),
         watermark=args.watermark,
+        frame_images=json.loads(args.frame_images),
     )

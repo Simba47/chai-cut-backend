@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { createReadStream, createWriteStream } from 'node:fs'
 import { writeFile, mkdtemp, rm } from 'node:fs/promises'
 import { pipeline } from 'node:stream/promises'
@@ -39,22 +40,28 @@ export async function handleRenderJob(job: Job) {
 
   try {
     const t0 = Date.now()
+    type SpecSeg = {
+      crop_boxes?: Array<{ source_video_id?: string | null; image_path?: string | null }>
+      frame?: { items?: Array<{ kind?: string; source_video_id?: string | null; image_path?: string | null }> } | null
+    }
+    const specSegs = (renderSpec.segments ?? []) as SpecSeg[]
+    // Other videos: B-roll formats, and videos placed on frame lanes
+    const otherVideoIds = new Set<string>()
+    for (const seg of specSegs) {
+      for (const box of seg.crop_boxes ?? []) if (box.source_video_id) otherVideoIds.add(box.source_video_id)
+      for (const it of seg.frame?.items ?? []) if (it.kind === 'video' && it.source_video_id) otherVideoIds.add(it.source_video_id)
+    }
     const secondaryVideos: Record<string, string> = {}
-    const seenVideoIds = new Set<string>()
-    for (const seg of (renderSpec.segments ?? []) as Array<{ crop_boxes?: Array<{ source_video_id?: string }> }>) {
-      for (const box of seg.crop_boxes ?? []) {
-        if (!box.source_video_id || seenVideoIds.has(box.source_video_id)) continue
-        seenVideoIds.add(box.source_video_id)
-        const [vRow] = await db`SELECT storage_path FROM videos WHERE id = ${box.source_video_id}`
-        if (!vRow?.storage_path) continue
-        try {
-          const t1 = Date.now()
-          const localPath = join(tmp, `secondary_${box.source_video_id}.mp4`)
-          await r2DownloadToFile(vRow.storage_path, localPath)
-          console.log(`[render] B-roll download: ${((Date.now()-t1)/1000).toFixed(1)}s`)
-          secondaryVideos[box.source_video_id] = localPath
-        } catch (e) { console.warn(`[render] Failed to download secondary video:`, e) }
-      }
+    for (const videoId of otherVideoIds) {
+      const [vRow] = await db`SELECT storage_path FROM videos WHERE id = ${videoId}`
+      if (!vRow?.storage_path) continue
+      try {
+        const t1 = Date.now()
+        const localPath = join(tmp, `secondary_${videoId}.mp4`)
+        await r2DownloadToFile(vRow.storage_path, localPath)
+        console.log(`[render] B-roll download: ${((Date.now()-t1)/1000).toFixed(1)}s`)
+        secondaryVideos[videoId] = localPath
+      } catch (e) { console.warn(`[render] Failed to download secondary video:`, e) }
     }
     console.log(`[render] Downloads done: ${((Date.now()-t0)/1000).toFixed(1)}s`)
 
@@ -63,10 +70,26 @@ export async function handleRenderJob(job: Job) {
       if (ov.type !== 'image' || !ov.storage_path) continue
       try {
         const ext = ov.storage_path.split('.').pop() ?? 'png'
-        const localPath = join(tmp, `overlay_${Buffer.from(ov.storage_path).toString('hex').slice(0, 16)}.${ext}`)
+        const localPath = join(tmp, `overlay_${createHash('sha1').update(ov.storage_path).digest('hex').slice(0, 16)}.${ext}`)
         await r2DownloadToFile(ov.storage_path, localPath)
         overlayImages[ov.storage_path] = localPath
       } catch (e) { console.warn(`[render] Failed to download overlay:`, e) }
+    }
+
+    // Photos on frame lanes (and on frame slots saved before lanes existed)
+    const framePhotoPaths = new Set<string>()
+    for (const seg of specSegs) {
+      for (const box of seg.crop_boxes ?? []) if (box.image_path) framePhotoPaths.add(box.image_path)
+      for (const it of seg.frame?.items ?? []) if (it.kind === 'photo' && it.image_path) framePhotoPaths.add(it.image_path)
+    }
+    const frameImages: Record<string, string> = {}
+    for (const path of framePhotoPaths) {
+      try {
+        const ext = path.split('.').pop() ?? 'png'
+        const localPath = join(tmp, `frame_${createHash('sha1').update(path).digest('hex').slice(0, 16)}.${ext}`)
+        await r2DownloadToFile(path, localPath)
+        frameImages[path] = localPath
+      } catch (e) { console.warn(`[render] Failed to download frame photo:`, e) }
     }
 
     const overlayVideos: Record<string, string> = {}
@@ -91,6 +114,7 @@ export async function handleRenderJob(job: Job) {
       '--secondary-videos', JSON.stringify(secondaryVideos),
       '--overlay-images', JSON.stringify(overlayImages),
       '--overlay-videos', JSON.stringify(overlayVideos),
+      '--frame-images', JSON.stringify(frameImages),
     ]
     if (payload.watermark) pythonArgs.push('--watermark')
     const tPy = Date.now()
@@ -125,6 +149,8 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
         SELECT json_agg(jsonb_build_object(
           'id', cb.id, 'segment_id', cb.segment_id, 'slot_index', cb.slot_index,
           'source_video_id', cb.source_video_id, 'source_offset_ms', cb.source_offset_ms,
+          'image_path', cb.image_path, 'image_motion', cb.image_motion,
+          'volume', cb.volume, 'muted', cb.muted,
           'box_keyframes', COALESCE((
             SELECT json_agg(bk.* ORDER BY bk.t_ms) FROM box_keyframes bk WHERE bk.box_id = cb.id
           ), '[]')
