@@ -32,6 +32,16 @@ async function runMigrations() {
   await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS timing_offset_ms INTEGER DEFAULT 0`
   await db`ALTER TABLE videos ADD COLUMN IF NOT EXISTS role TEXT CHECK (role IN ('project','asset')) NOT NULL DEFAULT 'project'`
   await db`ALTER TABLE videos ADD COLUMN IF NOT EXISTS title TEXT`
+  // Frames: five frame layouts, letterbox band settings per format, and per-slot photo / motion / audio mix
+  await db`ALTER TABLE segments DROP CONSTRAINT IF EXISTS segments_layout_check`
+  await db`ALTER TABLE segments ADD CONSTRAINT segments_layout_check CHECK (layout IN (
+    'vertical','split','trio','spotlight','centered','horizontal',
+    'frame_single','frame_video_photo','frame_dual','frame_dual_letterbox','frame_triple'))`
+  await db`ALTER TABLE segments ADD COLUMN IF NOT EXISTS frame JSONB`
+  await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS image_path TEXT`
+  await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS image_motion TEXT`
+  await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS volume REAL NOT NULL DEFAULT 1`
+  await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS muted BOOLEAN NOT NULL DEFAULT false`
   await db`
     CREATE TABLE IF NOT EXISTS ai_edit_jobs (
       id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

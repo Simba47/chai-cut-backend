@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from frames import is_frame, frame_audio_plan
+
 
 def build_ffmpeg_audio_args(
     source_video: str,
@@ -98,6 +100,21 @@ def build_ffmpeg_audio_args(
     ]
 
 
+_audio_cache: dict[str, bool] = {}
+
+
+def _has_audio(path: str) -> bool:
+    """Whether a media file has a sound track (assume yes if ffprobe can't tell)."""
+    if path not in _audio_cache:
+        try:
+            r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", path],
+                               capture_output=True, text=True, timeout=30)
+            _audio_cache[path] = r.returncode != 0 or bool(r.stdout.strip())
+        except Exception:
+            _audio_cache[path] = True
+    return _audio_cache[path]
+
+
 def build_segment_audio_args(
     source_video: str,
     clip_start_ms: int,
@@ -138,8 +155,10 @@ def build_segment_audio_args(
         for s in sorted_segs
         if (s.get("crop_boxes") or [{}])[0].get("source_video_id")
     )
+    # Frames mix their slots' sound, so they need the per-segment path too
+    has_frames = any(is_frame(s.get("layout")) for s in sorted_segs)
 
-    if not has_broll_audio:
+    if not has_broll_audio and not has_frames:
         return build_ffmpeg_audio_args(
             source_video, clip_start_ms, clip_end_ms,
             audio_tracks, speech_ranges, output_audio,
@@ -152,18 +171,36 @@ def build_segment_audio_args(
 
     clip_start_s = clip_start_ms / 1000.0
 
-    # Collect which B-roll video IDs are actually used and count their uses
-    broll_uses: dict[str, int] = {}
-    main_uses = 0
+    # What each segment plays: a list of (source video id or None = main, start offset in s, volume,
+    # delay from the segment's start in s, duration in s). A normal segment plays one source for its
+    # whole length; a frame mixes the main video with its video items, each during its own time.
+    plans: list[list[tuple[str | None, float, float, float, float]]] = []
     for seg in sorted_segs:
+        seg_dur = (int(seg["end_ms"]) - int(seg["start_ms"])) / 1000.0
+        if is_frame(seg.get("layout")):
+            # Videos without a sound track add nothing (and have no audio stream to read)
+            plans.append([p for p in frame_audio_plan(seg, secondary_videos) if not p[0] or _has_audio(secondary_videos[p[0]])])
+            continue
         box = (seg.get("crop_boxes") or [{}])[0]
         vid_id = box.get("source_video_id") if box else None
         if vid_id and vid_id in secondary_videos:
-            broll_uses[vid_id] = broll_uses.get(vid_id, 0) + 1
+            plans.append([(vid_id, int(box.get("source_offset_ms") or 0) / 1000.0, 1.0, 0.0, seg_dur)])
         else:
-            main_uses += 1
+            _cb_off = box.get("source_offset_ms") if box else None
+            vid_off_ms = int(seg["video_offset_ms"]) if seg.get("video_offset_ms") is not None else (int(_cb_off) if _cb_off is not None else int(seg["start_ms"]))
+            plans.append([(None, vid_off_ms / 1000.0, 1.0, 0.0, seg_dur)])
 
-    # Build inputs: main source pre-seeked, then each needed B-roll file
+    broll_uses: dict[str, int] = {}
+    main_uses = 0
+    for plan in plans:
+        for vid_id, *_ in plan:
+            if vid_id:
+                broll_uses[vid_id] = broll_uses.get(vid_id, 0) + 1
+            else:
+                main_uses += 1
+
+    # Build inputs: main source pre-seeked, then each needed secondary file (looped, since
+    # frames loop videos shorter than their format)
     inputs: list[str] = [
         "ffmpeg", "-y",
         "-ss", f"{clip_start_s:.3f}",
@@ -172,7 +209,7 @@ def build_segment_audio_args(
     broll_idx: dict[str, int] = {}
     for vid_id in broll_uses:
         broll_idx[vid_id] = len(broll_idx) + 1
-        inputs += ["-i", secondary_videos[vid_id]]
+        inputs += ["-stream_loop", "-1", "-i", secondary_videos[vid_id]]
 
     # Build filter_complex
     fp: list[str] = []
@@ -207,29 +244,30 @@ def build_segment_audio_args(
 
     norm_labels: list[str] = []
     n_segs = len(sorted_segs)
-    for i, seg in enumerate(sorted_segs):
-        box = (seg.get("crop_boxes") or [{}])[0]
-        vid_id = box.get("source_video_id") if box else None
-        dur_ms = int(seg["end_ms"]) - int(seg["start_ms"])
-        dur_s  = dur_ms / 1000.0
-        raw_lbl  = f"[sa{i}]"
+    fmt = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
+    for i, (seg, plan) in enumerate(zip(sorted_segs, plans)):
+        dur_s = (int(seg["end_ms"]) - int(seg["start_ms"])) / 1000.0
         norm_lbl = f"[san{i}]"
-
-        if vid_id and vid_id in broll_pools:
-            off_s  = int(box.get("source_offset_ms") or 0) / 1000.0
-            end_s  = off_s + dur_s
-            src    = next(broll_its[vid_id])
-            fp.append(f"{src}atrim=start={off_s:.3f}:end={end_s:.3f},asetpts=PTS-STARTPTS{raw_lbl}")
+        pieces: list[str] = []
+        for j, (vid_id, off_s, vol, delay_s, piece_s) in enumerate(plan):
+            src = next(broll_its[vid_id]) if vid_id else next(main_it)
+            lbl = f"[sa{i}_{j}]"
+            vol_f = f",volume={vol:.3f}" if abs(vol - 1.0) > 1e-3 else ""
+            delay_f = f",adelay=delays={int(round(delay_s * 1000))}:all=1" if delay_s > 0.0005 else ""
+            # Normalise each piece to stereo 48 kHz to handle mixed formats (e.g. B-roll at 44.1 kHz)
+            fp.append(f"{src}atrim=start={off_s:.3f}:end={off_s + piece_s:.3f},asetpts=PTS-STARTPTS{vol_f},{fmt}{delay_f}{lbl}")
+            pieces.append(lbl)
+        if is_frame(seg.get("layout")):
+            # A silent bed of exactly the frame's length, with its sounds mixed on top;
+            # normalize=0 keeps each sound at the volume the user set
+            bed = f"[sbed{i}]"
+            fp.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={dur_s:.3f},{fmt}{bed}")
+            if pieces:
+                fp.append(f"{bed}{''.join(pieces)}amix=inputs={len(pieces) + 1}:duration=first:dropout_transition=0:normalize=0,{fmt}{norm_lbl}")
+            else:
+                fp.append(f"{bed}anull{norm_lbl}")
         else:
-            _cb_off = box.get("source_offset_ms") if box and not (vid_id and vid_id in broll_pools) else None
-            vid_off_ms   = int(seg["video_offset_ms"]) if seg.get("video_offset_ms") is not None else (int(_cb_off) if _cb_off is not None else int(seg["start_ms"]))
-            trim_start   = vid_off_ms / 1000.0   # relative to pre-seeked clip_start
-            trim_end     = trim_start + dur_s
-            src          = next(main_it)
-            fp.append(f"{src}atrim=start={trim_start:.3f}:end={trim_end:.3f},asetpts=PTS-STARTPTS{raw_lbl}")
-
-        # Normalise each piece to stereo 48 kHz to handle mixed formats (e.g. B-roll at 44.1 kHz)
-        fp.append(f"{raw_lbl}aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo{norm_lbl}")
+            fp.append(f"{pieces[0]}anull{norm_lbl}")
         norm_labels.append(norm_lbl)
 
     concat_in = "".join(norm_labels)
