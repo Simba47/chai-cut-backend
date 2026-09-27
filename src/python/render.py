@@ -505,7 +505,8 @@ def main(
     overlay_videos   = overlay_videos   or {}
     frame_images     = frame_images     or {}
 
-    spec           = json.load(open(spec_path))
+    # UTF-8 explicitly: Windows defaults to cp1252 and fails on Telugu/Hindi captions
+    spec           = json.load(open(spec_path, encoding="utf-8"))
     clip_start_ms  = int(spec["start_ms"])
     clip_end_ms    = int(spec["end_ms"])
     clip_dur_ms    = clip_end_ms - clip_start_ms
