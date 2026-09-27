@@ -12,9 +12,26 @@ export function registerHandler(type: JobType, handler: JobHandler) {
   handlers.set(type, handler)
 }
 
+// Several workers share this queue (Railway, and a local one during development), so a worker
+// that starts must not take back jobs another worker is still running. A job only counts as
+// stuck once it has been "processing" longer than the job timeout (plus a minute): its worker
+// died or was restarted mid-job. updated_at is set by the jobs_updated_at trigger on claim.
+const STUCK_AFTER_MS = JOB_TIMEOUT_MS + 60_000
+const STUCK_SWEEP_MS = 5 * 60 * 1000
+
+async function requeueStuck() {
+  const stuck = await db`
+    UPDATE jobs SET status = 'queued'
+    WHERE status = 'processing' AND updated_at < now() - (${STUCK_AFTER_MS}::int * interval '1 millisecond')
+    RETURNING id
+  `
+  if (stuck.length) console.log(`[queue] Re-queued ${stuck.length} stuck job(s) (processing for over ${Math.round(STUCK_AFTER_MS / 60000)} min)`)
+}
+
 export async function startQueue() {
-  const stuck = await db`UPDATE jobs SET status = 'queued' WHERE status = 'processing' RETURNING id`
-  if (stuck.length) console.log(`[queue] Reset ${stuck.length} stuck processing job(s) to queued`)
+  await requeueStuck()
+  // Keep rescuing jobs whose worker died, not only when this one starts
+  setInterval(() => { requeueStuck().catch(err => console.error('[queue] Stuck-job sweep failed:', err)) }, STUCK_SWEEP_MS)
 
   console.log(`[queue] Worker started (concurrency=${CONCURRENCY}), polling for jobs…`)
   await Promise.all(Array.from({ length: CONCURRENCY }, (_, i) => runLoop(i)))
