@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges
-from frames import is_frame, frame_rows, wrap_band_text, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones
+from frames import is_frame, frame_rows, wrap_band_text, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry
 
 # ── Quality presets (identical to previous version) ───────────────────────────
 _QUALITY: dict[int, dict] = {
@@ -276,6 +276,32 @@ def _hex6(v: str | None, fallback: str) -> str:
     return h[:6] if len(h) >= 6 and all(c in "0123456789abcdefABCDEF" for c in h[:6]) else fallback
 
 
+def _filter_path(p: str) -> str:
+    """A file path as a quoted filter option (forward slashes; ':' still escaped inside the quotes)."""
+    return "'" + p.replace("\\", "/").replace(":", "\\:").replace("'", "") + "'"
+
+
+def _corner_mask(tmp: str, w: int, h: int, m: int, r: int) -> str:
+    """
+    A w×h RGBA image that is black except for a transparent rounded box inset by m with corner
+    radius r. Laid over media padded with black, it gives the media rounded corners and a black
+    border. Drawn at twice the size and scaled down for smooth corners; made once per size.
+    """
+    path = os.path.join(tmp, f"corners_{w}x{h}_{m}_{r}.png")
+    if os.path.exists(path):
+        return path
+    W, H, M, R = w * 2, h * 2, m * 2, r * 2
+    dx = f"max(max({M + R}-X\\,X-{W - M - 1 - R})\\,0)"
+    dy = f"max(max({M + R}-Y\\,Y-{H - M - 1 - R})\\,0)"
+    inside = (f"lte({dx}*{dx}+{dy}*{dy}\\,{R * R})*gte(X\\,{M})*lt(X\\,{W - M})*gte(Y\\,{M})*lt(Y\\,{H - M})")
+    vf = f"format=rgba,geq=r=0:g=0:b=0:a=255*(1-{inside}),scale={w}:{h}:flags=area"
+    res = subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"color=c=black:s={W}x{H}:d=1",
+                          "-vf", vf, "-frames:v", "1", path], capture_output=True, text=True)
+    if res.returncode != 0 or not os.path.exists(path):
+        raise RuntimeError(f"corner mask failed: {res.stderr[-400:]}")
+    return path
+
+
 def _frame_text_font(text: str) -> str:
     """Montserrat Bold for Latin text; Noto for Indian scripts Montserrat can't draw."""
     if any("\u0c00" <= c <= "\u0c7f" for c in text):
@@ -289,8 +315,9 @@ def _frame_text_font(text: str) -> str:
     return path.replace("\\", "/").replace(":", "\\:") if path else ""
 
 
-def _frame_text_chain(text: str, bg: str, color: str, size_1080: int, w: int, h: int, dur_s: float) -> str:
-    """A solid w×h card with centred, wrapped text (the band or a text card in a slot)."""
+def _frame_text_chain(text: str, bg: str, color: str, size_1080: int, w: int, h: int, dur_s: float,
+                      cx: float = 0.5, cy: float = 0.5) -> str:
+    """A solid w×h card with wrapped text centred on (cx, cy) — shares of the card, set by dragging it in the editor."""
     chain = f"color=c=0x{bg}:s={w}x{h}:d={dur_s:.3f}:r=30,format=yuv420p"
     text = (text or "").strip()
     font = _frame_text_font(text) if text else ""
@@ -299,13 +326,13 @@ def _frame_text_chain(text: str, bg: str, color: str, size_1080: int, w: int, h:
         # Wrap at 1080-wide scale, like the editor preview, so lines break in the same places
         lines = wrap_band_text(text, 1080, size_1080)
         lh = int(size * 1.2)
-        top = (h - lh * len(lines)) / 2
+        top = cy * h - lh * len(lines) / 2
         for li, ln in enumerate(lines):
             if not ln:
                 continue
             y = int(top + li * lh + (lh - size) / 2)
             chain += (f",drawtext=fontfile='{font}':text='{_escape_drawtext(ln)}':fontsize={size}"
-                      f":fontcolor=0x{color}:x=(w-tw)/2:y={y}")
+                      f":fontcolor=0x{color}:x={cx * w:.1f}-tw/2:y={y}")
     return f"{chain},setsar=1"
 
 
@@ -478,7 +505,8 @@ def main(
     overlay_videos   = overlay_videos   or {}
     frame_images     = frame_images     or {}
 
-    spec           = json.load(open(spec_path))
+    # UTF-8 explicitly: Windows defaults to cp1252 and fails on Telugu/Hindi captions
+    spec           = json.load(open(spec_path, encoding="utf-8"))
     clip_start_ms  = int(spec["start_ms"])
     clip_end_ms    = int(spec["end_ms"])
     clip_dur_ms    = clip_end_ms - clip_start_ms
@@ -724,6 +752,25 @@ def main(
             if is_frame(layout):
                 dur_s = dur_ms / 1000.0
                 st = frame_state(seg)
+
+                def media_size(corners, rh: int) -> tuple[int, int, int, int]:
+                    """(width, height) the media is scaled to, plus the border m and radius r (0, 0 = edge to edge)."""
+                    g = corner_geometry(corners)
+                    if not g:
+                        return out_w, rh, 0, 0
+                    inset, radius = g
+                    m = max(2, int(round(inset * out_w / 1080 / 2)) * 2)
+                    return out_w - 2 * m, rh - 2 * m, m, max(2, int(round(radius * out_w / 1080)))
+
+                def rounded(chain: str, rh: int, m: int, r: int, key: str) -> str:
+                    """Pad media to the full slot on black and lay the rounded-corner mask over it."""
+                    if not m:
+                        return chain
+                    mask = _corner_mask(tmp, out_w, rh, m, r)
+                    fp.append(f"{chain},pad={out_w}:{rh}:{m}:{m}:color=black,format=yuv420p[{key}p]")
+                    fp.append(f"movie=filename={_filter_path(mask)},format=rgba[{key}k]")
+                    return f"[{key}p][{key}k]overlay=0:0,format=yuv420p,setsar=1"
+
                 main_slots = set(st.get("main_slots") or [])
                 band = st.get("band") or {}
                 band_bg = _hex6(band.get("bg"), "000000")
@@ -740,8 +787,10 @@ def main(
                         if off_ms is None:
                             off_ms = box.get("source_offset_ms") if box and box.get("source_offset_ms") is not None else smss
                         ts = int(off_ms) / 1000.0
-                        fp.append(f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,"
-                                  f"{_crop_filter(box, smss)},{_scale_cover(out_w, rh)},setsar=1,format=yuv420p{cur_row}")
+                        mw, mh, mm, mr = media_size((st.get("main_corners") or {}).get(str(slot)), rh)
+                        chain = (f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,"
+                                 f"{_crop_filter(box, smss)},{_scale_cover(mw, mh)},setsar=1,format=yuv420p")
+                        fp.append(f"{rounded(chain, rh, mm, mr, f'fr{si}r{ri}m')}{cur_row}")
                     else:
                         fp.append(f"color=c=0x111111:s={out_w}x{rh}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{cur_row}")
 
@@ -754,18 +803,24 @@ def main(
                                 continue  # the captions themselves are moved into the band (see _write_ass)
                             chain = _frame_text_chain(
                                 it.get("text") or "", _hex6(it.get("bg"), band_bg if kind == "band" else "000000"),
-                                _hex6(it.get("color"), "ffffff"), int(it.get("size") or 64), out_w, rh, d)
+                                _hex6(it.get("color"), "ffffff"), int(it.get("size") or 64), out_w, rh, d,
+                                float(it["x"]) if it.get("x") is not None else 0.5,
+                                float(it["y"]) if it.get("y") is not None else 0.5)
                         elif ik == "photo" and (si, it["id"]) in frame_item_in:
                             src = frame_item_in[(si, it["id"])]
-                            zp = photo_motion_filter(it.get("motion") or "none", out_w, rh, d)
+                            mw, mh, mm, mr = media_size(it.get("corners"), rh)
+                            zp = photo_motion_filter(it.get("motion") or "none", mw, mh, d)
                             if zp:
-                                chain = (f"{src}scale={out_w * 2}:{rh * 2}:force_original_aspect_ratio=increase,crop={out_w * 2}:{rh * 2},"
+                                chain = (f"{src}scale={mw * 2}:{mh * 2}:force_original_aspect_ratio=increase,crop={mw * 2}:{mh * 2},"
                                          f"{zp},setsar=1,format=yuv420p,trim=duration={d:.3f},setpts=PTS-STARTPTS")
                             else:
-                                chain = f"{src}{_scale_cover(out_w, rh)},setsar=1,format=yuv420p,trim=duration={d:.3f},setpts=PTS-STARTPTS"
+                                chain = f"{src}{_scale_cover(mw, mh)},setsar=1,format=yuv420p,trim=duration={d:.3f},setpts=PTS-STARTPTS"
+                            chain = rounded(chain, rh, mm, mr, f"fr{si}r{ri}i{ii}c")
                         elif ik == "video" and (si, it["id"]) in frame_item_in:
                             src = frame_item_in[(si, it["id"])]
-                            chain = f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{_scale_cover(out_w, rh)},setsar=1,format=yuv420p"
+                            mw, mh, mm, mr = media_size(it.get("corners"), rh)
+                            chain = f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{_scale_cover(mw, mh)},setsar=1,format=yuv420p"
+                            chain = rounded(chain, rh, mm, mr, f"fr{si}r{ri}i{ii}c")
                         else:
                             print(f"[render] frame item skipped (media missing): {ik} {it.get('id')}", flush=True)
                             continue

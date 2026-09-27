@@ -15,6 +15,21 @@ FRAME_TEMPLATES: dict[str, list[tuple[str, int | None, float]]] = {
 
 MOTIONS = {"none", "zoom_in", "zoom_out", "pan_left", "pan_right"}
 
+# Rounded corners on frame media from the editor's Corners slider (0-100), in px at 1080 wide at
+# 100%: (black border around the media, corner radius). Mirrors cornerGeometry() in
+# chai-cut-frontend/src/modules/editor/frames.ts ('s'/'m'/'l' from the first version map onto it).
+CORNER_MAX = (44, 96)
+
+
+def corner_geometry(v) -> tuple[float, float] | None:
+    """(border, radius) in px at 1080 wide for a corners value, or None for square corners."""
+    n = {"s": 35, "m": 60, "l": 100}.get(v, v) if isinstance(v, str) else v
+    try:
+        k = max(0.0, min(100.0, float(n or 0))) / 100.0
+    except (TypeError, ValueError):
+        return None
+    return (CORNER_MAX[0] * k, CORNER_MAX[1] * k) if k > 0 else None
+
 
 def is_frame(layout: str | None) -> bool:
     return bool(layout) and layout in FRAME_TEMPLATES
@@ -132,11 +147,9 @@ def lane_items(seg: dict, state: dict, lane) -> list[dict]:
 
 
 def frame_band_shown(seg: dict) -> bool:
-    """The text band shows only while the frame has text on it (editor: frameBandShown)."""
+    """Frames whose template has a band always show it: a solid space for text (editor: frameBandShown)."""
     layout = seg.get("layout")
-    if not is_frame(layout) or not any(kind == "band" for kind, _, _ in FRAME_TEMPLATES[layout]):
-        return False
-    return bool(lane_items(seg, frame_state(seg), "band"))
+    return is_frame(layout) and any(kind == "band" for kind, _, _ in FRAME_TEMPLATES[layout])
 
 
 def caption_band_zones(segments: list[dict], out_h: int) -> list[tuple[int, int, int]]:
@@ -164,6 +177,31 @@ def caption_band_zones(segments: list[dict], out_h: int) -> list[tuple[int, int,
     return zones
 
 
+def main_slot_sound(state: dict, slot: int) -> tuple[float, bool]:
+    """
+    (volume, muted) of the main video in one slot. Each slot has its own setting; one without it:
+    the first main slot uses the frame's older main setting, any other is muted. Mirrors
+    mainSlotSound() in the editor.
+    """
+    slots = state.get("main_slots") or [0]
+    first = min(slots) if slots else 0
+    key = str(slot)
+    vols, mutes = state.get("main_volumes") or {}, state.get("main_mutes") or {}
+    legacy_vol = state.get("main_volume") if state.get("main_volume") is not None else 1.0
+    volume = float(vols[key]) if vols.get(key) is not None else (float(legacy_vol) if slot == first else 1.0)
+    muted = bool(mutes[key]) if mutes.get(key) is not None else (bool(state.get("main_muted")) if slot == first else True)
+    return volume, muted
+
+
+def main_audio_volume(state: dict) -> float:
+    """How loud the main video plays in a frame: the sum of every audible slot showing it."""
+    total = 0.0
+    for slot in state.get("main_slots") or []:
+        v, m = main_slot_sound(state, int(slot))
+        total += 0.0 if m else v
+    return total
+
+
 def frame_audio_plan(seg: dict, secondary_videos: dict[str, str]) -> list[tuple[str | None, float, float, float, float]]:
     """
     Sound of one frame format as (source video id or None for the main video, source start in s,
@@ -173,8 +211,9 @@ def frame_audio_plan(seg: dict, secondary_videos: dict[str, str]) -> list[tuple[
     state = frame_state(seg)
     dur_s = (int(seg["end_ms"]) - int(seg["start_ms"])) / 1000.0
     out: list[tuple[str | None, float, float, float, float]] = []
-    vol = float(state.get("main_volume") if state.get("main_volume") is not None else 1.0)
-    if not state.get("main_muted") and vol > 0:
+    # Every slot showing the main video adds its own sound (the same audio, so volumes add up)
+    vol = main_audio_volume(state)
+    if vol > 0:
         if seg.get("video_offset_ms") is not None:
             off_ms = int(seg["video_offset_ms"])
         else:
