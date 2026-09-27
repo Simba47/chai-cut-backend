@@ -1155,17 +1155,20 @@ async function transliterateWithGemini(
   for (let i = 0; i < entries.length; i += BATCH) {
     const batch = entries.slice(i, i + BATCH)
     const words = batch.map(e => e.word.trim())
-    try {
-      // gemini-2.5-flash writes the most natural Tenglish in tests; Google has started retiring
-      // 2.5 models for new accounts, so fall back to the always-current Flash alias on 404
-      let res: Response | undefined
-      for (const model of ['gemini-2.5-flash', 'gemini-flash-latest']) {
-        res = await fetchWithTimeout(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-          method: 'POST',
-          headers: { 'x-goog-api-key': GEMINI_API_KEY!, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text:
+    // A batch occasionally comes back merged/split despite temperature 0 and explicit
+    // instructions — one retry before falling back recovers most of these for free.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        // gemini-2.5-flash writes the most natural Tenglish in tests; Google has started retiring
+        // 2.5 models for new accounts, so fall back to the always-current Flash alias on 404
+        let res: Response | undefined
+        for (const model of ['gemini-2.5-flash', 'gemini-flash-latest']) {
+          res = await fetchWithTimeout(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+            method: 'POST',
+            headers: { 'x-goog-api-key': GEMINI_API_KEY!, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text:
 `You convert ${langName} caption words into ${style}: the way ${langName} speakers write their language in English letters on WhatsApp or YouTube comments.
 Rules:
 - Exactly one output string per input word, same order. Never merge, split, drop or add words.
@@ -1173,29 +1176,31 @@ Rules:
 - English words written in ${langName} script get their normal English spelling (ఇట్స్ → "it's", ట్రూ → "true", కాటన్ → "cotton", యాక్టర్స్ → "actors", యాడ్ → "ad").
 - Numbers and words already in English letters stay as they are. Drop trailing punctuation.
 - Lowercase, except names and the pronoun "I".` }] },
-            contents: [{ role: 'user', parts: [{ text: JSON.stringify(words) }] }],
-            generationConfig: {
-              temperature: 0,
-              responseMimeType: 'application/json',
-              responseSchema: { type: 'ARRAY', items: { type: 'STRING' } },
-              thinkingConfig: { thinkingBudget: 0 },
-            },
-          }),
-        }, 60_000)
-        if (res.status !== 404) break
+              contents: [{ role: 'user', parts: [{ text: JSON.stringify(words) }] }],
+              generationConfig: {
+                temperature: 0,
+                responseMimeType: 'application/json',
+                responseSchema: { type: 'ARRAY', items: { type: 'STRING' } },
+                thinkingConfig: { thinkingBudget: 0 },
+              },
+            }),
+          }, 60_000)
+          if (res.status !== 404) break
+        }
+        if (!res!.ok) throw new Error(`Gemini ${res!.status}: ${(await res!.text()).slice(0, 200)}`)
+        const data = await res!.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] }
+        const arr = JSON.parse(data.candidates?.[0]?.content?.parts?.[0]?.text ?? '[]') as unknown[]
+        if (!Array.isArray(arr) || arr.length !== batch.length) {
+          throw new Error(`expected ${batch.length} words, got ${Array.isArray(arr) ? arr.length : 'non-array'}`)
+        }
+        for (let j = 0; j < batch.length; j++) {
+          const v = arr[j]
+          result[i + j] = typeof v === 'string' && v.trim() ? stripDiacritics(v.trim()).replace(/[.,!?।]+$/g, '') : undefined
+        }
+        break
+      } catch (err) {
+        if (attempt === 2) console.warn(`[transliterate] Gemini batch ${i}-${i + batch.length} failed, using fallback:`, err)
       }
-      if (!res!.ok) throw new Error(`Gemini ${res!.status}: ${(await res!.text()).slice(0, 200)}`)
-      const data = await res!.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] }
-      const arr = JSON.parse(data.candidates?.[0]?.content?.parts?.[0]?.text ?? '[]') as unknown[]
-      if (!Array.isArray(arr) || arr.length !== batch.length) {
-        throw new Error(`expected ${batch.length} words, got ${Array.isArray(arr) ? arr.length : 'non-array'}`)
-      }
-      for (let j = 0; j < batch.length; j++) {
-        const v = arr[j]
-        result[i + j] = typeof v === 'string' && v.trim() ? stripDiacritics(v.trim()).replace(/[.,!?।]+$/g, '') : undefined
-      }
-    } catch (err) {
-      console.warn(`[transliterate] Gemini batch ${i}-${i + batch.length} failed, using fallback:`, err)
     }
   }
 
