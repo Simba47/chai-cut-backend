@@ -654,9 +654,12 @@ def main(
                         length, _ = _probe(path)
                         if length > 0:
                             off = off % length  # videos loop: a start past the end wraps around
-                        inputs += ["-stream_loop", "-1", "-ss", f"{off:.3f}", "-i", path]
+                        # thread_queue_size: without it, a looped input feeding a complex filter graph
+                        # alongside other inputs can overflow ffmpeg's default demuxer->filter queue
+                        # ("Failed to inject frame into filter network: Resource temporarily unavailable")
+                        inputs += ["-thread_queue_size", "1024", "-stream_loop", "-1", "-ss", f"{off:.3f}", "-i", path]
                     elif it.get("kind") == "photo" and os.path.exists(frame_images.get(it.get("image_path") or "", "")):
-                        inputs += ["-loop", "1", "-framerate", "30", "-t", f"{it['dur_s']:.3f}", "-i", frame_images[it["image_path"]]]
+                        inputs += ["-thread_queue_size", "1024", "-loop", "1", "-framerate", "30", "-t", f"{it['dur_s']:.3f}", "-i", frame_images[it["image_path"]]]
                     else:
                         continue
                     frame_item_in[(si, it["id"])] = f"[{next_input}:v]"
