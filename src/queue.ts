@@ -2,7 +2,8 @@ import db from './db.js'
 import type { Job, JobType } from './types.js'
 import { JOB_POLL_INTERVAL_MS } from './types.js'
 
-type JobHandler = (job: Job) => Promise<void>
+/** `signal` aborts when the job runs past JOB_TIMEOUT_MS: handlers stop their child processes on it */
+type JobHandler = (job: Job, signal: AbortSignal) => Promise<void>
 const handlers = new Map<JobType, JobHandler>()
 
 const CONCURRENCY = parseInt(process.env.QUEUE_CONCURRENCY ?? '2', 10)
@@ -66,19 +67,32 @@ async function tick() {
   const handler = handlers.get(job.type as JobType)
   if (!handler) { await fail(job.id, `No handler for type: ${job.type}`); return }
 
+  // On timeout the job is marked failed straight away (so the stuck-job sweep never runs it a
+  // second time) and told to stop. This loop still waits for the handler to actually finish:
+  // racing it against the timer used to free the slot while its ffmpeg/Python kept running, so the
+  // worker ran more jobs than CONCURRENCY and a render's clip stayed "rendering".
+  const ctrl = new AbortController()
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    const msg = `job timed out after ${JOB_TIMEOUT_MS / 1000}s`
+    console.error(`[queue] Job ${job.id} ${msg}, stopping it`)
+    ctrl.abort(new Error(msg))
+    fail(job.id, msg).catch(err => console.error(`[queue] Could not mark job ${job.id} failed:`, err))
+  }, JOB_TIMEOUT_MS)
+
   try {
-    await Promise.race([
-      handler(job),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`job timed out after ${JOB_TIMEOUT_MS / 1000}s`)), JOB_TIMEOUT_MS)
-      ),
-    ])
+    await handler(job, ctrl.signal)
+    if (timedOut) { console.warn(`[queue] Job ${job.id} finished after its timeout (left as failed)`); return }
     await db`UPDATE jobs SET status = 'done' WHERE id = ${job.id}`
     console.log(`[queue] Job ${job.id} done`)
   } catch (err) {
+    if (timedOut) { console.error(`[queue] Job ${job.id} stopped after its timeout`); return }
     const msg = err instanceof Error ? err.message : String(err)
     console.error(`[queue] Job ${job.id} failed:`, msg)
     await fail(job.id, msg)
+  } finally {
+    clearTimeout(timer)
   }
 }
 

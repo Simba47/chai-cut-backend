@@ -5,3 +5,10 @@ __pycache__/
 *.pyc
 *.pyo
 tmp/
+
+# Private business documents: stay on the founder's PC, never pushed
+COSTS.txt
+PLANS-AND-BILLING.txt
+Shortcut-Pipeline-Review.pdf
+Shortcut-Technical-Overview.pdf
+shortcut-india-pricing*.pdf

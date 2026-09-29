@@ -30,8 +30,13 @@ import { handleAiEditJob } from './jobs/ai_edit.js'
 // Safe schema migrations — idempotent, run on every startup
 async function runMigrations() {
   await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS timing_offset_ms INTEGER DEFAULT 0`
+  // Captions on/off per clip. Turning captions off used to delete the style, and the editor then
+  // switched them back on for any clip whose video has a transcript. Existing styles count as on.
+  await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT true`
   await db`ALTER TABLE videos ADD COLUMN IF NOT EXISTS role TEXT CHECK (role IN ('project','asset')) NOT NULL DEFAULT 'project'`
   await db`ALTER TABLE videos ADD COLUMN IF NOT EXISTS title TEXT`
+  // Why a video failed, in words the user can act on (e.g. a link that isn't shared publicly)
+  await db`ALTER TABLE videos ADD COLUMN IF NOT EXISTS error TEXT`
   // Frames: five frame layouts, letterbox band settings per format, and per-slot photo / motion / audio mix
   await db`ALTER TABLE segments DROP CONSTRAINT IF EXISTS segments_layout_check`
   await db`ALTER TABLE segments ADD CONSTRAINT segments_layout_check CHECK (layout IN (

@@ -26,6 +26,10 @@ export interface TranscribeJobPayload {
   render_after?: RenderJobPayload
   // Upload/link: caption the whole video in the background once it's ready
   transcribe_full?: boolean
+  // Link imports from Google Drive / Dropbox: downloaded directly (no yt-dlp)
+  link_source?: 'gdrive' | 'dropbox'
+  // Largest file the user's plan allows (link imports stop past this)
+  max_bytes?: number
 }
 
 export interface RenderJobPayload {

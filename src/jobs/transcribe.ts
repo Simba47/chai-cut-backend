@@ -1,10 +1,15 @@
 import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import { writeFile, readFile, unlink, mkdtemp, readdir, rm } from 'node:fs/promises'
+import { createWriteStream } from 'node:fs'
+import { Readable, Transform } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import type { ReadableStream as WebReadableStream } from 'node:stream/web'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3'
-import { r2, R2_BUCKET } from '../r2.js'
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
+import { r2, R2_BUCKET, r2DownloadToFile, r2UploadFile } from '../r2.js'
 import db from '../db.js'
 import type { Job, TranscribeJobPayload } from '../types.js'
 
@@ -23,11 +28,39 @@ async function r2Upload(key: string, body: Buffer, contentType: string): Promise
 
 const execFileAsync = promisify(execFile)
 
+/** A failure the user can act on: its message is shown on the video's card */
+class UserFacingError extends Error {}
+
 async function setProgress(videoId: string, pct: number) {
   await db`UPDATE videos SET download_progress = ${pct} WHERE id = ${videoId}`
 }
 
-export async function handleTranscribeJob(job: Job) {
+/** Length of a video file or URL in ms, or null if ffprobe can't tell */
+async function probeDurationMs(input: string, signal?: AbortSignal): Promise<number | null> {
+  try {
+    const { stdout } = await execFileAsync('ffprobe', [
+      '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input,
+    ], { signal, timeout: 60_000 })
+    const secs = parseFloat(stdout.trim())
+    return isNaN(secs) ? null : Math.round(secs * 1000)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The browser reads a video's length when it's uploaded, but can't for formats it doesn't play
+ * (MKV, iPhone HEVC…). Fill it in from storage then: ffprobe reads just the header over a signed URL.
+ */
+async function fillMissingDuration(videoId: string, storagePath: string, signal?: AbortSignal) {
+  const [row] = await db`SELECT duration_ms FROM videos WHERE id = ${videoId}`
+  if (!row || row.duration_ms) return
+  const url = await getSignedUrl(r2, new GetObjectCommand({ Bucket: R2_BUCKET, Key: storagePath }), { expiresIn: 600 })
+  const durationMs = await probeDurationMs(url, signal)
+  if (durationMs) await db`UPDATE videos SET duration_ms = ${durationMs} WHERE id = ${videoId} AND duration_ms IS NULL`
+}
+
+export async function handleTranscribeJob(job: Job, signal?: AbortSignal) {
   const raw = job.payload
   const payload = (typeof raw === 'string' ? JSON.parse(raw) : raw) as TranscribeJobPayload
   const isLinkJob = !payload.storage_path
@@ -43,6 +76,8 @@ export async function handleTranscribeJob(job: Job) {
   if (!isLinkJob && !isClipJob && !isRetranscribe) {
     await db`UPDATE videos SET status = 'ready', download_progress = 100 WHERE id = ${payload.video_id}`
     videoReady = true
+    await fillMissingDuration(payload.video_id, payload.storage_path, signal)
+      .catch(e => console.warn('[transcribe] could not read video length:', e))
     if (!isFullJob) {
       console.log(`[transcribe] upload video ${payload.video_id} ready — transcription deferred to clip creation`)
       return
@@ -83,16 +118,34 @@ export async function handleTranscribeJob(job: Job) {
 
     if (!audioCached) {
       if (isLinkJob) {
-        // Link job: yt-dlp → transcode → upload to storage
-        const result = await downloadWithYtDlp(payload.video_id, tmp)
+        // Link job: Google Drive / Dropbox → plain download; other sites → yt-dlp (home worker only).
+        // Either way the file is uploaded to storage.
+        const result = payload.link_source
+          ? await downloadDirectLink(payload.video_id, payload.link_source, tmp, payload.max_bytes, signal)
+          : await downloadWithYtDlp(payload.video_id, tmp, signal)
         videoPath = result.localPath
         storagePath = result.storagePath
         await db`UPDATE videos SET storage_path = ${storagePath} WHERE id = ${payload.video_id}`
+
+        // A link import is ready as soon as the file is stored — the user can start clipping
+        // while captions are made in the background (or not at all on plans without them, in
+        // which case the audio isn't needed and the job ends here)
+        if (!isClipJob && !isRetranscribe) {
+          const durationMs = await probeDurationMs(videoPath, signal)
+          await db`UPDATE videos SET status = 'ready', storage_path = ${storagePath}, download_progress = 100, duration_ms = ${durationMs} WHERE id = ${payload.video_id}`
+          videoReady = true
+          if (!isFullJob) {
+            console.log(`[transcribe] link video ${payload.video_id} ready — no captions on this plan`)
+            return
+          }
+          console.log(`[transcribe] link video ${payload.video_id} ready — captioning full video in background`)
+        }
       } else {
-        // Clip or retranscribe job: download video from storage
+        // Clip or retranscribe job: download video from storage (streamed to disk — a whole
+        // video held in memory could run the worker out of it)
         await setProgress(payload.video_id, 30)
         videoPath = join(tmp, 'video.mp4')
-        await writeFile(videoPath, await r2Download(storagePath))
+        await r2DownloadToFile(storagePath, videoPath, signal)
         await setProgress(payload.video_id, 55)
       }
 
@@ -105,11 +158,11 @@ export async function handleTranscribeJob(job: Job) {
           '-ss', String(startSec), '-i', videoPath,
           '-t', String(durSec),
           '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', audioPath,
-        ])
+        ], { signal })
       } else {
         await execFileAsync('ffmpeg', [
           '-i', videoPath, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', audioPath,
-        ])
+        ], { signal })
         // Cache full-video audio as FLAC for fast retranscription
         const cachePath = audioStoragePath ?? (storagePath ? storagePath.replace(/\.[^.]+$/, '_audio.flac') : null)
         if (cachePath) {
@@ -122,30 +175,10 @@ export async function handleTranscribeJob(job: Job) {
       }
     }
 
-    // ── Link-only jobs (no clip_id): just set video ready, skip transcription ──
-    if (isLinkJob && !isClipJob && !isRetranscribe) {
-      let durationMs: number | null = null
-      try {
-        const { stdout } = await execFileAsync('ffprobe', [
-          '-v', 'error', '-show_entries', 'format=duration',
-          '-of', 'default=noprint_wrappers=1:nokey=1', videoPath,
-        ])
-        const secs = parseFloat(stdout.trim())
-        if (!isNaN(secs)) durationMs = Math.round(secs * 1000)
-      } catch { /* optional */ }
-
-      await db`UPDATE videos SET status = 'ready', storage_path = ${storagePath}, download_progress = 100, duration_ms = ${durationMs} WHERE id = ${payload.video_id}`
-      videoReady = true
-      if (!isFullJob) {
-        console.log(`[transcribe] link video ${payload.video_id} ready — transcription deferred to clip creation`)
-        return
-      }
-      console.log(`[transcribe] link video ${payload.video_id} ready — captioning full video in background`)
-    }
-
     // ── Transcription ─────────────────────────────────────────────────────────
     // Progress only matters while the video is still 'transcribing' (not for background full-video captions)
-    const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, payload.language_code)
+    const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, payload.language_code, signal)
+    signal?.throwIfAborted()
 
     // Clip jobs (first transcription or retranscribe): replace only this clip's time range in the
     // video's transcript, so other clips of the same video keep their captions. The editor reads
@@ -215,7 +248,11 @@ export async function handleTranscribeJob(job: Job) {
     // Only mark failed for fresh download jobs — retranscribe is called inline from ai_edit
     // on an already-ready video, and a failed background caption job leaves the video usable.
     if (!isClipJob && !isRetranscribe && !videoReady) {
-      await db`UPDATE videos SET status = 'failed' WHERE id = ${payload.video_id}`.catch(() => {})
+      // A reason the user can act on is shown on the video's card (e.g. "set sharing to anyone
+      // with the link"); anything else shows the generic "couldn't process" message
+      const reason = err instanceof UserFacingError ? err.message : null
+      await db`UPDATE videos SET status = 'failed', error = ${reason} WHERE id = ${payload.video_id}`
+        .catch(() => db`UPDATE videos SET status = 'failed' WHERE id = ${payload.video_id}`.catch(() => {}))
     }
     throw err
   } finally {
@@ -234,7 +271,118 @@ export async function handleTranscribeJob(job: Job) {
   }
 }
 
-async function downloadWithYtDlp(videoId: string, tmp: string): Promise<{ localPath: string; storagePath: string }> {
+// ── Google Drive / Dropbox share links ─────────────────────────────────────────
+// A public share link downloads with plain HTTP from any server (no yt-dlp, no home IP needed).
+
+const LINK_NAMES = { gdrive: 'Google Drive', dropbox: 'Dropbox' } as const
+const VIDEO_EXT_BY_TYPE: Record<string, string> = {
+  'video/mp4': '.mp4', 'video/quicktime': '.mov', 'video/webm': '.webm', 'video/x-matroska': '.mkv',
+}
+const VIDEO_TYPE_BY_EXT: Record<string, string> = { '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm', '.mkv': 'video/x-matroska' }
+
+/** The URL that returns the file itself rather than the share page */
+function directDownloadUrl(shareUrl: string, source: 'gdrive' | 'dropbox'): string {
+  const u = new URL(shareUrl)
+  if (source === 'dropbox') {
+    u.searchParams.delete('raw')
+    u.searchParams.set('dl', '1')
+    return u.toString()
+  }
+  // drive.google.com/file/d/<id>/view · …/open?id=<id> · …/uc?id=<id>
+  const id = u.pathname.match(/\/file\/d\/([\w-]+)/)?.[1] ?? u.searchParams.get('id')
+  if (!id) throw new UserFacingError('That Google Drive link doesn\'t point to a file. Open the video in Drive and copy its link.')
+  // confirm=t skips Drive's "can't scan this large file for viruses" page
+  return `https://drive.usercontent.google.com/download?id=${encodeURIComponent(id)}&export=download&confirm=t`
+}
+
+function filenameFromDisposition(header: string | null): string | null {
+  if (!header) return null
+  const star = header.match(/filename\*\s*=\s*(?:UTF-8'')?([^;]+)/i)?.[1]
+  if (star) { try { return decodeURIComponent(star.trim().replace(/^"|"$/g, '')) } catch { /* fall through */ } }
+  return header.match(/filename\s*=\s*"?([^";]+)"?/i)?.[1]?.trim() ?? null
+}
+
+async function downloadDirectLink(
+  videoId: string, source: 'gdrive' | 'dropbox', tmp: string, maxBytes: number | undefined, signal?: AbortSignal,
+): Promise<{ localPath: string; storagePath: string }> {
+  const [video] = await db`SELECT source_url, user_id FROM videos WHERE id = ${videoId}`
+  if (!video?.source_url) throw new Error('No source URL for video ' + videoId)
+  const name = LINK_NAMES[source]
+  const tooBig = () => new UserFacingError(`This video is bigger than your plan's ${Math.round((maxBytes ?? 0) / 1024 ** 3)} GB limit.`)
+
+  await setProgress(videoId, 5)
+  let res = await fetch(directDownloadUrl(video.source_url, source), { redirect: 'follow', signal })
+  // Large Drive files can come back as a "can't scan this file for viruses" page whose button
+  // carries the real download link (a form with hidden fields): follow it once
+  if (source === 'gdrive' && res.ok && (res.headers.get('content-type') ?? '').includes('text/html')) {
+    const page = await res.text()
+    const action = page.match(/<form[^>]+id="download-form"[^>]+action="([^"]+)"/i)?.[1]
+    if (action) {
+      const next = new URL(action.replace(/&amp;/g, '&'))
+      for (const [, name, value] of page.matchAll(/<input[^>]+type="hidden"[^>]+name="([^"]+)"[^>]+value="([^"]*)"/gi)) {
+        next.searchParams.set(name, value.replace(/&amp;/g, '&'))
+      }
+      res = await fetch(next, { redirect: 'follow', signal })
+    } else {
+      // No download button: a sign-in or "you need access" page, i.e. the file isn't shared
+      throw new UserFacingError('Google Drive didn\'t share the file. Set sharing to "Anyone with the link" and try again.')
+    }
+  }
+  if (!res.ok || !res.body) {
+    throw new UserFacingError(res.status === 404
+      ? `That file couldn't be found on ${name}. Check the link.`
+      : `Couldn't download the file from ${name} (error ${res.status}). Check the link is shared with "Anyone with the link".`)
+  }
+  const type = (res.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase()
+  // A web page instead of the file: the link isn't public (or it's a folder)
+  if (type.startsWith('text/html')) {
+    res.body.cancel().catch(() => {})
+    throw new UserFacingError(`${name} didn't share the file. Set sharing to "Anyone with the link" and try again.`)
+  }
+  const total = Number(res.headers.get('content-length')) || 0
+  if (maxBytes && total > maxBytes) { res.body.cancel().catch(() => {}); throw tooBig() }
+
+  const filename = filenameFromDisposition(res.headers.get('content-disposition'))
+  const extFromName = filename?.match(/\.[a-z0-9]+$/i)?.[0].toLowerCase()
+  const ext = (extFromName && VIDEO_TYPE_BY_EXT[extFromName]) ? extFromName : VIDEO_EXT_BY_TYPE[type]
+  if (!ext) {
+    res.body.cancel().catch(() => {})
+    throw new UserFacingError('That link isn\'t a video file we support (MP4, MOV, MKV or WebM).')
+  }
+
+  // Stream to disk, counting bytes: stop as soon as it's bigger than the plan allows
+  // (Content-Length can be missing), and report progress as 5–45 %
+  const localPath = join(tmp, `video${ext}`)
+  let received = 0, lastPct = 5
+  const counter = new Transform({
+    transform(chunk: Buffer, _enc, done) {
+      received += chunk.length
+      if (maxBytes && received > maxBytes) { done(tooBig()); return }
+      if (total) {
+        const pct = Math.round(5 + (received / total) * 40)
+        if (pct !== lastPct) { lastPct = pct; setProgress(videoId, pct).catch(() => {}) }
+      }
+      done(null, chunk)
+    },
+  })
+  await pipeline(Readable.fromWeb(res.body as unknown as WebReadableStream), counter, createWriteStream(localPath), { signal })
+
+  // Make sure it really is a video before storing it
+  const { stdout } = await execFileAsync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', localPath], { signal })
+    .catch(() => ({ stdout: '' }))
+  if (!stdout.includes('video')) throw new UserFacingError('That file doesn\'t contain a video we can read.')
+
+  await setProgress(videoId, 47)
+  const storagePath = `raw/${video.user_id}/${videoId}${ext}`
+  await r2UploadFile(storagePath, localPath, VIDEO_TYPE_BY_EXT[ext])
+  // The file's own name becomes the video's title (unless the user already named it)
+  const title = filename?.replace(/\.[^.]+$/, '').trim().slice(0, 120)
+  if (title) await db`UPDATE videos SET title = COALESCE(title, ${title}) WHERE id = ${videoId}`
+  await setProgress(videoId, 58)
+  return { localPath, storagePath }
+}
+
+async function downloadWithYtDlp(videoId: string, tmp: string, signal?: AbortSignal): Promise<{ localPath: string; storagePath: string }> {
   const [video] = await db`SELECT source_url, user_id FROM videos WHERE id = ${videoId}`
   if (!video?.source_url) throw new Error('No source URL for video ' + videoId)
 
@@ -256,7 +404,8 @@ async function downloadWithYtDlp(videoId: string, tmp: string): Promise<{ localP
   ]
 
   await new Promise<void>((resolve, reject) => {
-    const proc = spawn('yt-dlp', ytdlpArgs)
+    const proc = spawn('yt-dlp', ytdlpArgs, { signal })
+    proc.on('error', reject)
 
     let lastUpdate = 0
     proc.stdout.on('data', (chunk: Buffer) => {
@@ -318,7 +467,8 @@ async function downloadWithYtDlp(videoId: string, tmp: string): Promise<{ localP
       '-movflags', '+faststart',
       '-progress', 'pipe:1',
       '-y', localPath,
-    ])
+    ], { signal })
+    proc.on('error', reject)
 
     let outTime = 0
     proc.stdout.on('data', (chunk: Buffer) => {
@@ -344,8 +494,7 @@ async function downloadWithYtDlp(videoId: string, tmp: string): Promise<{ localP
   const storagePath = `raw/${video.user_id}/${videoId}.mp4`
 
   console.log(`[transcribe] uploading to R2: ${storagePath}`)
-  const fileBuffer = await readFile(localPath)
-  await r2Upload(storagePath, fileBuffer, 'video/mp4')
+  await r2UploadFile(storagePath, localPath, 'video/mp4')
 
   await setProgress(videoId, 58)
   return { localPath, storagePath }
@@ -834,7 +983,7 @@ async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promis
   }
 }
 
-export async function transcribeAudio(audioPath: string, videoId?: string, languageCode?: string): Promise<SarvamResponse> {
+export async function transcribeAudio(audioPath: string, videoId?: string, languageCode?: string, signal?: AbortSignal): Promise<SarvamResponse> {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not set')
   console.log(`[transcribe] ${GEMINI_STT_MODEL} (verbatim, word timestamps)`)
 
@@ -848,6 +997,8 @@ export async function transcribeAudio(audioPath: string, videoId?: string, langu
   if (videoId) await setProgress(videoId, 62)
 
   async function chunkWords(i: number, lang: string | undefined): Promise<SarvamWord[]> {
+    // A job that ran past its timeout stops here, between chunks
+    signal?.throwIfAborted()
     const startSec = i * GEMINI_CHUNK_SEC
     const chunkPath = audioPath.replace('.wav', `_gchunk${i}.wav`)
     await execFileAsync('ffmpeg', [

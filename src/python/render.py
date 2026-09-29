@@ -600,7 +600,8 @@ def main(
 
         # ── ASS captions ───────────────────────────────────────────────────────
         ass_path = None
-        if clip_words and caption_style:
+        # enabled False = the user turned captions off (styles saved before that field count as on)
+        if clip_words and caption_style and caption_style.get("enabled") is not False:
             ass_path = os.path.join(tmp, "captions.ass")
             _write_ass(clip_words, caption_style, clip_start_ms, out_w, out_h, ass_path,
                        band_zones=caption_band_zones(segments, out_h))

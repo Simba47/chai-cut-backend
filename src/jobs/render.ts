@@ -1,14 +1,11 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { createReadStream, createWriteStream } from 'node:fs'
 import { writeFile, mkdtemp, rm } from 'node:fs/promises'
-import { pipeline } from 'node:stream/promises'
-import { Readable } from 'node:stream'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3'
+import { GetObjectCommand } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
-import { r2, R2_BUCKET } from '../r2.js'
+import { r2, R2_BUCKET, r2DownloadToFile, r2UploadFile } from '../r2.js'
 import db from '../db.js'
 import type { Job, RenderJobPayload } from '../types.js'
 import { fileURLToPath } from 'node:url'
@@ -17,17 +14,15 @@ import { dirname } from 'node:path'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 
-// Stream R2 object directly to a local file — never buffers the whole file in memory.
-async function r2DownloadToFile(key: string, filePath: string): Promise<void> {
-  const res = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }))
-  await pipeline(Readable.from(res.Body as AsyncIterable<Uint8Array>), createWriteStream(filePath))
-}
-
-export async function handleRenderJob(job: Job) {
+export async function handleRenderJob(job: Job, signal?: AbortSignal) {
   const payload = job.payload as unknown as RenderJobPayload
   const { clip_id, video_storage_path } = payload
+  // The quality the export asked for (it used to be ignored: every render came out 1080p)
+  const quality = payload.quality && QUALITY_DIMS[payload.quality] ? payload.quality : '1080p'
 
-  const renderSpec = await buildRenderSpec(clip_id, video_storage_path, '1080p')
+  const renderSpec = await buildRenderSpec(clip_id, video_storage_path, quality)
+  // Other videos shown in the clip are fetched by ID: only ever the clip owner's own videos
+  const [owner] = await db`SELECT v.user_id FROM clips c JOIN videos v ON v.id = c.video_id WHERE c.id = ${clip_id}`
   // Sign the source URL so FFmpeg can stream directly from R2 via HTTP range requests.
   // This avoids downloading the full source file (can be 1GB+) to Railway's disk
   // when we only need a 60-second window of it.
@@ -53,12 +48,12 @@ export async function handleRenderJob(job: Job) {
     }
     const secondaryVideos: Record<string, string> = {}
     for (const videoId of otherVideoIds) {
-      const [vRow] = await db`SELECT storage_path FROM videos WHERE id = ${videoId}`
+      const [vRow] = await db`SELECT storage_path FROM videos WHERE id = ${videoId} AND user_id = ${owner?.user_id ?? null}`
       if (!vRow?.storage_path) continue
       try {
         const t1 = Date.now()
         const localPath = join(tmp, `secondary_${videoId}.mp4`)
-        await r2DownloadToFile(vRow.storage_path, localPath)
+        await r2DownloadToFile(vRow.storage_path, localPath, signal)
         console.log(`[render] B-roll download: ${((Date.now()-t1)/1000).toFixed(1)}s`)
         secondaryVideos[videoId] = localPath
       } catch (e) { console.warn(`[render] Failed to download secondary video:`, e) }
@@ -71,7 +66,7 @@ export async function handleRenderJob(job: Job) {
       try {
         const ext = ov.storage_path.split('.').pop() ?? 'png'
         const localPath = join(tmp, `overlay_${createHash('sha1').update(ov.storage_path).digest('hex').slice(0, 16)}.${ext}`)
-        await r2DownloadToFile(ov.storage_path, localPath)
+        await r2DownloadToFile(ov.storage_path, localPath, signal)
         overlayImages[ov.storage_path] = localPath
       } catch (e) { console.warn(`[render] Failed to download overlay:`, e) }
     }
@@ -87,7 +82,7 @@ export async function handleRenderJob(job: Job) {
       try {
         const ext = path.split('.').pop() ?? 'png'
         const localPath = join(tmp, `frame_${createHash('sha1').update(path).digest('hex').slice(0, 16)}.${ext}`)
-        await r2DownloadToFile(path, localPath)
+        await r2DownloadToFile(path, localPath, signal)
         frameImages[path] = localPath
       } catch (e) { console.warn(`[render] Failed to download frame photo:`, e) }
     }
@@ -97,11 +92,11 @@ export async function handleRenderJob(job: Job) {
     for (const ov of (renderSpec.overlays ?? []) as Array<{ type?: string; source_video_id?: string }>) {
       if (ov.type !== 'video' || !ov.source_video_id || seenOverlayVideoIds.has(ov.source_video_id)) continue
       seenOverlayVideoIds.add(ov.source_video_id)
-      const [vRow] = await db`SELECT storage_path FROM videos WHERE id = ${ov.source_video_id}`
+      const [vRow] = await db`SELECT storage_path FROM videos WHERE id = ${ov.source_video_id} AND user_id = ${owner?.user_id ?? null}`
       if (!vRow?.storage_path) continue
       try {
         const localPath = join(tmp, `overlay_video_${ov.source_video_id}.mp4`)
-        await r2DownloadToFile(vRow.storage_path, localPath)
+        await r2DownloadToFile(vRow.storage_path, localPath, signal)
         overlayVideos[ov.source_video_id] = localPath
       } catch (e) { console.warn(`[render] Failed to download overlay video:`, e) }
     }
@@ -118,11 +113,11 @@ export async function handleRenderJob(job: Job) {
     ]
     if (payload.watermark) pythonArgs.push('--watermark')
     const tPy = Date.now()
-    await runPython(pythonScript, pythonArgs)
+    await runPython(pythonScript, pythonArgs, signal)
     console.log(`[render] Python done: ${((Date.now()-tPy)/1000).toFixed(1)}s`)
 
     const outputStoragePath = `clips/${clip_id}/output.mp4`
-    await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath, Body: createReadStream(outputPath), ContentType: 'video/mp4' }))
+    await r2UploadFile(outputStoragePath, outputPath, 'video/mp4')
 
     const output_url = await getSignedUrl(r2, new GetObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath }), { expiresIn: 60 * 60 * 24 * 7 })
     await db`UPDATE clips SET status = 'done', output_url = ${output_url}, output_storage_path = ${outputStoragePath} WHERE id = ${clip_id}`
@@ -190,6 +185,7 @@ export async function renderClipWithLocalVideo(
   clipId: string,
   videoLocalPath: string,
   videoStoragePath: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const renderSpec = await buildRenderSpec(clipId, videoStoragePath, '1080p')
   const tmp = await mkdtemp(join(tmpdir(), 'render-'))
@@ -201,9 +197,9 @@ export async function renderClipWithLocalVideo(
     await runPython(pythonScript, [
       '--video', videoLocalPath, '--spec', specPath, '--output', outputPath,
       '--secondary-videos', '{}', '--overlay-images', '{}', '--overlay-videos', '{}',
-    ])
+    ], signal)
     const outputStoragePath = `clips/${clipId}/output.mp4`
-    await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath, Body: createReadStream(outputPath), ContentType: 'video/mp4' }))
+    await r2UploadFile(outputStoragePath, outputPath, 'video/mp4')
     const output_url = await getSignedUrl(r2, new GetObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath }), { expiresIn: 60 * 60 * 24 * 7 })
     await db`UPDATE clips SET status = 'done', output_url = ${output_url}, output_storage_path = ${outputStoragePath} WHERE id = ${clipId}`
     console.log(`[render] Clip ${clipId} done`)
@@ -215,9 +211,19 @@ export async function renderClipWithLocalVideo(
   }
 }
 
-function runPython(script: string, args: string[]): Promise<void> {
+// `signal` (the job timing out) kills Python together with the ffmpeg it started: on Linux Python
+// runs in its own process group, and the whole group is killed (killing only Python would leave
+// ffmpeg running on)
+function runPython(script: string, args: string[], signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
-    const proc = spawn('python3', [script, ...args], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } })
+    if (signal?.aborted) { reject(signal.reason); return }
+    const group = process.platform !== 'win32'
+    const proc = spawn('python3', [script, ...args], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' }, detached: group })
+    const kill = () => {
+      try { if (group && proc.pid) process.kill(-proc.pid, 'SIGKILL'); else proc.kill('SIGKILL') } catch { /* already gone */ }
+    }
+    signal?.addEventListener('abort', kill, { once: true })
+    proc.on('close', () => signal?.removeEventListener('abort', kill))
     let stderr = ''
     proc.stdout?.on('data', (d: Buffer) => process.stdout.write(d))
     proc.stderr?.on('data', (d: Buffer) => { process.stderr.write(d); stderr += d.toString() })
