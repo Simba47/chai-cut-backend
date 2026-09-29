@@ -181,36 +181,6 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
   }
 }
 
-export async function renderClipWithLocalVideo(
-  clipId: string,
-  videoLocalPath: string,
-  videoStoragePath: string,
-  signal?: AbortSignal,
-): Promise<void> {
-  const renderSpec = await buildRenderSpec(clipId, videoStoragePath, '1080p')
-  const tmp = await mkdtemp(join(tmpdir(), 'render-'))
-  const outputPath = join(tmp, 'output.mp4')
-  const specPath = join(tmp, 'spec.json')
-  try {
-    await writeFile(specPath, JSON.stringify(renderSpec, null, 2))
-    const pythonScript = join(__dirname, '../../src/python/render.py')
-    await runPython(pythonScript, [
-      '--video', videoLocalPath, '--spec', specPath, '--output', outputPath,
-      '--secondary-videos', '{}', '--overlay-images', '{}', '--overlay-videos', '{}',
-    ], signal)
-    const outputStoragePath = `clips/${clipId}/output.mp4`
-    await r2UploadFile(outputStoragePath, outputPath, 'video/mp4')
-    const output_url = await getSignedUrl(r2, new GetObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath }), { expiresIn: 60 * 60 * 24 * 7 })
-    await db`UPDATE clips SET status = 'done', output_url = ${output_url}, output_storage_path = ${outputStoragePath} WHERE id = ${clipId}`
-    console.log(`[render] Clip ${clipId} done`)
-  } catch (err) {
-    await db`UPDATE clips SET status = 'failed' WHERE id = ${clipId}`
-    throw err
-  } finally {
-    await rm(tmp, { recursive: true, force: true })
-  }
-}
-
 // `signal` (the job timing out) kills Python together with the ffmpeg it started: on Linux Python
 // runs in its own process group, and the whole group is killed (killing only Python would leave
 // ffmpeg running on)

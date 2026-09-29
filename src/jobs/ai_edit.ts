@@ -8,7 +8,7 @@ import { r2DownloadToFile } from '../r2.js'
 import db from '../db.js'
 import type { Job, AiEditJobPayload } from '../types.js'
 import { handleTranscribeJob } from './transcribe.js'
-import { renderClipWithLocalVideo } from './render.js'
+import { findClips, type FoundClip } from '../lib/clipFinder.js'
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
 
@@ -21,7 +21,6 @@ const execFileAsync = promisify(execFile)
 const REEL_W = 81 / 256  // ≈ 0.316
 
 interface CropBox { x: number; y: number; w: number; h: number }
-interface Highlight { start_ms: number; end_ms: number; title: string }
 interface FrameDetection { frame_index: number; person_count: number; faces: CropBox[] }
 interface FaceInfo { face_count: number; face_boxes: CropBox[]; frames: FrameDetection[] }
 interface SlotKf { t_ms: number; x: number; y: number; w: number; h: number }
@@ -227,98 +226,117 @@ function buildSegments(info: FaceInfo, clipDurationMs: number): ClipSegment[] {
   })
 }
 
-async function selectHighlights(
-  words: Array<{ word: string; start_ms: number; end_ms: number }>,
-  clipCount: number,
-  durationMs: number,
-): Promise<Highlight[]> {
-  const targetMs = 60_000  // ~60s per clip
+type Word = { word: string; start_ms: number; end_ms: number }
 
-  // FIX 1: Sample evenly across the FULL video (not just the first 8000 chars)
-  // 500 words × ~15 chars each ≈ 7500 chars, stays under token limit
-  const MAX_SAMPLE = 500
-  const step = Math.max(1, Math.floor(words.length / MAX_SAMPLE))
-  const transcript = words
-    .filter((_, i) => i % step === 0)
-    .map(w => `${w.word}[${w.start_ms}]`)
-    .join(' ')
-
-  const prompt = `You are a professional video editor selecting the best highlight clips to post as short-form vertical content. Your job is to find the moments that will make viewers stop scrolling.
-
-Transcript format: word[timestamp_ms] ... (sampled evenly across the full video)
-${transcript}
-
-Video duration: ${Math.round(durationMs / 1000)}s
-Number of clips to select: ${clipCount}
-
-WHAT MAKES A GREAT HIGHLIGHT (applies to any video type):
-- A strong opinion, surprising statement, or counterintuitive insight
-- A peak emotional moment: genuine laughter, shock, excitement, tension, vulnerability
-- A self-contained story or anecdote with a clear beginning and payoff
-- A quotable, memorable line followed by context that makes it land
-- A moment of conflict, disagreement, or strong reaction
-- A practical insight or advice that stands on its own
-- Avoid: slow intros, sponsor reads, filler ("um", "so", "anyway"), pure logistics
-
-HOW TO CHOOSE START AND END:
-- Start just before the key moment begins (include the setup)
-- End after the reaction or punchline lands — don't cut mid-thought
-- Each clip must feel complete and make sense without watching the rest of the video
-
-Return ONLY a JSON array with exactly ${clipCount} objects. No other text.
-Each object: { "start_ms": <integer>, "end_ms": <integer>, "title": "<5 words max>" }
-
-CRITICAL RULES:
-- end_ms - start_ms MUST be between 55000 and 70000 (55 to 70 seconds). Never shorter, never longer.
-- Clips must not overlap
-- Spread clips across the full video — do not cluster them all at the start
-- start_ms and end_ms must be actual timestamps from the transcript
-- Return exactly ${clipCount} clips`
-
+// Gemini picks the clips: the numbered-line, windowed, scored method shared with the app's
+// "Best moments" (src/lib/clipFinder.ts)
+async function selectHighlights(words: Word[], clipCount: number, durationMs: number): Promise<FoundClip[]> {
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!)
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
-  const result = await model.generateContent(prompt)
-  const text = result.response.text()
-
-  const jsonMatch = text.match(/\[[\s\S]*\]/)
-  if (!jsonMatch) throw new Error(`Gemini did not return a JSON array: ${text.slice(0, 300)}`)
-
-  const parsed = JSON.parse(jsonMatch[0]) as Highlight[]
-  if (!Array.isArray(parsed) || parsed.length === 0) {
-    throw new Error('Gemini returned empty or invalid highlights array')
+  const ask = async (system: string, user: string) => {
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', systemInstruction: system })
+    return (await model.generateContent(user)).response.text()
   }
+  // Enough candidates per window that a short video (one window) can still fill the request
+  const windowCount = Math.max(1, Math.ceil(durationMs / (9 * 60_000)))
+  const perWindow = Math.min(10, Math.max(4, Math.ceil((clipCount * 1.5) / windowCount)))
+  return findClips({
+    words, durationMs, mode: { kind: 'best' }, ask,
+    limit: clipCount, perWindow, spread: true,
+    log: msg => console.warn('[ai_edit] clip finder:', msg),
+  })
+}
 
-  return parsed
-    .filter(h => typeof h.start_ms === 'number' && typeof h.end_ms === 'number')
-    .map(h => {
-      const start_ms = Math.max(0, Math.min(durationMs, Math.round(h.start_ms)))
-      let end_ms = Math.max(0, Math.min(durationMs, Math.round(h.end_ms)))
-      const dur = end_ms - start_ms
-      // Hard-enforce minimum length — Gemini sometimes ignores the prompt constraint
-      if (dur < 55000) {
-        end_ms = Math.min(durationMs, start_ms + 60000)
-      }
-      return { start_ms, end_ms, title: String(h.title ?? '').slice(0, 80) || 'Highlight' }
-    })
-    .filter(h => h.end_ms - h.start_ms >= 30000)  // discard anything still too short
-    .slice(0, clipCount)
+// ── Captions ──────────────────────────────────────────────────────────────────
+//
+// AI clips get captions on, with the editor's defaults (DEFAULT_CAPTION_STYLE in the app).
+// The font follows the script the clip is spoken in; ids are _FONT_NAMES in render.py.
+// Scripts without a bundled font yet (Tamil, Kannada, …) are shown in Roman letters.
+
+const SCRIPTS: Array<[string, RegExp]> = [
+  ['telugu', /[\u0C00-\u0C7F]/], ['devanagari', /[\u0900-\u097F]/], ['latin', /[A-Za-z]/],
+  ['other_indic', /[\u0980-\u0BFF\u0C80-\u0DFF]/], // Bengali, Gurmukhi, Gujarati, Odia, Tamil, Kannada, Malayalam, Sinhala
+]
+
+export function captionFontFor(words: Word[]): { font: string; language: string | null } {
+  const counts: Record<string, number> = {}
+  for (const w of words) {
+    for (const ch of w.word) {
+      for (const [name, re] of SCRIPTS) if (re.test(ch)) { counts[name] = (counts[name] ?? 0) + 1; break }
+    }
+  }
+  const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0]
+  if (top === 'telugu') return { font: 'noto-sans-telugu', language: null }
+  if (top === 'devanagari') return { font: 'noto-sans-devanagari', language: null }
+  if (top === 'other_indic') return { font: 'roboto', language: 'roman' }
+  return { font: 'roboto', language: null }
+}
+
+// ── Transcript ────────────────────────────────────────────────────────────────
+
+/**
+ * Whether the video's transcript covers the whole video. A clip made before the full-video
+ * captions finished leaves a transcript holding only that clip's words; picking clips from it
+ * would miss everything else. "Whole" = words in at least 60% of the video's minutes.
+ */
+function coversVideo(words: Word[], durationMs: number) {
+  if (words.length === 0) return false
+  const minutes = Math.max(1, Math.ceil(durationMs / 60_000))
+  const spoken = new Set(words.map(w => Math.floor(w.start_ms / 60_000)))
+  return spoken.size / minutes >= 0.6
+}
+
+async function loadWords(videoId: string): Promise<Word[]> {
+  const [row] = await db`SELECT id FROM transcripts WHERE video_id = ${videoId} ORDER BY created_at DESC LIMIT 1`
+  if (!row) return []
+  return db<Word[]>`SELECT word, start_ms, end_ms FROM transcript_words WHERE transcript_id = ${row.id} ORDER BY start_ms`
+}
+
+/** Waits (up to 10 min) for the full-video captions started at upload, instead of paying for a second transcription */
+async function waitForFullTranscription(videoId: string, signal?: AbortSignal) {
+  const deadline = Date.now() + 10 * 60_000
+  while (Date.now() < deadline) {
+    const [running] = await db`
+      SELECT id FROM jobs
+      WHERE type = 'transcribe' AND payload->>'video_id' = ${videoId}
+        AND payload->>'transcribe_full' = 'true' AND status IN ('queued', 'processing')
+      LIMIT 1
+    `
+    if (!running) return
+    signal?.throwIfAborted()
+    await new Promise(r => setTimeout(r, 5000))
+  }
+}
+
+async function setProgress(aiEditJobId: string, progress: number) {
+  await db`UPDATE ai_edit_jobs SET progress = ${Math.round(progress)} WHERE id = ${aiEditJobId}`
+    .catch(e => console.warn('[ai_edit] could not save progress:', e))
 }
 
 export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
   const payload = job.payload as unknown as AiEditJobPayload
   const { ai_edit_job_id, video_id, clip_count } = payload
+  const t0 = Date.now()
 
-  await db`UPDATE ai_edit_jobs SET status = 'running' WHERE id = ${ai_edit_job_id}`
+  await db`UPDATE ai_edit_jobs SET status = 'running', progress = 5 WHERE id = ${ai_edit_job_id}`
 
   try {
-    // 1. Get video info
-    const [video] = await db`SELECT id, storage_path, duration_ms FROM videos WHERE id = ${video_id}`
+    // 1. Get video info (and the owner's plan, for the export watermark)
+    const [video] = await db`
+      SELECT v.id, v.storage_path, v.duration_ms, u.plan
+      FROM videos v LEFT JOIN users u ON u.id = v.user_id
+      WHERE v.id = ${video_id}
+    `
     if (!video?.storage_path) throw new Error('Video not found or missing storage path')
+    // Same rule as the app's plans (src/lib/plans.ts): only the free plan exports with a watermark
+    const watermark = !['starter', 'creator', 'agency'].includes(video.plan ?? 'free')
 
-    // 2. Ensure transcript exists — transcribe inline if not yet done
-    const [existingTranscript] = await db`SELECT id FROM transcripts WHERE video_id = ${video_id} LIMIT 1`
-    if (!existingTranscript) {
-      console.log(`[ai_edit] No transcript for ${video_id} — transcribing now`)
+    // 2. Ensure a whole-video transcript — transcribe inline if there isn't one.
+    //    Always from storage (R2), never yt-dlp, so this also runs on Railway.
+    await waitForFullTranscription(video_id, signal)
+    let words = await loadWords(video_id)
+    const knownDurationMs = video.duration_ms ?? (words.length ? words[words.length - 1].end_ms : 0)
+    if (!coversVideo(words, knownDurationMs)) {
+      console.log(`[ai_edit] Transcript for ${video_id} missing or partial (${words.length} words) — transcribing now`)
       await handleTranscribeJob({
         id: `ai-edit-tx-${ai_edit_job_id}`,
         type: 'transcribe',
@@ -328,37 +346,31 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       }, signal)
+      words = await loadWords(video_id)
     }
-
-    // 3. Load transcript words
-    const [transcriptRow] = await db`
-      SELECT id FROM transcripts WHERE video_id = ${video_id} ORDER BY created_at DESC LIMIT 1
-    `
-    if (!transcriptRow) throw new Error('No transcript available')
-
-    const words = await db<{ word: string; start_ms: number; end_ms: number }[]>`
-      SELECT word, start_ms, end_ms FROM transcript_words
-      WHERE transcript_id = ${transcriptRow.id}
-      ORDER BY start_ms
-    `
-    if (!words.length) throw new Error('Transcript is empty')
-
+    if (!words.length) throw new Error('This video has no speech to make clips from')
     const durationMs = video.duration_ms ?? words[words.length - 1].end_ms
+    await setProgress(ai_edit_job_id, 20)
 
-    // 4. Ask Gemini to select highlights across the full video
+    // 3. Pick the clips across the whole video
     const highlights = await selectHighlights(words, clip_count, durationMs)
-    console.log(`[ai_edit] ${highlights.length} highlights selected for job ${ai_edit_job_id}`)
+    if (highlights.length === 0) throw new Error('AI could not find any good clips in this video')
+    console.log(`[ai_edit] ${highlights.length}/${clip_count} clips picked for job ${ai_edit_job_id} (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
+    await setProgress(ai_edit_job_id, 35)
 
-    // 5. Download video once
+    // 4. Download video once (for framing)
     const tmp = await mkdtemp(join(tmpdir(), 'ai-edit-'))
     try {
       const videoPath = join(tmp, 'source.mp4')
       console.log(`[ai_edit] Downloading video ${video.storage_path}`)
       await r2DownloadToFile(video.storage_path, videoPath, signal)
+      await setProgress(ai_edit_job_id, 45)
 
-      // 6. Face detection + create DB records for all clips
-      const createdClipIds: string[] = []
-      for (const highlight of highlights) {
+      // 5. Frame each clip, save it, and queue its render (the render queue exports it, so this
+      //    job stays well inside the job timeout however many clips there are)
+      for (let hi = 0; hi < highlights.length; hi++) {
+        signal?.throwIfAborted()
+        const highlight = highlights[hi]
         const clipDurationMs = highlight.end_ms - highlight.start_ms
 
         // Detect per-second subject positions across the entire clip
@@ -366,65 +378,78 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
 
         // Brain: dynamically switch layout per-second within the clip
         const segments = buildSegments(faceInfo, clipDurationMs)
+        const clipWords = words.filter(w => w.start_ms >= highlight.start_ms && w.start_ms < highlight.end_ms)
+        const caption = captionFontFor(clipWords)
 
-        const [clipRow] = await db`
-          INSERT INTO clips (video_id, start_ms, end_ms, status, title, ai_edit_job_id)
-          VALUES (${video_id}, ${highlight.start_ms}, ${highlight.end_ms}, 'rendering', ${highlight.title}, ${ai_edit_job_id})
-          RETURNING id
-        `
-        const clip_id = clipRow.id
-
-        for (let si = 0; si < segments.length; si++) {
-          const seg = segments[si]
-          const [segRow] = await db`
-            INSERT INTO segments (clip_id, start_ms, end_ms, layout, sort_order, video_offset_ms)
-            VALUES (${clip_id}, ${seg.start_ms}, ${seg.end_ms}, ${seg.layout}, ${si}, NULL)
-            RETURNING id
-          `
-          const seg_id = segRow.id
-
-          for (let slotIdx = 0; slotIdx < seg.slotKfs.length; slotIdx++) {
-            // source_offset_ms is where in the clip this segment's video starts: render.py trims
-            // the main video from it, so 0 made every later segment replay the clip's start
-            const [boxRow] = await db`
-              INSERT INTO crop_boxes (segment_id, slot_index, source_video_id, source_offset_ms)
-              VALUES (${seg_id}, ${slotIdx}, NULL, ${seg.start_ms})
-              RETURNING id
-            `
-            for (const kf of seg.slotKfs[slotIdx]) {
-              await db`
-                INSERT INTO box_keyframes (box_id, t_ms, x, y, w, h)
-                VALUES (${boxRow.id}, ${kf.t_ms}, ${kf.x}, ${kf.y}, ${kf.w}, ${kf.h})
-              `
-            }
-          }
-        }
+        const clip_id = await saveClip(video_id, ai_edit_job_id, highlight, segments, caption)
+        const renderPayload = { clip_id, video_storage_path: video.storage_path, quality: '1080p', watermark }
+        await db`INSERT INTO jobs (type, payload, status) VALUES ('render', ${db.json(renderPayload)}, 'queued')`
 
         const layoutSummary = segments.map(s =>
           `${s.layout}(${s.start_ms / 1000}s–${s.end_ms / 1000}s,${s.slotKfs[0]?.length ?? 0}kf)`
         ).join(' | ')
-        console.log(`[ai_edit] Clip ${clip_id}: ${segments.length} seg — ${layoutSummary}`)
+        console.log(`[ai_edit] Clip ${clip_id} (score ${highlight.score}, ${caption.font}${caption.language ? '/' + caption.language : ''}): ${segments.length} seg — ${layoutSummary}`)
         console.log(`[ai_edit] Detection summary: ${faceInfo.frames.length} frames, max_persons=${faceInfo.face_count}`)
-        createdClipIds.push(clip_id)
-      }
-
-      // 7. Render all clips inline — video already on disk, no re-download
-      const RENDER_PARALLEL = 3
-      for (let i = 0; i < createdClipIds.length; i += RENDER_PARALLEL) {
-        const batch = createdClipIds.slice(i, i + RENDER_PARALLEL)
-        await Promise.all(batch.map(id => renderClipWithLocalVideo(id, videoPath, video.storage_path, signal)))
-        console.log(`[ai_edit] Rendered batch ${Math.floor(i / RENDER_PARALLEL) + 1}/${Math.ceil(createdClipIds.length / RENDER_PARALLEL)}`)
+        await setProgress(ai_edit_job_id, 45 + (55 * (hi + 1)) / highlights.length - 1)
       }
     } finally {
       await rm(tmp, { recursive: true, force: true })
     }
 
-    await db`UPDATE ai_edit_jobs SET status = 'done' WHERE id = ${ai_edit_job_id}`
-    console.log(`[ai_edit] Job ${ai_edit_job_id} done`)
+    await db`UPDATE ai_edit_jobs SET status = 'done', progress = 100 WHERE id = ${ai_edit_job_id}`
+    console.log(`[ai_edit] Job ${ai_edit_job_id} done in ${((Date.now() - t0) / 1000).toFixed(0)}s (renders queued)`)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error(`[ai_edit] Job ${ai_edit_job_id} failed:`, msg)
     await db`UPDATE ai_edit_jobs SET status = 'failed', error = ${msg} WHERE id = ${ai_edit_job_id}`
     throw err
   }
+}
+
+/**
+ * One clip with its formats, crop boxes, keyframes and caption style, in one transaction.
+ * Rows go in as bulk inserts: the database is several hundred ms away, and a round trip per
+ * keyframe took minutes per clip.
+ */
+async function saveClip(
+  videoId: string, aiEditJobId: string, highlight: FoundClip, segments: ClipSegment[],
+  caption: { font: string; language: string | null },
+): Promise<string> {
+  return db.begin(async tx => {
+    const [clipRow] = await tx`
+      INSERT INTO clips (video_id, start_ms, end_ms, status, title, ai_edit_job_id, ai_score, ai_reason)
+      VALUES (${videoId}, ${highlight.start_ms}, ${highlight.end_ms}, 'rendering', ${highlight.title.slice(0, 120) || 'Highlight'},
+        ${aiEditJobId}, ${highlight.score}, ${highlight.reason || null})
+      RETURNING id
+    `
+    const clipId = clipRow.id as string
+
+    const segRows = await tx`
+      INSERT INTO segments ${tx(segments.map((seg, si) => ({
+        clip_id: clipId, start_ms: seg.start_ms, end_ms: seg.end_ms, layout: seg.layout, sort_order: si, video_offset_ms: null,
+      })))}
+      RETURNING id, sort_order
+    `
+    const segIdByOrder = new Map(segRows.map(r => [r.sort_order as number, r.id as string]))
+
+    // source_offset_ms is where in the clip this segment's video starts: render.py trims
+    // the main video from it, so 0 made every later segment replay the clip's start
+    const boxInputs = segments.flatMap((seg, si) => seg.slotKfs.map((kfs, slotIdx) => ({
+      row: { segment_id: segIdByOrder.get(si)!, slot_index: slotIdx, source_video_id: null, source_offset_ms: seg.start_ms },
+      kfs,
+    })))
+    const boxRows = await tx`INSERT INTO crop_boxes ${tx(boxInputs.map(b => b.row))} RETURNING id, segment_id, slot_index`
+    const boxId = new Map(boxRows.map(r => [`${r.segment_id}:${r.slot_index}`, r.id as string]))
+    const kfRows = boxInputs.flatMap(b => b.kfs.map(kf => ({
+      box_id: boxId.get(`${b.row.segment_id}:${b.row.slot_index}`)!, t_ms: kf.t_ms, x: kf.x, y: kf.y, w: kf.w, h: kf.h,
+    })))
+    // Postgres allows 65,535 parameters per statement: 6 per keyframe
+    for (let i = 0; i < kfRows.length; i += 5000) await tx`INSERT INTO box_keyframes ${tx(kfRows.slice(i, i + 5000))}`
+
+    await tx`
+      INSERT INTO caption_styles (clip_id, font, size, color, position, animation, language)
+      VALUES (${clipId}, ${caption.font}, 52, '#FFFFFF', 'bottom-center', 'karaoke', ${caption.language})
+    `
+    return clipId
+  })
 }

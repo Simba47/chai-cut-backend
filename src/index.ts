@@ -58,6 +58,13 @@ async function runMigrations() {
     )
   `
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_edit_job_id uuid REFERENCES ai_edit_jobs(id) ON DELETE SET NULL`
+  // The original schema only allowed 'transcribe' and 'render' jobs, so an 'ai_edit' job could not be queued
+  await db`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_type_check`
+  await db`ALTER TABLE jobs ADD CONSTRAINT jobs_type_check CHECK (type IN ('transcribe','render','ai_edit'))`
+  // "Make my clips": how far the job has got (0–100), and why the AI picked each clip
+  await db`ALTER TABLE ai_edit_jobs ADD COLUMN IF NOT EXISTS progress INTEGER NOT NULL DEFAULT 0`
+  await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_score INTEGER`
+  await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_reason TEXT`
   console.log('[startup] migrations ok')
 }
 
