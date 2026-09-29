@@ -24,8 +24,10 @@ RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
     -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp
 
 # Python deps
-COPY src/python/requirements.txt /tmp/req.txt
-RUN pip3 install --no-cache-dir -r /tmp/req.txt --break-system-packages
+COPY src/python/requirements.txt src/python/requirements-nodeps.txt /tmp/
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt --break-system-packages \
+    && pip3 install --no-cache-dir --no-deps -r /tmp/requirements-nodeps.txt --break-system-packages \
+    && MPLBACKEND=Agg python3 -c "from mediapipe.tasks.python import vision; import cv2; cv2.CascadeClassifier"
 
 # Node deps
 COPY package.json package-lock.json* ./

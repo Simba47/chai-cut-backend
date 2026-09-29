@@ -2,9 +2,13 @@
 Subject detection on a directory of JPEG frames.
 
 Per-frame pipeline (in order):
-  1. Haar frontal-face cascade  — precise positions for forward-facing subjects
-  2. Wide-blob analysis          — when blob width >= 35% of frame, treat as 2+ people
-  3. Background subtraction      — fallback for side-on/full-body subjects
+  1. MediaPipe FaceDetector (BlazeFace short-range, Apache-2.0) on the whole frame and on square
+     tiles of it: the model sees a 128×128 image, so on a wide frame the tiles keep faces big
+     enough to find. Catches side-on and tilted faces the Haar cascade missed.
+  2. Haar frontal-face cascade  — only when MediaPipe finds nothing, or can't be imported
+  3. Frame differencing (motion) — position fallback for subjects with no detectable face
+Faces that never change from frame to frame (a poster or photo on the wall) are dropped: the
+detectors find them as readily as people, and they would pull the crop to a split layout.
 
 Output: JSON to stdout:
   {
@@ -14,11 +18,12 @@ Output: JSON to stdout:
       {
         "frame_index": 0,
         "person_count": N,       # how many distinct people are in this frame
-        "faces": [{x,y,w,h}]    # positions of detected subjects, left→right
+        "faces": [{x,y,w,h,score}]  # positions of detected subjects, left→right
       }, ...
     ]
   }
-  All coordinates are fractions of the frame (0.0–1.0).
+  All coordinates are fractions of the frame (0.0–1.0). score is the detection confidence
+  (MediaPipe), 1.0 for Haar faces and 0.0 for motion boxes.
 """
 import argparse
 import json
@@ -28,12 +33,15 @@ import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CASCADE_PATH = os.path.join(SCRIPT_DIR, 'haarcascade_frontalface_default.xml')
+BLAZEFACE_PATH = os.path.join(SCRIPT_DIR, 'blaze_face_short_range.tflite')
+
+MIN_SCORE = 0.5        # ignore less confident MediaPipe faces
+MIN_FACE_AREA = 0.02   # ignore faces smaller than 2% of the frame (background people)
 
 
-
-def _normalize(x, y, w, h, w_px, h_px):
+def _normalize(x, y, w, h, w_px, h_px, score=1.0):
     return {"x": x / w_px, "y": y / h_px, "w": w / w_px, "h": h / h_px,
-            "cx": (x + w / 2) / w_px, "area": (w / w_px) * (h / h_px)}
+            "cx": (x + w / 2) / w_px, "area": (w / w_px) * (h / h_px), "score": score}
 
 
 def _filter_by_size(boxes, min_rel=0.4):
@@ -42,6 +50,66 @@ def _filter_by_size(boxes, min_rel=0.4):
         return []
     max_area = max(b["area"] for b in boxes)
     return [b for b in boxes if b["area"] >= min_rel * max_area]
+
+
+def _iou(a, b):
+    ix = max(0.0, min(a["x"] + a["w"], b["x"] + b["w"]) - max(a["x"], b["x"]))
+    iy = max(0.0, min(a["y"] + a["h"], b["y"] + b["h"]) - max(a["y"], b["y"]))
+    inter = ix * iy
+    union = a["w"] * a["h"] + b["w"] * b["h"] - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _nms(boxes, iou=0.3):
+    """The same face found in the whole frame and in a tile: keep the most confident one."""
+    kept = []
+    for b in sorted(boxes, key=lambda b: -b["score"]):
+        if all(_iou(b, k) <= iou for k in kept):
+            kept.append(b)
+    return kept
+
+
+class _MediaPipe:
+    def __init__(self):
+        os.environ.setdefault("MPLBACKEND", "Agg")  # mediapipe's drawing helpers import matplotlib
+        from mediapipe.tasks.python import vision
+        from mediapipe.tasks.python.core.base_options import BaseOptions
+        import mediapipe as mp
+        self._mp = mp
+        self._detector = vision.FaceDetector.create_from_options(vision.FaceDetectorOptions(
+            base_options=BaseOptions(model_asset_path=BLAZEFACE_PATH),
+            min_detection_confidence=MIN_SCORE,
+        ))
+
+    def _run(self, rgb):
+        image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+        return self._detector.detect(image).detections
+
+    def detect(self, bgr):
+        """Faces in the whole frame plus square tiles across it (for wide frames)"""
+        rgb = bgr[:, :, ::-1]
+        h_px, w_px = rgb.shape[:2]
+        views = [(0, rgb)]
+        if w_px > h_px * 1.2:
+            n = int(np.ceil(w_px / h_px)) + 1          # 16:9 → 3 overlapping squares
+            for i in range(n):
+                x0 = round(i * (w_px - h_px) / (n - 1))
+                views.append((x0, rgb[:, x0:x0 + h_px]))
+        boxes = []
+        for x0, view in views:
+            for d in self._run(view):
+                bb = d.bounding_box
+                score = float(d.categories[0].score) if d.categories else 0.0
+                x = max(0, bb.origin_x) + x0
+                y = max(0, bb.origin_y)
+                w = min(bb.width, w_px - x)
+                h = min(bb.height, h_px - y)
+                if w <= 0 or h <= 0:
+                    continue
+                boxes.append(_normalize(x, y, w, h, w_px, h_px, score))
+        boxes = [b for b in _nms(boxes) if b["score"] >= MIN_SCORE and b["area"] >= MIN_FACE_AREA]
+        boxes.sort(key=lambda b: -b["area"])
+        return _filter_by_size(boxes)
 
 
 def _detect_haar(cascade, gray, w_px, h_px):
@@ -75,12 +143,58 @@ def _motion_center(prev_gray, curr_gray, w_px, h_px, threshold=18):
     return float(xs.mean()) / w_px
 
 
-def detect_with_opencv(frames_dir: str) -> dict:
+STATIC_DIFF = 3.0       # mean grey-level change per frame below which a face is a picture, not a person
+STATIC_MIN_FRAMES = 8   # judged only on faces seen for at least this many frames (2 s at 4 fps)
+
+
+def _box_diff(prev_gray, gray, b):
+    """Mean grey-level change inside a box since the previous frame"""
+    h, w = gray.shape[:2]
+    x0, y0 = int(b["x"] * w), int(b["y"] * h)
+    x1, y1 = max(x0 + 1, int((b["x"] + b["w"]) * w)), max(y0 + 1, int((b["y"] + b["h"]) * h))
+    return float(np.abs(gray[y0:y1, x0:x1].astype(np.int16) - prev_gray[y0:y1, x0:x1].astype(np.int16)).mean())
+
+
+def track_faces(frames: list[list[dict]], iou=0.3, resets: set[int] | None = None) -> list[list[int]]:
+    """
+    Gives every face a track id that stays the same while it is the same person: a face joins
+    the track of the box it overlaps most (IoU > iou) in the previous frame. Tracks end at
+    frame indexes in `resets` (camera cuts). Returns track ids per frame, parallel to `frames`.
+    """
+    ids: list[list[int]] = []
+    next_id = 0
+    for fi, faces in enumerate(frames):
+        prev = frames[fi - 1] if fi > 0 and not (resets and fi in resets) else []
+        prev_ids = ids[fi - 1] if prev else []
+        taken: set[int] = set()
+        row = []
+        for f in faces:
+            best, best_iou = None, iou
+            for pi, p in enumerate(prev):
+                v = _iou(f, p)
+                if v > best_iou and prev_ids[pi] not in taken:
+                    best, best_iou = prev_ids[pi], v
+            if best is None:
+                best = next_id
+                next_id += 1
+            taken.add(best)
+            row.append(best)
+        ids.append(row)
+    return ids
+
+
+def detect_subjects(frames_dir: str) -> dict:
     import cv2
 
     cascade = None
     if os.path.exists(CASCADE_PATH):
         cascade = cv2.CascadeClassifier(CASCADE_PATH)
+
+    mediapipe = None
+    try:
+        mediapipe = _MediaPipe()
+    except Exception as e:  # not installed, or the model file is missing: Haar + motion only
+        print(f"[detect] MediaPipe unavailable, using Haar: {e}", file=sys.stderr)
 
     frame_files = sorted(
         f for f in os.listdir(frames_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))
@@ -88,50 +202,76 @@ def detect_with_opencv(frames_dir: str) -> dict:
     if not frame_files:
         return {"face_count": 0, "face_boxes": [], "frames": []}
 
-    # Load all frames
-    loaded = []
-    for fname in frame_files:
+    # ── Pass 1: faces per frame, how much each one changed since the previous frame, and
+    #    where motion is (the fallback when no face is left) ─────────────────────────────
+    raw: list[list[dict]] = []
+    motion_cx: list[float | None] = []
+    methods: list[str] = []
+    prev_gray = None
+    for fi, fname in enumerate(frame_files):
         img = cv2.imread(os.path.join(frames_dir, fname))
         if img is None:
             continue
-        h_px, w_px = img.shape[:2]
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)
-        loaded.append((gray, w_px, h_px))
+        hp, wp = img.shape[:2]
+        gray = cv2.equalizeHist(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+        subjects = []
+        method = "none"
 
-    if not loaded:
-        return {"face_count": 0, "face_boxes": [], "frames": []}
+        # MediaPipe faces — the main source of truth for person COUNT
+        if mediapipe is not None:
+            try:
+                subjects = mediapipe.detect(img)
+                if subjects:
+                    method = "mediapipe"
+            except Exception as e:
+                print(f"[detect] MediaPipe failed on frame {fi}: {e}", file=sys.stderr)
 
-    w_px, h_px = loaded[0][1], loaded[0][2]
+        # Haar frontal faces when MediaPipe found nobody
+        if not subjects and cascade is not None:
+            subjects = _detect_haar(cascade, gray, wp, hp)
+            if subjects:
+                method = "haar"
 
-    # ── Per-frame analysis ─────────────────────────────────────────────────────
+        same_shot = prev_gray is not None and prev_gray.shape == gray.shape
+        for s in subjects:
+            s["diff"] = _box_diff(prev_gray, gray, s) if same_shot else None
+        # Frame-differencing against the PREVIOUS frame finds WHERE motion is happening right
+        # now (scene-change safe: no global background model). A talking / moving person
+        # registers as motion; a static backdrop does not.
+        motion_cx.append(_motion_center(prev_gray, gray, wp, hp) if same_shot else None)
+        prev_gray = gray
+        raw.append(subjects)
+        methods.append(method)
+
+    # ── Pass 2: drop faces that never change — posters, photos, paused screens ─────────────
+    track_ids = track_faces(raw)
+    diffs: dict[int, list[float]] = {}
+    for faces, ids in zip(raw, track_ids):
+        for f, tid in zip(faces, ids):
+            if f["diff"] is not None:
+                diffs.setdefault(tid, []).append(f["diff"])
+    # The quietest quarter of frames decides: a hand or arm passing in front of a poster
+    # makes it change for a while, but a live face is never still for that long
+    static = {tid for tid, d in diffs.items()
+              if len(d) >= STATIC_MIN_FRAMES and float(np.percentile(d, 25)) < STATIC_DIFF}
+
+    # ── Pass 3: per-frame people, with the layout filters ────────────────────────────────
     per_frame = []
     slot_data: list[list[dict]] = [[] for _ in range(4)]
     max_person_count = 0
+    counts_by_method = {"mediapipe": 0, "haar": 0, "motion": 0, "none": 0}
+    for fi, (faces, ids) in enumerate(zip(raw, track_ids)):
+        subjects = [f for f, tid in zip(faces, ids) if tid not in static]
+        method = methods[fi] if subjects else "none"
 
-    for fi, (gray, wp, hp) in enumerate(loaded):
-        subjects = []
-
-        # Step 1: Haar frontal faces — sole source of truth for person COUNT.
-        # Background subtraction is NOT used for counting: global median
-        # backgrounds contaminate mixed scenes (e.g., judges panel + solo
-        # performer in same clip) and produce wildly incorrect foreground masks.
-        if cascade is not None:
-            subjects = _detect_haar(cascade, gray, wp, hp)
-
-        # Step 2: Position fallback — when Haar finds nobody (non-frontal
-        # subject), use frame-differencing against the PREVIOUS frame to find
-        # WHERE motion is happening right now. This is scene-change safe: we
-        # compare frame[i] vs frame[i-1], no global background model needed.
-        # A talking / moving person registers as motion; static backdrop does not.
-        if len(subjects) == 0 and fi > 0:
-            prev_gray = loaded[fi - 1][0]
-            cx = _motion_center(prev_gray, gray, wp, hp)
-            if cx is not None:
-                # Virtual face box centred on the motion — count treated as 1 person.
-                subjects = [{"x": max(0, cx - 0.1), "y": 0.0,
-                             "w": 0.2, "h": 1.0,
-                             "cx": cx, "area": 0.05}]
+        # Position fallback — no (live) face: follow the motion, counted as 1 person
+        if not subjects and motion_cx[fi] is not None:
+            cx = motion_cx[fi]
+            subjects = [{"x": max(0, cx - 0.1), "y": 0.0,
+                         "w": 0.2, "h": 1.0,
+                         "cx": cx, "area": 0.05, "score": 0.0}]
+            method = "motion"
+        counts_by_method[method] += 1
 
         # Prominence filter: if one subject is 2× larger than all others the
         # camera is on a close-up of the speaker; others are background.
@@ -154,26 +294,23 @@ def detect_with_opencv(frames_dir: str) -> dict:
         person_count = len(subjects)
         max_person_count = max(max_person_count, person_count)
 
-        # ── Per-frame log ──────────────────────────────────────────────────────
-        haar_raw = _detect_haar(cascade, gray, wp, hp) if cascade is not None else []
-        log_method = "haar" if haar_raw else ("motion" if (fi > 0 and person_count > 0) else "none")
-        cx_list = [f"{s['cx']:.2f}" for s in subjects]
-        print(
-            f"[detect] frame={fi:02d} haar={len(haar_raw)} "
-            f"after_filters={person_count} method={log_method} "
-            f"cx=[{','.join(cx_list)}]",
-            file=sys.stderr,
-        )
-
         per_frame.append({
             "frame_index": fi,
             "person_count": person_count,
-            "faces": [{"x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"]}
+            "faces": [{"x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"], "score": round(s["score"], 3)}
                       for s in subjects[:4]],
         })
 
         for i, s in enumerate(subjects[:4]):
             slot_data[i].append({"x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"]})
+
+    counts = [f["person_count"] for f in per_frame] or [0]
+    print(
+        f"[detect] {len(per_frame)} frames, faces/frame min={min(counts)} "
+        f"avg={sum(counts) / len(counts):.2f} max={max(counts)}, by method {counts_by_method}, "
+        f"static faces dropped: {len(static)}",
+        file=sys.stderr,
+    )
 
     # ── Averaged boxes (backward compat) ──────────────────────────────────────
     face_boxes = []
@@ -196,7 +333,7 @@ if __name__ == "__main__":
     parser.add_argument("--frames-dir", required=True)
     args = parser.parse_args()
     try:
-        result = detect_with_opencv(args.frames_dir)
+        result = detect_subjects(args.frames_dir)
     except Exception as e:
         print(f"[face_detect] Error: {e}", file=sys.stderr)
         result = {"face_count": 0, "face_boxes": [], "frames": []}

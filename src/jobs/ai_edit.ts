@@ -17,82 +17,153 @@ const __dirname = dirname(__filename)
 
 const execFileAsync = promisify(execFile)
 
-// 9:16 crop width as a fraction of a 16:9 source (full height)
-const REEL_W = 81 / 256  // ≈ 0.316
-
-interface CropBox { x: number; y: number; w: number; h: number }
+interface CropBox { x: number; y: number; w: number; h: number; score?: number }
 interface FrameDetection { frame_index: number; person_count: number; faces: CropBox[] }
 interface FaceInfo { face_count: number; face_boxes: CropBox[]; frames: FrameDetection[] }
 interface SlotKf { t_ms: number; x: number; y: number; w: number; h: number }
 interface ClipSegment { start_ms: number; end_ms: number; layout: 'vertical' | 'split'; slotKfs: SlotKf[][] }
-
-async function extractFrames(videoPath: string, startMs: number, endMs: number, outDir: string): Promise<void> {
-  const startS = startMs / 1000
-  const durationS = (endMs - startMs) / 1000
-  await execFileAsync('ffmpeg', [
-    '-ss', String(startS),
-    '-t', String(Math.min(durationS, 80)),
-    '-i', videoPath,
-    '-vf', 'fps=1,scale=640:-1',
-    '-q:v', '3',
-    '-frames:v', '80',
-    join(outDir, 'frame_%04d.jpg'),
-  ])
+/** What the framing needs to know about a clip */
+export interface ClipAnalysis {
+  info: FaceInfo
+  /** Camera cuts, ms from the clip's start */
+  cuts: number[]
+  /** Width of a 9:16 crop as a fraction of the source width (full height) */
+  reelW: number
+  /** The source is already vertical: show the whole frame */
+  portrait: boolean
 }
 
-async function detectFaces(tmp: string, videoPath: string, startMs: number, endMs: number): Promise<FaceInfo> {
+// Frames analysed per second, and the time between them. 4 fps catches quick head turns and
+// lets the crop follow within a quarter second.
+const DETECT_FPS = 4
+const FRAME_INTERVAL_MS = 1000 / DETECT_FPS
+
+// Minimum segment duration before we'll commit to a layout switch.
+// Avoids rapid flickering when a person briefly walks on/off screen.
+const MIN_SEGMENT_MS = 3000
+// A shot between two camera cuts shorter than this never gets its own segment
+const MIN_SHOT_MS = 1000
+// A cut only starts a new segment when the crop would move at least this much (fraction of width)
+const CUT_MOVE = 0.05
+
+const EMPTY: FaceInfo = { face_count: 0, face_boxes: [], frames: [] }
+
+export async function probeSize(videoPath: string): Promise<{ width: number; height: number } | null> {
+  try {
+    const { stdout } = await execFileAsync('ffprobe', [
+      '-v', 'error', '-select_streams', 'v:0',
+      '-show_entries', 'stream=width,height:stream_side_data=rotation', '-of', 'json', videoPath,
+    ])
+    const st = JSON.parse(stdout).streams?.[0]
+    if (!st?.width || !st?.height) return null
+    // Phone videos are often stored landscape with a 90° rotation flag
+    const rot = Math.abs(Number(st.side_data_list?.find((d: { rotation?: number }) => d.rotation !== undefined)?.rotation ?? 0)) % 180
+    return rot === 90 ? { width: st.height, height: st.width } : { width: st.width, height: st.height }
+  } catch {
+    return null
+  }
+}
+
+async function extractFrames(videoPath: string, startMs: number, endMs: number, outDir: string, signal?: AbortSignal): Promise<void> {
+  await execFileAsync('ffmpeg', [
+    '-ss', String(startMs / 1000),
+    '-t', String((endMs - startMs) / 1000),
+    '-i', videoPath,
+    '-an', '-vf', `fps=${DETECT_FPS},scale=640:-1`,
+    '-q:v', '3',
+    join(outDir, 'frame_%04d.jpg'),
+  ], { signal })
+}
+
+/**
+ * Camera cuts inside the clip (ms from its start), from FFmpeg's scene-change detector on a
+ * small copy of the picture. Empty if detection fails: the crop then just isn't reset.
+ */
+export async function detectCuts(videoPath: string, startMs: number, endMs: number, signal?: AbortSignal): Promise<number[]> {
+  try {
+    const { stderr } = await execFileAsync('ffmpeg', [
+      '-hide_banner', '-nostats',
+      '-ss', String(startMs / 1000), '-t', String((endMs - startMs) / 1000), '-i', videoPath,
+      '-an', '-vf', 'scale=320:-1,scdet=threshold=10', '-f', 'null', '-',
+    ], { signal, maxBuffer: 16 * 1024 * 1024 })
+    const cuts = [...stderr.matchAll(/lavfi\.scd\.time:\s*([\d.]+)/g)].map(m => Math.round(parseFloat(m[1]) * 1000))
+    return [...new Set(cuts)].filter(t => t > 0 && t < endMs - startMs).sort((a, b) => a - b)
+  } catch (e) {
+    console.warn('[ai_edit] cut detection failed:', e instanceof Error ? e.message : e)
+    return []
+  }
+}
+
+async function detectFaces(tmp: string, videoPath: string, startMs: number, endMs: number, signal?: AbortSignal): Promise<FaceInfo> {
   const framesDir = join(tmp, `frames-${startMs}`)
   await mkdir(framesDir, { recursive: true })
   try {
-    await extractFrames(videoPath, startMs, endMs, framesDir)
+    await extractFrames(videoPath, startMs, endMs, framesDir, signal)
   } catch {
-    return { face_count: 0, face_boxes: [], frames: [] }
+    return EMPTY
   }
 
-  return new Promise((resolve) => {
+  const result = await new Promise<FaceInfo>((resolve) => {
     const script = join(__dirname, '../../src/python/face_detect.py')
-    const proc = spawn('python3', [script, '--frames-dir', framesDir], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } })
+    const proc = spawn('python3', [script, '--frames-dir', framesDir], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', MPLBACKEND: 'Agg' } })
+    const kill = () => proc.kill('SIGKILL')
+    signal?.addEventListener('abort', kill, { once: true })
     let stdout = ''
     let stderr = ''
     proc.stdout?.on('data', (d: Buffer) => { stdout += d.toString() })
     proc.stderr?.on('data', (d: Buffer) => { stderr += d.toString() })
     proc.on('close', code => {
-      if (stderr) console.warn('[ai_edit] face_detect stderr:', stderr.slice(-300))
-      if (code !== 0 || !stdout.trim()) { resolve({ face_count: 0, face_boxes: [], frames: [] }); return }
-      try { resolve(JSON.parse(stdout) as FaceInfo) } catch { resolve({ face_count: 0, face_boxes: [], frames: [] }) }
+      signal?.removeEventListener('abort', kill)
+      // The summary line; MediaPipe's own start-up chatter is left out
+      const summary = stderr.split('\n').filter(l => l.startsWith('[detect]') || l.startsWith('[face_detect]')).join(' | ')
+      if (summary) console.log('[ai_edit] face_detect:', summary.slice(-400))
+      if (code !== 0 || !stdout.trim()) { resolve(EMPTY); return }
+      try { resolve(JSON.parse(stdout) as FaceInfo) } catch { resolve(EMPTY) }
     })
-    proc.on('error', () => resolve({ face_count: 0, face_boxes: [], frames: [] }))
+    proc.on('error', () => resolve(EMPTY))
   })
+  await rm(framesDir, { recursive: true, force: true }).catch(() => {})
+  return result
 }
 
-// Run one detection pass for the full clip — face_detect.py returns per-frame positions
-// so we get one keyframe every 4 seconds for smooth subject tracking
-async function detectClip(tmp: string, videoPath: string, startMs: number, endMs: number): Promise<FaceInfo> {
-  return detectFaces(tmp, videoPath, startMs, endMs)
+/**
+ * Everything the framing needs for one clip: faces 4× a second and the camera cuts (run side
+ * by side). A source that is already vertical skips detection and shows the whole frame.
+ */
+export async function analyseClip(
+  tmp: string, videoPath: string, startMs: number, endMs: number,
+  size: { width: number; height: number } | null, signal?: AbortSignal,
+): Promise<ClipAnalysis> {
+  const portrait = !!size && size.height >= size.width
+  // 9:16 crop at full height: 81/256 ≈ 0.316 of a 16:9 source
+  const reelW = size ? Math.min(1, (9 / 16) * (size.height / size.width)) : 81 / 256
+  if (portrait) return { info: EMPTY, cuts: [], reelW, portrait }
+  const [info, cuts] = await Promise.all([
+    detectFaces(tmp, videoPath, startMs, endMs, signal),
+    detectCuts(videoPath, startMs, endMs, signal),
+  ])
+  return { info, cuts, reelW, portrait }
 }
-
-// FRAME_INTERVAL_MS matches the ffmpeg extraction rate: fps=1 → 1 frame per second
-const FRAME_INTERVAL_MS = 1000
-
-// Minimum segment duration before we'll commit to a layout switch.
-// Avoids rapid flickering when a person briefly walks on/off screen.
-const MIN_SEGMENT_MS = 3000
 
 // ── Crop stabilisation helpers ────────────────────────────────────────────────
 //
 // Per-frame subject detection has natural jitter: the detected center shifts a
 // few percent each frame even when nobody moved. Two passes fix this:
 //
-//   1. EMA (α=0.3): blends toward the new position gradually.
-//      A large sudden move takes ~3 frames to fully land — no snap cuts.
+//   1. EMA (α=0.3 per second of video): blends toward the new position gradually.
+//      A large sudden move takes ~3 seconds to fully land — no snap cuts.
 //
 //   2. Dead zone (3% of frame width): once smoothed, suppress any remaining
 //      movement smaller than the threshold. The crop stays completely still
 //      when the subject hasn't really moved; only genuine repositioning moves it.
 //
 // Together: stationary subject → locked crop. Moving subject → smooth follow.
+// Both restart at every camera cut, so the crop jumps to the new shot instead of sliding.
 
-function _ema(values: number[], alpha = 0.3): number[] {
+// α per frame giving the same response per second as α=0.3 at 1 frame per second
+const EMA_ALPHA = 1 - Math.pow(1 - 0.3, 1 / DETECT_FPS)
+
+function _ema(values: number[], alpha = EMA_ALPHA): number[] {
   if (!values.length) return []
   const out = [values[0]]
   for (let i = 1; i < values.length; i++) {
@@ -110,30 +181,51 @@ function _deadZone(values: number[], threshold = 0.03): number[] {
   return out
 }
 
-// Smooth raw detected center positions before converting to keyframes.
-function stabilise(rawCx: number[]): number[] {
-  return _deadZone(_ema(rawCx))
+// Smooth raw detected center positions before converting to keyframes, starting afresh at
+// each index in `resets` (the first frame after a camera cut).
+function stabilise(rawCx: number[], resets: number[] = []): number[] {
+  const out: number[] = []
+  const bounds = [0, ...resets.filter(r => r > 0 && r < rawCx.length), rawCx.length]
+  for (let i = 0; i < bounds.length - 1; i++) {
+    out.push(..._deadZone(_ema(rawCx.slice(bounds[i], bounds[i + 1]))))
+  }
+  return out
+}
+
+const median = (v: number[]) => {
+  const s = [...v].sort((a, b) => a - b)
+  return s.length ? s[Math.floor(s.length / 2)] : 0.5
 }
 
 // ── Layout brain ──────────────────────────────────────────────────────────────
 //
-// Analyses per-second frame detections and produces one or more ClipSegments,
+// Analyses the per-frame detections (4 a second) and produces one or more ClipSegments,
 // each with the right layout (vertical / split) and smooth motion keyframes.
 //
 // Rules — generic, apply to any video type:
 //   - 1 person visible   → vertical, track that person
 //   - 2+ people visible  → split, tight on the 2 most prominent (Option B)
-//   - Layout switches only happen when a run of frames holds the same layout
+//   - Within a shot, layout switches only happen when a run of frames holds the same layout
 //     for at least MIN_SEGMENT_MS (avoids single-frame noise causing a cut)
+//   - Camera cuts: smoothing restarts at every cut. A cut starts a new segment when the layout
+//     changes there or the crop would move by CUT_MOVE or more, so the crop cuts with the
+//     picture (the renderer pans between keyframes inside a segment). Shots shorter than
+//     MIN_SHOT_MS join the shot before them.
+//   - Already-vertical source → one full-frame segment
 //
 // Keyframe t_ms values are clip-relative (0 = first frame of the clip).
 // render.py subtracts seg.start_ms per segment to get FFmpeg-relative time.
-function buildSegments(info: FaceInfo, clipDurationMs: number): ClipSegment[] {
-  const center = (1 - REEL_W) / 2
+export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): ClipSegment[] {
+  const { info, cuts, reelW, portrait } = analysis
+  const center = (1 - reelW) / 2
+
+  if (portrait) {
+    return [{ start_ms: 0, end_ms: clipDurationMs, layout: 'vertical', slotKfs: [[{ t_ms: 0, x: 0, y: 0, w: 1, h: 1 }]] }]
+  }
 
   const vertKf = (t_ms: number, cx: number): SlotKf => ({
-    t_ms, y: 0, w: REEL_W, h: 1,
-    x: Math.max(0, Math.min(1 - REEL_W, cx - REEL_W / 2)),
+    t_ms, y: 0, w: reelW, h: 1,
+    x: Math.max(0, Math.min(1 - reelW, cx - reelW / 2)),
   })
   const splitKf = (t_ms: number, cx: number): SlotKf => {
     const CW = 0.5
@@ -144,85 +236,117 @@ function buildSegments(info: FaceInfo, clipDurationMs: number): ClipSegment[] {
   if (info.frames.length === 0) {
     return [{
       start_ms: 0, end_ms: clipDurationMs, layout: 'vertical',
-      slotKfs: [[{ t_ms: 0, x: center, y: 0, w: REEL_W, h: 1 }]],
+      slotKfs: [[{ t_ms: 0, x: center, y: 0, w: reelW, h: 1 }]],
     }]
   }
 
-  // Step 1: Per-frame layout decision using face_detect.py's person_count
-  type FrameLayout = { frame: FrameDetection; layout: 'vertical' | 'split' }
-  const frameLayouts: FrameLayout[] = info.frames.map(f => {
-    const count = f.person_count ?? f.faces.length
-    const layout = count >= 2 ? 'split' : 'vertical'
-    const cxList = f.faces.map(face => (face.x + face.w / 2).toFixed(2)).join(',')
-    console.log(`[brain] frame=${String(f.frame_index).padStart(2,'0')} persons=${count} → ${layout} cx=[${cxList}]`)
-    return { frame: f, layout }
-  })
-
-  // Step 2: Group consecutive same-layout frames into runs
-  type Run = { layout: 'vertical' | 'split'; frames: FrameDetection[] }
-  const runs: Run[] = []
-  for (const { frame, layout } of frameLayouts) {
-    const last = runs[runs.length - 1]
-    if (last && last.layout === layout) {
-      last.frames.push(frame)
-    } else {
-      runs.push({ layout, frames: [frame] })
+  type Layout = 'vertical' | 'split'
+  const frameTime = (f: FrameDetection) => f.frame_index * FRAME_INTERVAL_MS
+  const layoutOf = (f: FrameDetection): Layout => ((f.person_count ?? f.faces.length) >= 2 ? 'split' : 'vertical')
+  // Raw subject centre per slot for a frame and layout
+  const rawCx = (f: FrameDetection, layout: Layout, slotIdx: number) => {
+    if (layout === 'vertical') {
+      const best = [...f.faces].sort((a, b) => (b.w * b.h) - (a.w * a.h))[0]
+      return best ? best.x + best.w / 2 : 0.5
     }
+    const bySize = [...f.faces].sort((a, b) => (b.w * b.h) - (a.w * a.h))
+    const top2 = bySize.slice(0, 2).sort((a, b) => (a.x + a.w / 2) - (b.x + b.w / 2))
+    const face = top2[slotIdx] ?? top2[0]
+    return face ? face.x + face.w / 2 : slotIdx === 0 ? 0.3 : 0.7
   }
 
-  // Step 3: Merge runs shorter than MIN_SEGMENT_MS into their neighbor
+  const frames = [...info.frames].sort((a, b) => a.frame_index - b.frame_index)
   const minFrames = Math.ceil(MIN_SEGMENT_MS / FRAME_INTERVAL_MS)
-  let merged = true
-  while (merged && runs.length > 1) {
-    merged = false
-    for (let i = 0; i < runs.length; i++) {
-      if (runs[i].frames.length < minFrames) {
-        const mergeLeft  = i > 0 ? runs[i - 1].frames.length : -1
-        const mergeRight = i < runs.length - 1 ? runs[i + 1].frames.length : -1
-        if (mergeLeft >= mergeRight) {
-          runs[i - 1].frames = [...runs[i - 1].frames, ...runs[i].frames]
-          runs.splice(i, 1)
+
+  // Step 1: shots — frames between camera cuts (a shot under MIN_SHOT_MS joins the one before)
+  type Shot = { start_ms: number; frames: FrameDetection[] }
+  const shots: Shot[] = [{ start_ms: 0, frames: [] }]
+  const cutQueue = [...cuts]
+  for (const f of frames) {
+    while (cutQueue.length && frameTime(f) >= cutQueue[0]) {
+      shots.push({ start_ms: cutQueue.shift()!, frames: [] })
+    }
+    shots[shots.length - 1].frames.push(f)
+  }
+  const merged: Shot[] = []
+  for (const shot of shots) {
+    if (!shot.frames.length) continue
+    const last = merged[merged.length - 1]
+    const nextStart = shots[shots.indexOf(shot) + 1]?.start_ms ?? clipDurationMs
+    if (last && nextStart - shot.start_ms < MIN_SHOT_MS) last.frames.push(...shot.frames)
+    else merged.push({ start_ms: merged.length ? shot.start_ms : 0, frames: [...shot.frames] })
+  }
+
+  // Step 2: within each shot, runs of the same layout; runs under MIN_SEGMENT_MS merge into
+  // their bigger neighbour (in that shot only)
+  type Run = { layout: Layout; start_ms: number; frames: FrameDetection[]; cutStart: boolean }
+  const runs: Run[] = []
+  for (const shot of merged) {
+    const shotRuns: Run[] = []
+    for (const f of shot.frames) {
+      const layout = layoutOf(f)
+      const last = shotRuns[shotRuns.length - 1]
+      if (last && last.layout === layout) last.frames.push(f)
+      else shotRuns.push({ layout, start_ms: shotRuns.length ? frameTime(f) : shot.start_ms, frames: [f], cutStart: shotRuns.length === 0 })
+    }
+    let changed = true
+    while (changed && shotRuns.length > 1) {
+      changed = false
+      for (let i = 0; i < shotRuns.length; i++) {
+        if (shotRuns[i].frames.length >= minFrames) continue
+        const left = i > 0 ? shotRuns[i - 1].frames.length : -1
+        const right = i < shotRuns.length - 1 ? shotRuns[i + 1].frames.length : -1
+        if (left >= right) {
+          shotRuns[i - 1].frames.push(...shotRuns[i].frames)
         } else {
-          runs[i + 1].frames = [...runs[i].frames, ...runs[i + 1].frames]
-          runs.splice(i, 1)
+          shotRuns[i + 1].frames = [...shotRuns[i].frames, ...shotRuns[i + 1].frames]
+          shotRuns[i + 1].start_ms = shotRuns[i].start_ms
+          shotRuns[i + 1].cutStart = shotRuns[i].cutStart
         }
-        merged = true
+        shotRuns.splice(i, 1)
+        changed = true
         break
       }
     }
+    runs.push(...shotRuns)
   }
 
-  // Step 4: Build ClipSegment per run, with stabilised keyframes
-  return runs.map(run => {
-    const sorted = [...run.frames].sort((a, b) => a.frame_index - b.frame_index)
-    const start_ms = sorted[0].frame_index * FRAME_INTERVAL_MS
-    const last = sorted[sorted.length - 1]
-    const end_ms = Math.min((last.frame_index + 1) * FRAME_INTERVAL_MS, clipDurationMs)
-
-    if (run.layout === 'vertical') {
-      // Raw centers: largest detected subject per frame
-      const rawCx = sorted.map(f => {
-        const best = [...f.faces].sort((a, b) => (b.w * b.h) - (a.w * a.h))[0]
-        return best ? best.x + best.w / 2 : 0.5
-      })
-      const cx = stabilise(rawCx)
-      const kfs = sorted.map((f, i) => vertKf(f.frame_index * FRAME_INTERVAL_MS, cx[i]))
-      return { start_ms, end_ms, layout: 'vertical' as const, slotKfs: [kfs.length ? kfs : [vertKf(start_ms, 0.5)]] }
+  // Step 3: a run that starts at a cut joins the run before it when the layout is the same and
+  // the crop would barely move — the cut then needs no segment boundary, only a smoothing reset
+  const slotCount = (layout: Layout) => (layout === 'split' ? 2 : 1)
+  const edgeCx = (run: Run, slot: number, atEnd: boolean) => {
+    const edge = atEnd ? run.frames.slice(-DETECT_FPS) : run.frames.slice(0, DETECT_FPS)
+    return median(edge.map(f => rawCx(f, run.layout, slot)))
+  }
+  type Group = { layout: Layout; start_ms: number; frames: FrameDetection[]; resets: number[] }
+  const groups: Group[] = []
+  for (const run of runs) {
+    const last = groups[groups.length - 1]
+    const lastRun = runs[runs.indexOf(run) - 1]
+    // Same layout with no cut between them (two runs left side by side by the merge above)
+    // always join; across a cut only when the crop barely moves
+    const join = !!last && last.layout === run.layout && (!run.cutStart
+      || Array.from({ length: slotCount(run.layout) }, (_, s) => s)
+        .every(s => Math.abs(edgeCx(lastRun, s, true) - edgeCx(run, s, false)) < CUT_MOVE))
+    if (join) {
+      if (run.cutStart) last.resets.push(last.frames.length)
+      last.frames.push(...run.frames)
+    } else {
+      groups.push({ layout: run.layout, start_ms: run.start_ms, frames: [...run.frames], resets: [] })
     }
+  }
 
-    // Split: stabilise each slot independently (Option B: tight on 2 people)
-    const slotKfs: SlotKf[][] = [0, 1].map(slotIdx => {
-      const rawCx = sorted.map(f => {
-        const bySize = [...f.faces].sort((a, b) => (b.w * b.h) - (a.w * a.h))
-        const top2   = bySize.slice(0, 2).sort((a, b) => (a.x + a.w / 2) - (b.x + b.w / 2))
-        const face   = top2[slotIdx] ?? top2[0]
-        return face ? face.x + face.w / 2 : slotIdx === 0 ? 0.3 : 0.7
-      })
-      const cx = stabilise(rawCx)
-      const kfs = sorted.map((f, i) => splitKf(f.frame_index * FRAME_INTERVAL_MS, cx[i]))
-      return kfs.length ? kfs : [splitKf(start_ms, slotIdx === 0 ? 0.3 : 0.7)]
+  // Step 4: one ClipSegment per group, with keyframes smoothed between cuts
+  return groups.map((g, gi) => {
+    const start_ms = gi === 0 ? 0 : g.start_ms
+    const end_ms = groups[gi + 1]?.start_ms ?? clipDurationMs
+    // The first keyframe sits on the segment start (the renderer extrapolates before it)
+    const kfTime = (f: FrameDetection, i: number) => (i === 0 ? start_ms : Math.max(start_ms, frameTime(f)))
+    const slotKfs = Array.from({ length: slotCount(g.layout) }, (_, slot) => {
+      const cx = stabilise(g.frames.map(f => rawCx(f, g.layout, slot)), g.resets)
+      return g.frames.map((f, i) => g.layout === 'vertical' ? vertKf(kfTime(f, i), cx[i]) : splitKf(kfTime(f, i), cx[i]))
     })
-    return { start_ms, end_ms, layout: 'split' as const, slotKfs }
+    return { start_ms, end_ms, layout: g.layout, slotKfs }
   })
 }
 
@@ -364,6 +488,7 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
       const videoPath = join(tmp, 'source.mp4')
       console.log(`[ai_edit] Downloading video ${video.storage_path}`)
       await r2DownloadToFile(video.storage_path, videoPath, signal)
+      const size = await probeSize(videoPath)
       await setProgress(ai_edit_job_id, 45)
 
       // 5. Frame each clip, save it, and queue its render (the render queue exports it, so this
@@ -373,11 +498,13 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
         const highlight = highlights[hi]
         const clipDurationMs = highlight.end_ms - highlight.start_ms
 
-        // Detect per-second subject positions across the entire clip
-        const faceInfo = await detectClip(tmp, videoPath, highlight.start_ms, highlight.end_ms)
+        // Faces 4× a second and camera cuts across the entire clip
+        const tDetect = Date.now()
+        const analysis = await analyseClip(tmp, videoPath, highlight.start_ms, highlight.end_ms, size, signal)
+        const detectS = ((Date.now() - tDetect) / 1000).toFixed(1)
 
-        // Brain: dynamically switch layout per-second within the clip
-        const segments = buildSegments(faceInfo, clipDurationMs)
+        // Brain: dynamically switch layout within the clip
+        const segments = buildSegments(analysis, clipDurationMs)
         const clipWords = words.filter(w => w.start_ms >= highlight.start_ms && w.start_ms < highlight.end_ms)
         const caption = captionFontFor(clipWords)
 
@@ -389,7 +516,12 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
           `${s.layout}(${s.start_ms / 1000}s–${s.end_ms / 1000}s,${s.slotKfs[0]?.length ?? 0}kf)`
         ).join(' | ')
         console.log(`[ai_edit] Clip ${clip_id} (score ${highlight.score}, ${caption.font}${caption.language ? '/' + caption.language : ''}): ${segments.length} seg — ${layoutSummary}`)
-        console.log(`[ai_edit] Detection summary: ${faceInfo.frames.length} frames, max_persons=${faceInfo.face_count}`)
+        const counts = analysis.info.frames.map(f => f.person_count)
+        console.log(analysis.portrait
+          ? `[ai_edit] Detection summary: vertical source, full frame`
+          : `[ai_edit] Detection summary: ${counts.length} frames in ${detectS}s, faces/frame min=${counts.length ? Math.min(...counts) : 0} `
+            + `avg=${counts.length ? (counts.reduce((a, b) => a + b, 0) / counts.length).toFixed(2) : 0} max=${analysis.info.face_count}, `
+            + `${analysis.cuts.length} camera cut(s)`)
         await setProgress(ai_edit_job_id, 45 + (55 * (hi + 1)) / highlights.length - 1)
       }
     } finally {
