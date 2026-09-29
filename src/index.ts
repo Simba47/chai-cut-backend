@@ -85,6 +85,20 @@ async function runMigrations() {
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS hashtags TEXT[]`
   // Stock videos saved as the user's assets for auto B-roll ("pexels:<id>"), reused when picked again
   await db`ALTER TABLE videos ADD COLUMN IF NOT EXISTS stock_ref TEXT`
+  // What users do with AI suggestions (to improve clip picking later)
+  await db`
+    CREATE TABLE IF NOT EXISTS ai_suggestion_events (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id uuid REFERENCES users(id) ON DELETE CASCADE,
+      video_id uuid REFERENCES videos(id) ON DELETE CASCADE,
+      clip_id uuid,
+      source text CHECK (source IN ('best_moments','clip_search','auto_clips')),
+      suggestion jsonb,
+      event text CHECK (event IN ('shown','previewed','used','exported','deleted')) NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )
+  `
+  await db`CREATE INDEX IF NOT EXISTS ai_suggestion_events_video_created ON ai_suggestion_events (video_id, created_at)`
   console.log('[startup] migrations ok')
 }
 
