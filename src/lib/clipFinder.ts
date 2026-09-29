@@ -126,9 +126,12 @@ const LINE_RULES = `Each transcript line is written as "L<number> [mm:ss] text".
 
 const ITEM_SHAPE = `{"start_line":number,"end_line":number,"title":"catchy 3-7 word title","summary":"one sentence","reason":"why it works, max 15 words","hook":0-10,"emotion":0-10,"story":0-10,"value":0-10,"clarity":0-10}`
 
-export function buildPrompt(mode: FinderMode, window: TranscriptLine[], durationMs: number, perWindow = BEST_PER_WINDOW) {
+export function buildPrompt(mode: FinderMode, window: TranscriptLine[], durationMs: number, perWindow = BEST_PER_WINDOW, exclude: Array<[number, number]> = []) {
   const transcript = window.map(l => `L${l.index} [${mmss(l.start_ms)}] ${l.text}`).join('\n')
-  const part = `Video duration: ${mmss(durationMs)}. This part covers ${mmss(window[0].start_ms)}–${mmss(window[window.length - 1].end_ms)}.`
+  const from = window[0].start_ms, to = window[window.length - 1].end_ms
+  const taken = exclude.filter(([a, b]) => b > from && a < to)
+  const part = `Video duration: ${mmss(durationMs)}. This part covers ${mmss(from)}–${mmss(to)}.`
+    + (taken.length ? `\nAlready made into clips (pick other moments, not these): ${taken.map(([a, b]) => `${mmss(a)}–${mmss(b)}`).join(', ')}.` : '')
 
   if (mode.kind === 'best') {
     const system = `You are a viral short-clip detector for Reels and Shorts. From this part of a video transcript, pick up to ${perWindow} moments that would work best as standalone vertical clips. Fewer is fine if this part is weak.
@@ -274,6 +277,8 @@ export async function findClips(opts: {
   limit?: number
   /** Best moments: candidates to ask for per window (default 4) */
   perWindow?: number
+  /** Source-time ranges already made into clips: new clips must not repeat them */
+  exclude?: Array<[number, number]>
   /** Best moments: spread the picks across the video instead of pure top-by-score */
   spread?: boolean
 }): Promise<FoundClip[]> {
@@ -285,7 +290,7 @@ export async function findClips(opts: {
   let failures = 0
   const perWindow = await mapLimit(windows, MAX_PARALLEL, async (window, i) => {
     try {
-      const { system, user } = buildPrompt(opts.mode, window, opts.durationMs, opts.perWindow)
+      const { system, user } = buildPrompt(opts.mode, window, opts.durationMs, opts.perWindow, opts.exclude)
       return parseCandidates(await opts.ask(system, user), window, lines, i)
     } catch (e) {
       failures++
@@ -295,9 +300,14 @@ export async function findClips(opts: {
   })
   if (failures === windows.length) throw new Error(`All ${windows.length} clip-finder windows failed`)
 
+  // Anything overlapping an existing clip by more than half (of the shorter one) is a repeat
+  const repeats = (c: FoundClip) => (opts.exclude ?? []).some(([a, b]) => {
+    const overlap = Math.min(b, c.end_ms) - Math.max(a, c.start_ms)
+    return overlap > 0.5 * Math.min(b - a, c.end_ms - c.start_ms)
+  })
   const fitted = perWindow.flat()
     .map(c => fitLength(c, lines))
-    .filter((c): c is FoundClip => c !== null)
+    .filter((c): c is FoundClip => c !== null && !repeats(c))
   const merged = dedupe(fitted) // sorted by score, highest first
   if (opts.mode.kind === 'search') return merged.filter(c => c.score >= SEARCH_MIN_SCORE)
   const limit = opts.limit ?? BEST_TOP_N

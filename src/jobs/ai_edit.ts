@@ -575,7 +575,7 @@ type Word = { word: string; start_ms: number; end_ms: number; speaker_id?: strin
 
 // Gemini picks the clips: the numbered-line, windowed, scored method shared with the app's
 // "Best moments" (src/lib/clipFinder.ts)
-async function selectHighlights(words: Word[], clipCount: number, durationMs: number): Promise<FoundClip[]> {
+async function selectHighlights(words: Word[], clipCount: number, durationMs: number, exclude: Array<[number, number]> = []): Promise<FoundClip[]> {
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!)
   const ask = async (system: string, user: string) => {
     const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', systemInstruction: system })
@@ -583,10 +583,11 @@ async function selectHighlights(words: Word[], clipCount: number, durationMs: nu
   }
   // Enough candidates per window that a short video (one window) can still fill the request
   const windowCount = Math.max(1, Math.ceil(durationMs / (9 * 60_000)))
-  const perWindow = Math.min(10, Math.max(4, Math.ceil((clipCount * 1.5) / windowCount)))
+  // More candidates when earlier batches already took some moments
+  const perWindow = Math.min(12, Math.max(4, Math.ceil((clipCount * 1.5 + exclude.length) / windowCount)))
   return findClips({
     words, durationMs, mode: { kind: 'best' }, ask,
-    limit: clipCount, perWindow, spread: true,
+    limit: clipCount, perWindow, spread: true, exclude,
     log: msg => console.warn('[ai_edit] clip finder:', msg),
   })
 }
@@ -703,9 +704,17 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
     const durationMs = video.duration_ms ?? words[words.length - 1].end_ms
     await setProgress(ai_edit_job_id, 20)
 
-    // 3. Pick the clips across the whole video
-    const highlights = await selectHighlights(words, clip_count, durationMs)
-    if (highlights.length === 0) throw new Error('AI could not find any good clips in this video')
+    // 3. Pick the clips across the whole video, never repeating one an earlier batch made
+    const earlier = await db`
+      SELECT start_ms, end_ms FROM clips WHERE video_id = ${video_id} AND ai_edit_job_id IS NOT NULL AND ai_edit_job_id <> ${ai_edit_job_id}
+    `
+    const exclude = earlier.map(c => [c.start_ms as number, c.end_ms as number] as [number, number])
+    const highlights = await selectHighlights(words, clip_count, durationMs, exclude)
+    if (highlights.length === 0) {
+      throw new Error(exclude.length
+        ? `AI could not find new moments beyond the ${exclude.length} clips already made from this video`
+        : 'AI could not find any good clips in this video')
+    }
     console.log(`[ai_edit] ${highlights.length}/${clip_count} clips picked for job ${ai_edit_job_id} (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
     await setProgress(ai_edit_job_id, 30)
 
