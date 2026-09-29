@@ -55,7 +55,7 @@ Return ONLY JSON, keys in English:
 {"hook": "...", "title": "...", "post_caption": "...", "hashtags": ["...", ...]}
 ${ROMAN_RULE} This applies to the hook, title and post caption.
 - hook: 3-7 words shown over the first 3 seconds that make someone stop scrolling. No clickbait lies: it must match what is actually said. No emoji, no hashtags.
-- title: at most 60 characters.
+- title: at most 60 characters, about this clip's moment (never just the video's title).
 - post_caption: 1-2 sentences for the post.
 - hashtags: exactly 5, no # sign needed, no spaces inside a tag, a mix of language-specific and English tags.`
 
@@ -72,5 +72,8 @@ ${ROMAN_RULE} This applies to the hook, title and post caption.
     .filter(Boolean)
     .slice(0, 5)
   if (!hook || !title) throw new Error('Gemini left out the hook or title')
+  // A title that is only the video's name says nothing about the clip: use the hook instead
+  const sameAsVideo = !!videoTitle && title.toLowerCase().replace(/\W/g, '') === videoTitle.toLowerCase().replace(/\W/g, '')
+  if (sameAsVideo) return { hook, title: hook.slice(0, 60), post_caption, hashtags }
   return { hook, title, post_caption, hashtags }
 }

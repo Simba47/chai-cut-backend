@@ -667,15 +667,13 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
   await db`UPDATE ai_edit_jobs SET status = 'running', progress = 5 WHERE id = ${ai_edit_job_id}`
 
   try {
-    // 1. Get video info (and the owner's plan, for the export watermark)
+    // 1. Get video info
     const [video] = await db`
-      SELECT v.id, v.user_id, v.storage_path, v.duration_ms, v.title, u.plan
-      FROM videos v LEFT JOIN users u ON u.id = v.user_id
+      SELECT v.id, v.user_id, v.storage_path, v.duration_ms, v.title
+      FROM videos v
       WHERE v.id = ${video_id}
     `
     if (!video?.storage_path) throw new Error('Video not found or missing storage path')
-    // Same rule as the app's plans (src/lib/plans.ts): only the free plan exports with a watermark
-    const watermark = !['starter', 'creator', 'agency'].includes(video.plan ?? 'free')
 
     // 2. Ensure a whole-video transcript — transcribe inline if there isn't one.
     //    Always from storage (R2), never yt-dlp, so this also runs on Railway.
@@ -732,8 +730,8 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
       const size = await probeSize(videoPath)
       await setProgress(ai_edit_job_id, 45)
 
-      // 5. Frame each clip, save it, and queue its render (the render queue exports it, so this
-      //    job stays well inside the job timeout however many clips there are)
+      // 5. Frame each clip and save it as a draft. Nothing is exported: the user previews the
+      //    clips in the app and exports the ones they want.
       for (let hi = 0; hi < highlights.length; hi++) {
         signal?.throwIfAborted()
         const highlight = highlights[hi]
@@ -751,8 +749,6 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
         const caption = captionFontFor(clipWords)
 
         const clip_id = await saveClip(video_id, ai_edit_job_id, highlight, segments, caption, texts[hi])
-        const renderPayload = { clip_id, video_storage_path: video.storage_path, quality: '1080p', watermark }
-        await db`INSERT INTO jobs (type, payload, status) VALUES ('render', ${db.json(renderPayload)}, 'queued')`
 
         const layoutSummary = segments.map(s =>
           `${s.layout}(${s.start_ms / 1000}s–${s.end_ms / 1000}s,${s.slotKfs[0]?.length ?? 0}kf)`
@@ -771,7 +767,7 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
     }
 
     await db`UPDATE ai_edit_jobs SET status = 'done', progress = 100 WHERE id = ${ai_edit_job_id}`
-    console.log(`[ai_edit] Job ${ai_edit_job_id} done in ${((Date.now() - t0) / 1000).toFixed(0)}s (renders queued)`)
+    console.log(`[ai_edit] Job ${ai_edit_job_id} done in ${((Date.now() - t0) / 1000).toFixed(0)}s (clips ready to preview)`)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error(`[ai_edit] Job ${ai_edit_job_id} failed:`, msg)
@@ -841,7 +837,7 @@ async function saveClip(
     const [clipRow] = await tx`
       INSERT INTO clips (video_id, start_ms, end_ms, status, title, ai_edit_job_id, ai_score, ai_reason, remove_fillers,
         hook_text, post_caption, hashtags)
-      VALUES (${videoId}, ${highlight.start_ms}, ${highlight.end_ms}, 'rendering', ${(text?.title || highlight.title).slice(0, 120) || 'Highlight'},
+      VALUES (${videoId}, ${highlight.start_ms}, ${highlight.end_ms}, 'draft', ${(text?.title || highlight.title).slice(0, 120) || 'Highlight'},
         ${aiEditJobId}, ${highlight.score}, ${highlight.reason || null}, true,
         ${text?.hook ?? null}, ${text?.post_caption ?? null}, ${text?.hashtags ?? null})
       RETURNING id
