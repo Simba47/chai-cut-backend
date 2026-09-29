@@ -18,7 +18,8 @@ RUN curl -fL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmp
     && ffmpeg -hide_banner -version | head -1 \
     && for f in subtitles drawtext movie zoompan; do \
          ffmpeg -hide_banner -filters | grep -q " $f " || { echo "ffmpeg build is missing the $f filter"; exit 1; }; \
-       done
+       done \
+    && { ffmpeg -hide_banner -buildconf | grep -q enable-libharfbuzz || { echo "ffmpeg build lacks harfbuzz (drawtext would break Telugu/Hindi text)"; exit 1; }; }
 
 RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
     -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp

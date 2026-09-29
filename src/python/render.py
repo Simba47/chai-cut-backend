@@ -625,6 +625,16 @@ def _scale_fit(w: int, h: int) -> str:
     )
 
 
+def _fit_font_size(text: str, font_path: str, size: int, max_w: int) -> int:
+    """The largest size up to `size` at which `text` is at most `max_w` px wide (min 28)."""
+    try:
+        from PIL import ImageFont  # installed with matplotlib
+        width = ImageFont.truetype(font_path, size).getlength(text)
+    except Exception:
+        return size
+    return size if width <= max_w else max(28, int(size * max_w / width))
+
+
 def _escape_drawtext(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:").replace("%", "\\%")
 
@@ -1085,7 +1095,15 @@ def main(
             sz   = int(ov.get("size") or 48)
             hx   = (ov.get("color") or "#ffffff").lstrip("#")
             r, g, b2 = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
-            sx   = int((ov.get("x") or 0.1) * out_w)
+            if ov.get("x") is None:
+                # Centred (the AI hook): shrink to fit 90% of the width if it's too long
+                sz = _fit_font_size(ov.get("text") or "", font_path, sz, int(out_w * 0.9))
+                sx = "(w-text_w)/2"
+                # A black outline keeps it readable on any background (e.g. a white wall)
+                outline = f":borderw={max(2, round(out_w * 4 / 1080))}:bordercolor=black"
+            else:
+                sx = int((ov.get("x") or 0.1) * out_w)
+                outline = ""
             sy   = int((ov.get("y") or 0.1) * out_h)
             t0   = ov.get("start_ms", 0) / 1000.0
             t1   = ov.get("end_ms", clip_dur_ms) / 1000.0
@@ -1093,7 +1111,7 @@ def main(
             fp.append(
                 f"{cur}drawtext=fontfile={font_path}:text='{text}':fontsize={sz}"
                 f":fontcolor=0x{r:02X}{g:02X}{b2:02X}:x={sx}:y={sy}"
-                f":shadowx=2:shadowy=2:shadowcolor=black@0.7"
+                f":shadowx=2:shadowy=2:shadowcolor=black@0.7{outline}"
                 f":enable='between(t,{t0:.3f},{t1:.3f})'{olbl}"
             )
             cur = olbl

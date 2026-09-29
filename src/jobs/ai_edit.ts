@@ -9,6 +9,7 @@ import db from '../db.js'
 import type { Job, AiEditJobPayload } from '../types.js'
 import { handleTranscribeJob } from './transcribe.js'
 import { findClips, type FoundClip } from '../lib/clipFinder.js'
+import { generateClipText, fontForText, type ClipText } from '../lib/clipText.js'
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
 
@@ -664,7 +665,7 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
   try {
     // 1. Get video info (and the owner's plan, for the export watermark)
     const [video] = await db`
-      SELECT v.id, v.storage_path, v.duration_ms, u.plan
+      SELECT v.id, v.storage_path, v.duration_ms, v.title, u.plan
       FROM videos v LEFT JOIN users u ON u.id = v.user_id
       WHERE v.id = ${video_id}
     `
@@ -698,6 +699,18 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
     const highlights = await selectHighlights(words, clip_count, durationMs)
     if (highlights.length === 0) throw new Error('AI could not find any good clips in this video')
     console.log(`[ai_edit] ${highlights.length}/${clip_count} clips picked for job ${ai_edit_job_id} (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
+    await setProgress(ai_edit_job_id, 30)
+
+    // Hook, title, post caption and hashtags per clip (a clip whose call fails just has none)
+    const texts: Array<ClipText | null> = await Promise.all(highlights.map(async (h, i) => {
+      await new Promise(r => setTimeout(r, (i % 4) * 250)) // spread the calls a little
+      try {
+        return await generateClipText(words.filter(w => w.start_ms >= h.start_ms && w.start_ms < h.end_ms), video.title ?? null, process.env.GEMINI_API_KEY!)
+      } catch (e) {
+        console.warn(`[ai_edit] clip text failed for ${h.start_ms}-${h.end_ms}:`, e instanceof Error ? e.message : e)
+        return null
+      }
+    }))
     await setProgress(ai_edit_job_id, 35)
 
     // 4. Download video once (for framing)
@@ -726,7 +739,7 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
         const clipWords = words.filter(w => w.start_ms >= highlight.start_ms && w.start_ms < highlight.end_ms)
         const caption = captionFontFor(clipWords)
 
-        const clip_id = await saveClip(video_id, ai_edit_job_id, highlight, segments, caption)
+        const clip_id = await saveClip(video_id, ai_edit_job_id, highlight, segments, caption, texts[hi])
         const renderPayload = { clip_id, video_storage_path: video.storage_path, quality: '1080p', watermark }
         await db`INSERT INTO jobs (type, payload, status) VALUES ('render', ${db.json(renderPayload)}, 'queued')`
 
@@ -765,15 +778,27 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
 async function saveClip(
   videoId: string, aiEditJobId: string, highlight: FoundClip, segments: ClipSegment[],
   caption: { font: string; language: string | null },
+  text: ClipText | null,
 ): Promise<string> {
   return db.begin(async tx => {
     const [clipRow] = await tx`
-      INSERT INTO clips (video_id, start_ms, end_ms, status, title, ai_edit_job_id, ai_score, ai_reason, remove_fillers)
-      VALUES (${videoId}, ${highlight.start_ms}, ${highlight.end_ms}, 'rendering', ${highlight.title.slice(0, 120) || 'Highlight'},
-        ${aiEditJobId}, ${highlight.score}, ${highlight.reason || null}, true)
+      INSERT INTO clips (video_id, start_ms, end_ms, status, title, ai_edit_job_id, ai_score, ai_reason, remove_fillers,
+        hook_text, post_caption, hashtags)
+      VALUES (${videoId}, ${highlight.start_ms}, ${highlight.end_ms}, 'rendering', ${(text?.title || highlight.title).slice(0, 120) || 'Highlight'},
+        ${aiEditJobId}, ${highlight.score}, ${highlight.reason || null}, true,
+        ${text?.hook ?? null}, ${text?.post_caption ?? null}, ${text?.hashtags ?? null})
       RETURNING id
     `
     const clipId = clipRow.id as string
+
+    // The hook, over the first 3 seconds near the top (x null = centred), like any text overlay
+    if (text?.hook) {
+      await tx`
+        INSERT INTO text_overlays (clip_id, text, start_ms, end_ms, x, y, font, size, color)
+        VALUES (${clipId}, ${text.hook}, 0, ${Math.min(3000, highlight.end_ms - highlight.start_ms)}, NULL, 0.15,
+          ${fontForText(text.hook)}, 76, '#FFFFFF')
+      `
+    }
 
     const segRows = await tx`
       INSERT INTO segments ${tx(segments.map((seg, si) => ({

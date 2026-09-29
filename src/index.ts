@@ -79,6 +79,10 @@ async function runMigrations() {
   // Remove pauses and filler words: the switch per clip, and the source-time ranges it cut
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS remove_fillers BOOLEAN NOT NULL DEFAULT false`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS cut_ranges JSONB`
+  // AI post text per clip: hook (also a text overlay), post caption, hashtags
+  await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS hook_text TEXT`
+  await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS post_caption TEXT`
+  await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS hashtags TEXT[]`
   console.log('[startup] migrations ok')
 }
 
