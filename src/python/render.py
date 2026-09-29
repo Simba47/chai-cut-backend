@@ -93,7 +93,7 @@ _PHRASE_GAP_MS   = 300  # silence gap longer than this → new subtitle line
 _MAX_PHRASE_WORDS = 5   # also break at this many words even with no gap
 
 
-def _group_sentences(words: list[dict]) -> list[list[dict]]:
+def _group_sentences(words: list[dict], max_words: int = _MAX_PHRASE_WORDS) -> list[list[dict]]:
     """Split words into subtitle phrases using gap + word-count, not punctuation.
 
     Punctuation-only splitting silently merges entire clips into one event when
@@ -119,7 +119,7 @@ def _group_sentences(words: list[dict]) -> list[list[dict]]:
             _is_sentence_end(w.get("word", ""))
             or speaker_change
             or gap > _PHRASE_GAP_MS
-            or len(current) >= _MAX_PHRASE_WORDS
+            or len(current) >= max_words
         ):
             sentences.append(current)
             current = []
@@ -152,7 +152,8 @@ def _write_ass(
     # Rebase word timestamps to clip-relative (0 = first frame of clip)
     clip_words = [
         {**w, "start_ms": w["start_ms"] - clip_start_ms + offset_ms,
-               "end_ms":   w["end_ms"]   - clip_start_ms + offset_ms}
+               "end_ms":   w["end_ms"]   - clip_start_ms + offset_ms,
+               "_src_start": w["start_ms"]}
         for w in words
     ]
 
@@ -173,12 +174,40 @@ def _write_ass(
         " BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
         f"Style: Default,{font_name},{font_size},{primary},&H00FFFFFF,&H00000000,{shadow},"
         "0,0,0,0,100,100,0,0,1,3,2,5,10,10,10,1",
+        *_preset_styles(style, font_name, font_size),
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
 
+    if style.get("animation") in _PRESETS:
+        lines += _preset_events(clip_words, style, out_w, out_h, band_zones or [])
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return
+
     sentences = [s for s in _group_sentences(clip_words) if s]
+    for i, (sentence, (start_ms, end_ms)) in enumerate(zip(sentences, _line_times(sentences))):
+        if end_ms <= start_ms:
+            continue
+        text     = " ".join(_word_display(w, roman) for w in sentence if _word_display(w, roman))
+        if not text.strip():
+            continue
+        # Alignment=5 (center of screen); \pos pins the anchor to exact coordinates. Where a
+        # frame shows captions in its text band, that part of the line is centred in the band.
+        for a, b, y in _split_by_zones(start_ms, end_ms, band_zones or [], pos_y):
+            tag = f"{{\\pos({pos_x},{y})}}"
+            lines.append(
+                f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},"
+                f"Default,,0,0,0,,{tag}{text}"
+            )
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _line_times(sentences: list[list[dict]]) -> list[tuple[int, int]]:
+    """When each caption line is on screen: (start, end) per line, clip-relative ms."""
     # max(): transcription occasionally returns a word whose end is before its start
     spans = [[s[0]["start_ms"], max(s[0]["start_ms"], s[-1]["end_ms"])] for s in sentences]
 
@@ -198,7 +227,8 @@ def _write_ass(
                 spans[k] = [round(run_start + (k - i) * slot), round(run_start + (k - i + 1) * slot)]
         i = j + 1
 
-    for i, sentence in enumerate(sentences):
+    out: list[tuple[int, int]] = []
+    for i in range(len(spans)):
         start_ms = max(0, spans[i][0])
         end_ms   = spans[i][1] + 200
         # Only one line on screen at a time (all lines share the same \pos, so any
@@ -209,22 +239,143 @@ def _write_ass(
             if next_start - spans[i][1] < 500:
                 end_ms = next_start
             end_ms = min(end_ms, next_start)
+        out.append((start_ms, end_ms))
+    return out
+
+
+# ── Animated caption presets ──────────────────────────────────────────────────
+#
+# Mirrored by drawPresetCaptions() in the editor (VideoPreview.tsx): same lines, same timing,
+# same colours. The older animations (karaoke / fade / none) keep the plain path above.
+#   pop       — each word appears when spoken, scaling 80% → 110% → 100% in 150 ms
+#   highlight — 3 words a line; a highlight_color box behind the spoken word
+#   bounce    — the line slides up into place and fades in; the spoken word in highlight_color
+#   word      — one big word at a time, centre screen
+# Emphasised words (caption_styles.emphasis, keyed by the word's start_ms in the video) are drawn
+# in highlight_color and 15% larger.
+
+_PRESETS = {"pop", "highlight", "bounce", "word"}
+_POP_MS = 150
+_BOUNCE_MS = 180
+_BOX_PAD = 14          # highlight box padding (px at 1080 wide)
+_WORD_SCALE = 150      # 'word' preset: % of the caption size
+_EMPHASIS_SCALE = 115
+
+
+def _ass_color(hex_color: str) -> str:
+    """#RRGGBB → inline ASS colour &HBBGGRR&"""
+    return _hex_to_ass(hex_color, 0).replace("&H00", "&H", 1) + "&"
+
+
+def _text_on(hex_color: str) -> str:
+    """Black or white, whichever reads on a box of this colour"""
+    h = hex_color.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return "#000000" if 0.299 * r + 0.587 * g + 0.114 * b > 150 else "#FFFFFF"
+
+
+def _preset_styles(style: dict, font_name: str, font_size: int) -> list[str]:
+    if style.get("animation") not in _PRESETS:
+        return []
+    # The Noto Indic fonts have no Latin letters: Roman-letter captions use Roboto (the editor too)
+    if style.get("language") == "roman":
+        font_name = _FONT_NAMES["roboto"]
+    stroke = int(style.get("stroke_width") if style.get("stroke_width") is not None else 4)
+    hl = _hex_to_ass(style.get("highlight_color") or "#FFE700", 0)
+    primary = _hex_to_ass(style.get("color") or "#ffffff", 0)
+    return [
+        f"Style: Preset,{font_name},{font_size},{primary},&H00FFFFFF,&H00000000,&H80000000,"
+        f"1,0,0,0,100,100,0,0,1,{stroke},2,5,10,10,10,1",
+        # Opaque box (BorderStyle 3) in the highlight colour; its text is never drawn
+        f"Style: PresetBox,{font_name},{font_size},&HFF000000,&H00FFFFFF,{hl},&H00000000,"
+        f"1,0,0,0,100,100,0,0,3,{_BOX_PAD},0,5,10,10,10,1",
+    ]
+
+
+def _esc(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("{", "(").replace("}", ")")
+
+
+def _preset_events(words: list[dict], style: dict, out_w: int, out_h: int, zones: list[tuple[int, int, int]]) -> list[str]:
+    anim = style["animation"]
+    roman = style.get("language") == "roman"
+    upper = bool(style.get("uppercase"))
+    color = style.get("color") or "#ffffff"
+    hl = style.get("highlight_color") or "#FFE700"
+    emphasis = style.get("emphasis") or {}
+    if isinstance(emphasis, str):
+        try:
+            emphasis = json.loads(emphasis)
+        except ValueError:
+            emphasis = {}
+    stroke = int(style.get("stroke_width") if style.get("stroke_width") is not None else 4)
+    per_line = 1 if anim == "word" else int(style.get("words_per_line") or (3 if anim == "highlight" else _MAX_PHRASE_WORDS))
+    pos_y_frac = style.get("position_y")
+    pos_y = int(float(pos_y_frac if pos_y_frac is not None else (0.5 if anim == "word" else 0.84)) * out_h)
+    pos_x = out_w // 2
+    base_scale = _WORD_SCALE if anim == "word" else 100
+
+    events: list[str] = []
+    sentences = [s for s in _group_sentences(words, max(1, per_line)) if s]
+    for sentence, (start_ms, end_ms) in zip(sentences, _line_times(sentences)):
         if end_ms <= start_ms:
             continue
-        text     = " ".join(_word_display(w, roman) for w in sentence if _word_display(w, roman))
-        if not text.strip():
+        shown = [(w, _word_display(w, roman)) for w in sentence]
+        shown = [(w, (t.upper() if upper else t)) for w, t in shown if t]
+        if not shown:
             continue
-        # Alignment=5 (center of screen); \pos pins the anchor to exact coordinates. Where a
-        # frame shows captions in its text band, that part of the line is centred in the band.
-        for a, b, y in _split_by_zones(start_ms, end_ms, band_zones or [], pos_y):
-            tag = f"{{\\pos({pos_x},{y})}}"
-            lines.append(
-                f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},"
-                f"Default,,0,0,0,,{tag}{text}"
-            )
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+        for a, b, y in _split_by_zones(start_ms, end_ms, zones, pos_y):
+            text_runs, box_runs = [], []
+            for j, (w, t) in enumerate(shown):
+                on = w["start_ms"] - a                      # spoken from (piece-relative)
+                off = (shown[j + 1][0]["start_ms"] if j + 1 < len(shown) else end_ms) - a
+                emph = bool(emphasis.get(str(w.get("_src_start", w["start_ms"]))))
+                sc = round(base_scale * (_EMPHASIS_SCALE if emph else 100) / 100)
+                rest = _ass_color(hl if emph else color)
+                live = _ass_color(_text_on(hl)) if anim == "highlight" else _ass_color(hl)
+                spoken = on <= 0 < off
+                tags = f"\\fscx{sc}\\fscy{sc}"
+                if anim in ("pop", "word"):
+                    if on <= 0:
+                        tags += "\\alpha&H00&"
+                    else:
+                        lo, hi = round(sc * 0.8), round(sc * 1.1)
+                        tags = (f"\\alpha&HFF&\\fscx{lo}\\fscy{lo}\\t({on},{on + 1},\\alpha&H00&)"
+                                f"\\t({on},{on + _POP_MS // 2},\\fscx{hi}\\fscy{hi})"
+                                f"\\t({on + _POP_MS // 2},{on + _POP_MS},\\fscx{sc}\\fscy{sc})")
+                if anim == "word":
+                    tags += f"\\1c{rest}"
+                else:
+                    tags += f"\\1c{live if spoken else rest}"
+                    if on > 0:
+                        tags += f"\\t({on},{on + 1},\\1c{live})"
+                    if 0 < off < b - a:
+                        tags += f"\\t({off},{off + 1},\\1c{rest})"
+                if anim == "highlight":
+                    # No outline inside the box; the box itself is drawn by the PresetBox layer
+                    tags += f"\\bord{0 if spoken else stroke}\\shad{0 if spoken else 2}"
+                    if on > 0:
+                        tags += f"\\t({on},{on + 1},\\bord0\\shad0)"
+                    if 0 < off < b - a:
+                        tags += f"\\t({off},{off + 1},\\bord{stroke}\\shad2)"
+                    box = f"\\fscx{sc}\\fscy{sc}\\3a{'&H00&' if spoken else '&HFF&'}"
+                    if on > 0:
+                        box += f"\\t({on},{on + 1},\\3a&H00&)"
+                    if 0 < off < b - a:
+                        box += f"\\t({off},{off + 1},\\3a&HFF&)"
+                    box_runs.append(f"{{{box}}}{_esc(t)}")
+                text_runs.append(f"{{{tags}}}{_esc(t)}")
+            if anim == "bounce" and a == start_ms:
+                dy = round(out_h * 0.02)
+                head = f"{{\\move({pos_x},{y + dy},{pos_x},{y},0,{_BOUNCE_MS})\\fad(80,0)}}"
+            else:
+                head = f"{{\\pos({pos_x},{y})}}"
+            if box_runs:
+                events.append(f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},PresetBox,,0,0,0,,{head}{' '.join(box_runs)}")
+            events.append(f"Dialogue: 1,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},Preset,,0,0,0,,{head}{' '.join(text_runs)}")
+    return events
 
 
 def _split_by_zones(start_ms: int, end_ms: int, zones: list[tuple[int, int, int]], default_y: int) -> list[tuple[int, int, int]]:

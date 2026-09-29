@@ -8,6 +8,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { r2, R2_BUCKET, r2DownloadToFile, r2UploadFile } from '../r2.js'
 import db from '../db.js'
 import type { Job, RenderJobPayload } from '../types.js'
+import { GoogleGenerativeAI } from '@google/generative-ai'
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
 
@@ -170,6 +171,18 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
     ? await db`SELECT word, word_roman, start_ms, end_ms, speaker_id FROM transcript_words WHERE transcript_id = ${transcriptRow.id} ORDER BY start_ms`
     : []
 
+  // Animated presets emphasise the words that matter; asked once per clip and kept
+  const style = captionStyles[0]
+  if (style && PRESETS.has(style.animation) && style.emphasis == null && words.length) {
+    const clipWords = words.filter(w => w.start_ms >= clip.start_ms && w.start_ms < clip.end_ms)
+    const emphasis = await pickEmphasis(clipWords.map(w => ({ word: w.word as string, start_ms: w.start_ms as number, end_ms: w.end_ms as number })))
+    if (emphasis) {
+      await db`UPDATE caption_styles SET emphasis = ${db.json(emphasis)} WHERE id = ${style.id}`
+        .catch(e => console.warn('[render] could not save caption emphasis:', e))
+      style.emphasis = emphasis
+    }
+  }
+
   const dims = QUALITY_DIMS[quality] ?? QUALITY_DIMS['1080p']
   return {
     clip_id: clipId,
@@ -200,4 +213,41 @@ function runPython(script: string, args: string[], signal?: AbortSignal): Promis
     proc.on('close', code => { if (code === 0) resolve(); else reject(new Error(`Python render failed (exit ${code}): ${stderr.slice(-500)}`)) })
     proc.on('error', reject)
   })
+}
+
+const PRESETS = new Set(['pop', 'highlight', 'bounce', 'word'])
+
+/**
+ * The 1–2 most important words in each caption line, as { "<word start_ms>": true } (the key
+ * render.py and the editor look words up by). Gemini reads the clip's lines once; null when it
+ * fails, so the clip renders without emphasis.
+ */
+export async function pickEmphasis(words: Array<{ word: string; start_ms: number; end_ms: number }>): Promise<Record<string, true> | null> {
+  if (!words.length || !process.env.GEMINI_API_KEY) return null
+  // Lines as the captions break them: a pause over 300 ms or 5 words
+  const lines: number[][] = []
+  words.forEach((w, i) => {
+    const line = lines[lines.length - 1]
+    if (!line || line.length >= 5 || w.start_ms - words[i - 1].end_ms > 300) lines.push([i])
+    else line.push(i)
+  })
+  const text = lines.map((l, li) => `${li}: ` + l.map(i => `${i}=${words[i].word}`).join(' ')).join('\n')
+  const prompt = `These are caption lines from a short video (any language, often Telugu, Hindi or Tamil mixed with English). Each word is written as index=word.
+For each line pick the 1 or 2 words that carry the meaning or emotion (a key noun, number, strong verb or punchline word) — never filler words. Skip a line if nothing stands out.
+Return ONLY JSON: {"words": [index, ...]}
+
+${text}`
+  try {
+    const model = new GoogleGenerativeAI(process.env.GEMINI_API_KEY).getGenerativeModel({ model: 'gemini-2.5-flash' })
+    const out = (await model.generateContent(prompt)).response.text()
+    const match = out.match(/\{[\s\S]*\}/)
+    const idx: unknown = match ? JSON.parse(match[0]).words : null
+    if (!Array.isArray(idx)) return null
+    const picked: Record<string, true> = {}
+    for (const i of idx) if (Number.isInteger(i) && words[i]) picked[String(words[i].start_ms)] = true
+    return picked
+  } catch (e) {
+    console.warn('[render] caption emphasis failed, rendering without it:', e instanceof Error ? e.message : e)
+    return null
+  }
 }

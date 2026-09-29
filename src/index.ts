@@ -65,6 +65,17 @@ async function runMigrations() {
   await db`ALTER TABLE ai_edit_jobs ADD COLUMN IF NOT EXISTS progress INTEGER NOT NULL DEFAULT 0`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_score INTEGER`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_reason TEXT`
+  // Animated caption presets (render.py _preset_events, editor drawPresetCaptions)
+  await db`ALTER TABLE caption_styles DROP CONSTRAINT IF EXISTS caption_styles_animation_check`
+  await db`ALTER TABLE caption_styles ADD CONSTRAINT caption_styles_animation_check
+    CHECK (animation IN ('karaoke','fade','none','pop','highlight','bounce','word'))`
+  await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS highlight_color TEXT DEFAULT '#FFE700'`
+  await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS words_per_line INTEGER`
+  await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS uppercase BOOLEAN NOT NULL DEFAULT false`
+  await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS stroke_width INTEGER DEFAULT 4`
+  // Words the AI marked as important ({ "<word start_ms>": true }), made once per clip at export
+  await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS emphasis JSONB`
+  await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS emoji BOOLEAN NOT NULL DEFAULT false`
   console.log('[startup] migrations ok')
 }
 
