@@ -18,12 +18,13 @@ Output: JSON to stdout:
       {
         "frame_index": 0,
         "person_count": N,       # how many distinct people are in this frame
-        "faces": [{x,y,w,h,score}]  # positions of detected subjects, left→right
+        "faces": [{x,y,w,h,score,lip}]  # positions of detected subjects, left→right
       }, ...
     ]
   }
   All coordinates are fractions of the frame (0.0–1.0). score is the detection confidence
-  (MediaPipe), 1.0 for Haar faces and 0.0 for motion boxes.
+  (MediaPipe), 1.0 for Haar faces and 0.0 for motion boxes. With --lips, "lip" is how open the
+  mouth is (inner lip gap / face height), given only on frames with 2+ faces.
 """
 import argparse
 import json
@@ -34,6 +35,7 @@ import numpy as np
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CASCADE_PATH = os.path.join(SCRIPT_DIR, 'haarcascade_frontalface_default.xml')
 BLAZEFACE_PATH = os.path.join(SCRIPT_DIR, 'blaze_face_short_range.tflite')
+LANDMARKER_PATH = os.path.join(SCRIPT_DIR, 'face_landmarker.task')
 
 MIN_SCORE = 0.5        # ignore less confident MediaPipe faces
 MIN_FACE_AREA = 0.02   # ignore faces smaller than 2% of the frame (background people)
@@ -110,6 +112,45 @@ class _MediaPipe:
         boxes = [b for b in _nms(boxes) if b["score"] >= MIN_SCORE and b["area"] >= MIN_FACE_AREA]
         boxes.sort(key=lambda b: -b["area"])
         return _filter_by_size(boxes)
+
+
+class _Lips:
+    """
+    How open each face's mouth is (MediaPipe FaceLandmarker, Apache-2.0): the gap between the
+    inner upper and lower lip divided by the face's height. Its change over time shows who is
+    talking. Runs on a crop around each detected face, so small faces in a wide shot still get
+    enough pixels.
+    """
+    UPPER, LOWER, TOP, CHIN = 13, 14, 10, 152
+
+    def __init__(self):
+        from mediapipe.tasks.python import vision
+        from mediapipe.tasks.python.core.base_options import BaseOptions
+        import mediapipe as mp
+        self._mp = mp
+        self._landmarker = vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=LANDMARKER_PATH), num_faces=1,
+        ))
+
+    def gap(self, bgr, face):
+        import cv2
+        h_px, w_px = bgr.shape[:2]
+        # The face box plus a margin, as a square
+        side = max(face["w"] * w_px, face["h"] * h_px) * 1.6
+        cx, cy = (face["x"] + face["w"] / 2) * w_px, (face["y"] + face["h"] / 2) * h_px
+        x0, y0 = int(max(0, cx - side / 2)), int(max(0, cy - side / 2))
+        x1, y1 = int(min(w_px, cx + side / 2)), int(min(h_px, cy + side / 2))
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            return None
+        crop = cv2.resize(bgr[y0:y1, x0:x1], (256, 256), interpolation=cv2.INTER_LINEAR)
+        rgb = np.ascontiguousarray(crop[:, :, ::-1])
+        res = self._landmarker.detect(self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb))
+        if not res.face_landmarks:
+            return None
+        lm = res.face_landmarks[0]
+        dist = lambda a, b: float(np.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y))
+        height = dist(self.TOP, self.CHIN)
+        return round(dist(self.UPPER, self.LOWER) / height, 4) if height > 0 else None
 
 
 def _detect_haar(cascade, gray, w_px, h_px):
@@ -193,7 +234,7 @@ def track_faces(frames: list[list[dict]], iou=0.3, resets: set[int] | None = Non
     return ids
 
 
-def detect_subjects(frames_dir: str) -> dict:
+def detect_subjects(frames_dir: str, lips: bool = False) -> dict:
     import cv2
 
     cascade = None
@@ -206,6 +247,13 @@ def detect_subjects(frames_dir: str) -> dict:
     except Exception as e:  # not installed, or the model file is missing: Haar + motion only
         print(f"[detect] MediaPipe unavailable, using Haar: {e}", file=sys.stderr)
 
+    lip_reader = None
+    if lips and mediapipe is not None:
+        try:
+            lip_reader = _Lips()
+        except Exception as e:
+            print(f"[detect] FaceLandmarker unavailable, no speaker tracking: {e}", file=sys.stderr)
+
     frame_files = sorted(
         f for f in os.listdir(frames_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))
     )
@@ -215,6 +263,7 @@ def detect_subjects(frames_dir: str) -> dict:
     # ── Pass 1: faces per frame, how much each one changed since the previous frame, and
     #    where motion is (the fallback when no face is left) ─────────────────────────────
     raw: list[list[dict]] = []
+    paths: list[str] = []
     motion_cx: list[float | None] = []
     methods: list[str] = []
     prev_gray = None
@@ -251,6 +300,7 @@ def detect_subjects(frames_dir: str) -> dict:
         motion_cx.append(_motion_center(prev_gray, gray, wp, hp) if same_shot else None)
         prev_gray = gray
         raw.append(subjects)
+        paths.append(os.path.join(frames_dir, fname))
         methods.append(method)
 
     # ── Pass 2: drop faces that never change — posters, photos, paused screens ─────────────
@@ -268,6 +318,7 @@ def detect_subjects(frames_dir: str) -> dict:
     slot_data: list[list[dict]] = [[] for _ in range(4)]
     max_person_count = 0
     counts_by_method = {"mediapipe": 0, "haar": 0, "motion": 0, "none": 0}
+    lip_frames = 0
     for fi, (faces, ids) in enumerate(zip(raw, track_ids)):
         subjects = [f for f, tid in zip(faces, ids) if tid not in static]
         method = methods[fi] if subjects else "none"
@@ -299,14 +350,28 @@ def detect_subjects(frames_dir: str) -> dict:
         # Sort left → right
         subjects.sort(key=lambda b: b["cx"])
 
+        # Mouth opening, only where there is more than one person to choose between
+        lip_values = [None] * len(subjects)
+        real = [s for s in subjects if s["score"] > 0]
+        if lip_reader is not None and len(real) >= 2:
+            img = cv2.imread(paths[fi])
+            for i, s in enumerate(subjects):
+                if s["score"] > 0:
+                    try:
+                        lip_values[i] = lip_reader.gap(img, s)
+                    except Exception as e:
+                        print(f"[detect] FaceLandmarker failed on frame {fi}: {e}", file=sys.stderr)
+            lip_frames += 1
+
         person_count = len(subjects)
         max_person_count = max(max_person_count, person_count)
 
         per_frame.append({
             "frame_index": fi,
             "person_count": person_count,
-            "faces": [{"x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"], "score": round(s["score"], 3)}
-                      for s in subjects[:4]],
+            "faces": [{"x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"], "score": round(s["score"], 3),
+                       **({"lip": lip_values[i]} if lip_values[i] is not None else {})}
+                      for i, s in enumerate(subjects[:4])],
         })
 
         for i, s in enumerate(subjects[:4]):
@@ -316,7 +381,7 @@ def detect_subjects(frames_dir: str) -> dict:
     print(
         f"[detect] {len(per_frame)} frames, faces/frame min={min(counts)} "
         f"avg={sum(counts) / len(counts):.2f} max={max(counts)}, by method {counts_by_method}, "
-        f"static faces dropped: {len(static)}",
+        f"static faces dropped: {len(static)}, lips read on {lip_frames} frames",
         file=sys.stderr,
     )
 
@@ -339,9 +404,10 @@ def detect_subjects(frames_dir: str) -> dict:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--frames-dir", required=True)
+    parser.add_argument("--lips", action="store_true", help="also measure mouth opening (speaker tracking)")
     args = parser.parse_args()
     try:
-        result = detect_subjects(args.frames_dir)
+        result = detect_subjects(args.frames_dir, lips=args.lips)
     except Exception as e:
         print(f"[face_detect] Error: {e}", file=sys.stderr)
         result = {"face_count": 0, "face_boxes": [], "frames": []}

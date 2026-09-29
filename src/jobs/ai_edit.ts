@@ -17,7 +17,7 @@ const __dirname = dirname(__filename)
 
 const execFileAsync = promisify(execFile)
 
-interface CropBox { x: number; y: number; w: number; h: number; score?: number }
+interface CropBox { x: number; y: number; w: number; h: number; score?: number; lip?: number }
 interface FrameDetection { frame_index: number; person_count: number; faces: CropBox[] }
 interface FaceInfo { face_count: number; face_boxes: CropBox[]; frames: FrameDetection[] }
 interface SlotKf { t_ms: number; x: number; y: number; w: number; h: number }
@@ -31,7 +31,14 @@ export interface ClipAnalysis {
   reelW: number
   /** The source is already vertical: show the whole frame */
   portrait: boolean
+  /** Spoken words in the clip, ms from its start (speaker tracking) */
+  speech: SpokenWord[]
 }
+export interface SpokenWord { start_ms: number; end_ms: number; speaker_id?: string | null }
+
+// Follow whoever is talking when 2+ people are in the picture. SPEAKER_TRACKING=off goes back
+// to framing by face count and size only.
+const SPEAKER_TRACKING = process.env.SPEAKER_TRACKING !== 'off'
 
 // Frames analysed per second, and the time between them. 4 fps catches quick head turns and
 // lets the crop follow within a quarter second.
@@ -47,6 +54,20 @@ const MIN_SHOT_MS = 1000
 const CUT_MOVE = 0.05
 
 const EMPTY: FaceInfo = { face_count: 0, face_boxes: [], frames: [] }
+
+// Speaker tracking: a talker's mouth moves this much more than anyone else's (1.2× right after
+// the transcript's speaker changes), and at least MIN_LIP_MOVE (std of lip gap / face height
+// within a second; closed-mouth listeners measure ~0.0005)
+const SPEAKER_RATIO = 1.5
+const SPEAKER_RATIO_HINTED = 1.2
+const MIN_LIP_MOVE = 0.0015
+// Each speaker (or split) choice is held at least this long
+const SPEAKER_HOLD_MS = 2000
+// With no speaker change in the transcript there, a new speaker must win this many seconds in a
+// row before the crop moves (a cough or a silent laugh can win one or two)
+const UNHINTED_SWITCH_S = 3
+// Speaker changing more than once within this window → both people, split screen
+const BACK_AND_FORTH_MS = 4000
 
 export async function probeSize(videoPath: string): Promise<{ width: number; height: number } | null> {
   try {
@@ -94,7 +115,7 @@ export async function detectCuts(videoPath: string, startMs: number, endMs: numb
   }
 }
 
-async function detectFaces(tmp: string, videoPath: string, startMs: number, endMs: number, signal?: AbortSignal): Promise<FaceInfo> {
+async function detectFaces(tmp: string, videoPath: string, startMs: number, endMs: number, signal?: AbortSignal, lips = false): Promise<FaceInfo> {
   const framesDir = join(tmp, `frames-${startMs}`)
   await mkdir(framesDir, { recursive: true })
   try {
@@ -105,7 +126,7 @@ async function detectFaces(tmp: string, videoPath: string, startMs: number, endM
 
   const result = await new Promise<FaceInfo>((resolve) => {
     const script = join(__dirname, '../../src/python/face_detect.py')
-    const proc = spawn('python3', [script, '--frames-dir', framesDir], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', MPLBACKEND: 'Agg' } })
+    const proc = spawn('python3', [script, '--frames-dir', framesDir, ...(lips ? ['--lips'] : [])], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', MPLBACKEND: 'Agg' } })
     const kill = () => proc.kill('SIGKILL')
     signal?.addEventListener('abort', kill, { once: true })
     let stdout = ''
@@ -132,17 +153,20 @@ async function detectFaces(tmp: string, videoPath: string, startMs: number, endM
  */
 export async function analyseClip(
   tmp: string, videoPath: string, startMs: number, endMs: number,
-  size: { width: number; height: number } | null, signal?: AbortSignal,
+  size: { width: number; height: number } | null, words: Array<SpokenWord & { word?: string }>, signal?: AbortSignal,
 ): Promise<ClipAnalysis> {
+  const speech = words
+    .filter(w => w.end_ms > startMs && w.start_ms < endMs)
+    .map(w => ({ start_ms: w.start_ms - startMs, end_ms: w.end_ms - startMs, speaker_id: w.speaker_id ?? null }))
   const portrait = !!size && size.height >= size.width
   // 9:16 crop at full height: 81/256 ≈ 0.316 of a 16:9 source
   const reelW = size ? Math.min(1, (9 / 16) * (size.height / size.width)) : 81 / 256
-  if (portrait) return { info: EMPTY, cuts: [], reelW, portrait }
+  if (portrait) return { info: EMPTY, cuts: [], reelW, portrait, speech }
   const [info, cuts] = await Promise.all([
-    detectFaces(tmp, videoPath, startMs, endMs, signal),
+    detectFaces(tmp, videoPath, startMs, endMs, signal, SPEAKER_TRACKING),
     detectCuts(videoPath, startMs, endMs, signal),
   ])
-  return { info, cuts, reelW, portrait }
+  return { info, cuts, reelW, portrait, speech }
 }
 
 // ── Crop stabilisation helpers ────────────────────────────────────────────────
@@ -197,6 +221,148 @@ const median = (v: number[]) => {
   return s.length ? s[Math.floor(s.length / 2)] : 0.5
 }
 
+// ── Speaker tracking ──────────────────────────────────────────────────────────
+
+const iou = (a: CropBox, b: CropBox) => {
+  const ix = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x))
+  const iy = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y))
+  const inter = ix * iy
+  const union = a.w * a.h + b.w * b.h - inter
+  return union > 0 ? inter / union : 0
+}
+
+// A person missing for up to this long (a hand over the face, a missed detection) keeps their id
+const TRACK_GAP_MS = 1000
+
+/**
+ * A stable id per person within the clip: each face takes the id of the person whose last box
+ * it overlaps most (IoU > 0.3), or whose centre is closest (under half a box width), among the
+ * people seen in the last TRACK_GAP_MS. Ids start fresh after every camera cut.
+ */
+export function trackFaces(frames: FrameDetection[], cuts: number[]): number[][] {
+  const ids: number[][] = []
+  let next = 0
+  let recent = new Map<number, { box: CropBox; t: number }>()
+  frames.forEach((f, fi) => {
+    const t = f.frame_index * FRAME_INTERVAL_MS
+    const prevT = fi > 0 ? frames[fi - 1].frame_index * FRAME_INTERVAL_MS : -1
+    if (cuts.some(c => c > prevT && c <= t)) recent = new Map()
+    for (const [id, r] of recent) if (t - r.t > TRACK_GAP_MS) recent.delete(id)
+    const taken = new Set<number>()
+    const row = f.faces.map(face => {
+      let best = -1, bestScore = 0
+      for (const [id, r] of recent) {
+        if (taken.has(id)) continue
+        const overlap = iou(face, r.box)
+        const dist = Math.abs((face.x + face.w / 2) - (r.box.x + r.box.w / 2))
+        const score = overlap > 0.3 ? 1 + overlap : dist < r.box.w / 2 ? 1 - dist / r.box.w : 0
+        if (score > bestScore) { best = id; bestScore = score }
+      }
+      if (best < 0) best = next++
+      taken.add(best)
+      return best
+    })
+    f.faces.forEach((face, i) => recent.set(row[i], { box: face, t }))
+    ids.push(row)
+  })
+  return ids
+}
+
+const pstdev = (v: number[]) => {
+  const m = v.reduce((a, b) => a + b, 0) / v.length
+  return Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / v.length)
+}
+
+/** Who to frame, per frame: a person's track id, 'split' for a quick back-and-forth, or null (no opinion) */
+export type SpeakerChoice = number | 'split' | null
+
+/**
+ * Decides, second by second, who is talking: while someone speaks (a transcript word overlaps
+ * the second), the person whose mouth moves clearly more than anyone else's. The transcript's
+ * speaker changes lower that bar (they mark likely turns) but its ids are not trusted across
+ * chunks. Choices are held for SPEAKER_HOLD_MS; the speaker changing more than once within
+ * BACK_AND_FORTH_MS means both are talking, so both are shown.
+ */
+export function planSpeakers(frames: FrameDetection[], tracks: number[][], speech: SpokenWord[], clipDurationMs: number): SpeakerChoice[] {
+  const seconds = Math.ceil(clipDurationMs / 1000)
+  const bySecond: number[][] = Array.from({ length: seconds }, () => [])
+  frames.forEach((f, fi) => {
+    const s = Math.floor((f.frame_index * FRAME_INTERVAL_MS) / 1000)
+    if (s < seconds) bySecond[s].push(fi)
+  })
+  // Speaker-id changes in the transcript (null ids ignored)
+  const turns: number[] = []
+  let lastId: string | null = null
+  for (const w of speech) {
+    if (!w.speaker_id) continue
+    if (lastId !== null && w.speaker_id !== lastId) turns.push(w.start_ms)
+    lastId = w.speaker_id
+  }
+
+  const hintedAt = (s: number) => turns.some(t => t >= s * 1000 - 500 && t < s * 1000 + 1500)
+
+  // Raw pick per second
+  const raw: Array<number | null> = bySecond.map((fis, s) => {
+    const from = s * 1000, to = from + 1000
+    if (!speech.some(w => w.start_ms < to && w.end_ms > from)) return null
+    const lips = new Map<number, number[]>()
+    for (const fi of fis) {
+      frames[fi].faces.forEach((face, i) => {
+        if (face.lip === undefined) return
+        const id = tracks[fi][i]
+        lips.set(id, [...(lips.get(id) ?? []), face.lip])
+      })
+    }
+    const moves = [...lips.entries()].filter(([, v]) => v.length >= 2).map(([id, v]) => ({ id, move: pstdev(v) }))
+      .sort((a, b) => b.move - a.move)
+    if (moves.length < 2 || moves[0].move < MIN_LIP_MOVE) return null
+    return moves[0].move >= (hintedAt(s) ? SPEAKER_RATIO_HINTED : SPEAKER_RATIO) * moves[1].move ? moves[0].id : null
+  })
+
+  // Back-and-forth: more than one change of (known) speaker within the window around a second,
+  // with a speaker change in the transcript there too
+  const half = Math.round(BACK_AND_FORTH_MS / 2000)
+  const busy = raw.map((_, s) => {
+    const known = raw.slice(Math.max(0, s - half), s + half).filter((x): x is number => x !== null)
+    let changes = 0
+    for (let i = 1; i < known.length; i++) if (known[i] !== known[i - 1]) changes++
+    // Lip readings alone are noisy: the transcript must also show a turn in the window
+    const from = (s - half) * 1000, to = (s + half) * 1000
+    return changes > 1 && turns.some(t => t >= from && t < to)
+  })
+
+  // Hold each choice; a speaker who left the picture (camera cut: new track ids) frees the choice.
+  // Where the transcript marks a turn the crop follows at once; elsewhere a new choice must win
+  // UNHINTED_SWITCH_S seconds in a row, so a burst of mouth movement never moves the crop.
+  const holdS = SPEAKER_HOLD_MS / 1000
+  const plan: SpeakerChoice[] = []
+  let current: SpeakerChoice = null
+  let since = -Infinity
+  let pending: SpeakerChoice = null
+  let pendingFor = 0
+  for (let s = 0; s < seconds; s++) {
+    const present = new Set(bySecond[s].flatMap(fi => tracks[fi]))
+    if (typeof current === 'number' && !present.has(current)) { current = null; since = -Infinity }
+    const want: SpeakerChoice = busy[s] ? 'split' : raw[s]
+    if (want !== null && want !== current && (current === null || s - since >= holdS)) {
+      pendingFor = want === pending ? pendingFor + 1 : 1
+      pending = want
+      if (current === null || hintedAt(s) || pendingFor >= UNHINTED_SWITCH_S) {
+        current = want
+        since = s
+        pending = null
+        pendingFor = 0
+      }
+    } else if (want !== pending) {
+      pending = null
+      pendingFor = 0
+    }
+    plan.push(current)
+  }
+  // Per frame
+  return frames.map(f => plan[Math.min(seconds - 1, Math.floor((f.frame_index * FRAME_INTERVAL_MS) / 1000))] ?? null)
+}
+
 // ── Layout brain ──────────────────────────────────────────────────────────────
 //
 // Analyses the per-frame detections (4 a second) and produces one or more ClipSegments,
@@ -212,6 +378,9 @@ const median = (v: number[]) => {
 //     picture (the renderer pans between keyframes inside a segment). Shots shorter than
 //     MIN_SHOT_MS join the shot before them.
 //   - Already-vertical source → one full-frame segment
+//   - Speaker tracking (2+ people in the picture): a clear speaker → vertical on them; a quick
+//     back-and-forth → split. A change of speaker is a new segment, so the crop cuts to them.
+//     Frames with one person are framed exactly as without speaker tracking.
 //
 // Keyframe t_ms values are clip-relative (0 = first frame of the clip).
 // render.py subtracts seg.start_ms per segment to get FFmpeg-relative time.
@@ -241,11 +410,52 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
   }
 
   type Layout = 'vertical' | 'split'
+  // What a frame shows: its layout, or vertical on one tracked speaker
+  type Mode = Layout | `speaker:${number}`
   const frameTime = (f: FrameDetection) => f.frame_index * FRAME_INTERVAL_MS
-  const layoutOf = (f: FrameDetection): Layout => ((f.person_count ?? f.faces.length) >= 2 ? 'split' : 'vertical')
+  const layoutOfMode = (m: Mode): Layout => (m === 'split' ? 'split' : 'vertical')
+
+  const frames = [...info.frames].sort((a, b) => a.frame_index - b.frame_index)
+  const tracks = trackFaces(frames, cuts)
+  const trackOf = new Map(frames.map((f, i) => [f, tracks[i]]))
+  const speakers = SPEAKER_TRACKING && frames.some(f => f.faces.some(face => face.lip !== undefined))
+    ? planSpeakers(frames, tracks, analysis.speech, clipDurationMs)
+    : frames.map(() => null)
+  const modeOf = new Map<FrameDetection, Mode>(frames.map((f, i) => {
+    const people = f.person_count ?? f.faces.length
+    const pick = speakers[i]
+    if (people >= 2 && pick === 'split') return [f, 'split']
+    if (people >= 2 && typeof pick === 'number' && tracks[i].includes(pick)) return [f, `speaker:${pick}`]
+    return [f, people >= 2 ? 'split' : 'vertical']
+  }))
+
+  // Where each speaker was last seen, for frames where their face was missed
+  const lastSeen = new Map<number, number>()
+  frames.forEach((f, i) => tracks[i].forEach((id, k) => lastSeen.set(id, f.faces[k].x + f.faces[k].w / 2)))
+  const seenAt = new Map<FrameDetection, Map<number, number>>()
+  {
+    const running = new Map<number, number>()
+    frames.forEach((f, i) => {
+      tracks[i].forEach((id, k) => running.set(id, f.faces[k].x + f.faces[k].w / 2))
+      seenAt.set(f, new Map(running))
+    })
+  }
+
   // Raw subject centre per slot for a frame and layout
   const rawCx = (f: FrameDetection, layout: Layout, slotIdx: number) => {
     if (layout === 'vertical') {
+      const mode = modeOf.get(f)
+      if (mode?.startsWith('speaker:')) {
+        const id = Number(mode.slice(8))
+        const i = trackOf.get(f)!.indexOf(id)
+        if (i >= 0) return f.faces[i].x + f.faces[i].w / 2
+        // The speaker's face was missed here: stay with the face nearest where they were
+        const at = seenAt.get(f)!.get(id) ?? lastSeen.get(id)
+        if (at !== undefined) {
+          const near = [...f.faces].sort((a, b) => Math.abs(a.x + a.w / 2 - at) - Math.abs(b.x + b.w / 2 - at))[0]
+          return near && Math.abs(near.x + near.w / 2 - at) < 0.15 ? near.x + near.w / 2 : at
+        }
+      }
       const best = [...f.faces].sort((a, b) => (b.w * b.h) - (a.w * a.h))[0]
       return best ? best.x + best.w / 2 : 0.5
     }
@@ -255,8 +465,8 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
     return face ? face.x + face.w / 2 : slotIdx === 0 ? 0.3 : 0.7
   }
 
-  const frames = [...info.frames].sort((a, b) => a.frame_index - b.frame_index)
   const minFrames = Math.ceil(MIN_SEGMENT_MS / FRAME_INTERVAL_MS)
+  const minSpeakerFrames = Math.ceil(SPEAKER_HOLD_MS / FRAME_INTERVAL_MS)
 
   // Step 1: shots — frames between camera cuts (a shot under MIN_SHOT_MS joins the one before)
   type Shot = { start_ms: number; frames: FrameDetection[] }
@@ -277,25 +487,28 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
     else merged.push({ start_ms: merged.length ? shot.start_ms : 0, frames: [...shot.frames] })
   }
 
-  // Step 2: within each shot, runs of the same layout; runs under MIN_SEGMENT_MS merge into
-  // their bigger neighbour (in that shot only)
-  type Run = { layout: Layout; start_ms: number; frames: FrameDetection[]; cutStart: boolean }
+  // Step 2: within each shot, runs of the same mode; runs under MIN_SEGMENT_MS (SPEAKER_HOLD_MS
+  // for a speaker) merge into their bigger neighbour (in that shot only)
+  type Run = { mode: Mode; start_ms: number; frames: FrameDetection[]; cutStart: boolean }
+  const shortRun = (r: Run) => r.frames.length < (r.mode.startsWith('speaker:') ? minSpeakerFrames : minFrames)
   const runs: Run[] = []
   for (const shot of merged) {
     const shotRuns: Run[] = []
     for (const f of shot.frames) {
-      const layout = layoutOf(f)
+      const mode = modeOf.get(f)!
       const last = shotRuns[shotRuns.length - 1]
-      if (last && last.layout === layout) last.frames.push(f)
-      else shotRuns.push({ layout, start_ms: shotRuns.length ? frameTime(f) : shot.start_ms, frames: [f], cutStart: shotRuns.length === 0 })
+      if (last && last.mode === mode) last.frames.push(f)
+      else shotRuns.push({ mode, start_ms: shotRuns.length ? frameTime(f) : shot.start_ms, frames: [f], cutStart: shotRuns.length === 0 })
     }
     let changed = true
     while (changed && shotRuns.length > 1) {
       changed = false
       for (let i = 0; i < shotRuns.length; i++) {
-        if (shotRuns[i].frames.length >= minFrames) continue
+        if (!shortRun(shotRuns[i])) continue
         const left = i > 0 ? shotRuns[i - 1].frames.length : -1
         const right = i < shotRuns.length - 1 ? shotRuns[i + 1].frames.length : -1
+        // Absorbed frames take on the neighbour's mode
+        for (const f of shotRuns[i].frames) modeOf.set(f, shotRuns[left >= right ? i - 1 : i + 1].mode)
         if (left >= right) {
           shotRuns[i - 1].frames.push(...shotRuns[i].frames)
         } else {
@@ -308,33 +521,38 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
         break
       }
     }
-    runs.push(...shotRuns)
+    // Neighbours left with the same mode by the merging become one run
+    for (const r of shotRuns) {
+      const last = runs[runs.length - 1]
+      if (last && !r.cutStart && last.mode === r.mode) last.frames.push(...r.frames)
+      else runs.push(r)
+    }
   }
 
-  // Step 3: a run that starts at a cut joins the run before it when the layout is the same and
-  // the crop would barely move — the cut then needs no segment boundary, only a smoothing reset
+  // Step 3: a run joins the run before it when the layout is the same and the crop would barely
+  // move — then a cut needs no segment boundary, only a smoothing reset. Otherwise (another
+  // speaker, another shot) it starts a new segment, so the crop cuts instead of panning.
   const slotCount = (layout: Layout) => (layout === 'split' ? 2 : 1)
   const edgeCx = (run: Run, slot: number, atEnd: boolean) => {
     const edge = atEnd ? run.frames.slice(-DETECT_FPS) : run.frames.slice(0, DETECT_FPS)
-    return median(edge.map(f => rawCx(f, run.layout, slot)))
+    return median(edge.map(f => rawCx(f, layoutOfMode(run.mode), slot)))
   }
   type Group = { layout: Layout; start_ms: number; frames: FrameDetection[]; resets: number[] }
   const groups: Group[] = []
-  for (const run of runs) {
+  runs.forEach((run, ri) => {
     const last = groups[groups.length - 1]
-    const lastRun = runs[runs.indexOf(run) - 1]
-    // Same layout with no cut between them (two runs left side by side by the merge above)
-    // always join; across a cut only when the crop barely moves
-    const join = !!last && last.layout === run.layout && (!run.cutStart
-      || Array.from({ length: slotCount(run.layout) }, (_, s) => s)
-        .every(s => Math.abs(edgeCx(lastRun, s, true) - edgeCx(run, s, false)) < CUT_MOVE))
+    const lastRun = runs[ri - 1]
+    const layout = layoutOfMode(run.mode)
+    const cropClose = () => Array.from({ length: slotCount(layout) }, (_, s) => s)
+      .every(s => Math.abs(edgeCx(lastRun, s, true) - edgeCx(run, s, false)) < CUT_MOVE)
+    const join = !!last && last.layout === layout && ((!run.cutStart && lastRun.mode === run.mode) || cropClose())
     if (join) {
       if (run.cutStart) last.resets.push(last.frames.length)
       last.frames.push(...run.frames)
     } else {
-      groups.push({ layout: run.layout, start_ms: run.start_ms, frames: [...run.frames], resets: [] })
+      groups.push({ layout, start_ms: run.start_ms, frames: [...run.frames], resets: [] })
     }
-  }
+  })
 
   // Step 4: one ClipSegment per group, with keyframes smoothed between cuts
   return groups.map((g, gi) => {
@@ -350,7 +568,7 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
   })
 }
 
-type Word = { word: string; start_ms: number; end_ms: number }
+type Word = { word: string; start_ms: number; end_ms: number; speaker_id?: string | null }
 
 // Gemini picks the clips: the numbered-line, windowed, scored method shared with the app's
 // "Best moments" (src/lib/clipFinder.ts)
@@ -412,7 +630,7 @@ function coversVideo(words: Word[], durationMs: number) {
 async function loadWords(videoId: string): Promise<Word[]> {
   const [row] = await db`SELECT id FROM transcripts WHERE video_id = ${videoId} ORDER BY created_at DESC LIMIT 1`
   if (!row) return []
-  return db<Word[]>`SELECT word, start_ms, end_ms FROM transcript_words WHERE transcript_id = ${row.id} ORDER BY start_ms`
+  return db<Word[]>`SELECT word, start_ms, end_ms, speaker_id FROM transcript_words WHERE transcript_id = ${row.id} ORDER BY start_ms`
 }
 
 /** Waits (up to 10 min) for the full-video captions started at upload, instead of paying for a second transcription */
@@ -500,7 +718,7 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
 
         // Faces 4× a second and camera cuts across the entire clip
         const tDetect = Date.now()
-        const analysis = await analyseClip(tmp, videoPath, highlight.start_ms, highlight.end_ms, size, signal)
+        const analysis = await analyseClip(tmp, videoPath, highlight.start_ms, highlight.end_ms, size, words, signal)
         const detectS = ((Date.now() - tDetect) / 1000).toFixed(1)
 
         // Brain: dynamically switch layout within the clip
