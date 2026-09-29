@@ -758,6 +758,7 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
 
 /**
  * One clip with its formats, crop boxes, keyframes and caption style, in one transaction.
+ * AI clips export with pauses and filler words removed (the user can switch it off).
  * Rows go in as bulk inserts: the database is several hundred ms away, and a round trip per
  * keyframe took minutes per clip.
  */
@@ -767,9 +768,9 @@ async function saveClip(
 ): Promise<string> {
   return db.begin(async tx => {
     const [clipRow] = await tx`
-      INSERT INTO clips (video_id, start_ms, end_ms, status, title, ai_edit_job_id, ai_score, ai_reason)
+      INSERT INTO clips (video_id, start_ms, end_ms, status, title, ai_edit_job_id, ai_score, ai_reason, remove_fillers)
       VALUES (${videoId}, ${highlight.start_ms}, ${highlight.end_ms}, 'rendering', ${highlight.title.slice(0, 120) || 'Highlight'},
-        ${aiEditJobId}, ${highlight.score}, ${highlight.reason || null})
+        ${aiEditJobId}, ${highlight.score}, ${highlight.reason || null}, true)
       RETURNING id
     `
     const clipId = clipRow.id as string

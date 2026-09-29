@@ -9,6 +9,11 @@ import { r2, R2_BUCKET, r2DownloadToFile, r2UploadFile } from '../r2.js'
 import db from '../db.js'
 import type { Job, RenderJobPayload } from '../types.js'
 import { GoogleGenerativeAI } from '@google/generative-ai'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { computeCutRanges, keptRanges, makeTimeMap, removedMs, type Range } from '../lib/cuts.js'
+
+const execFileAsync = promisify(execFile)
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
 
@@ -21,7 +26,7 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
   // The quality the export asked for (it used to be ignored: every render came out 1080p)
   const quality = payload.quality && QUALITY_DIMS[payload.quality] ? payload.quality : '1080p'
 
-  const renderSpec = await buildRenderSpec(clip_id, video_storage_path, quality)
+  const baseSpec = await buildRenderSpec(clip_id, video_storage_path, quality)
   // Other videos shown in the clip are fetched by ID: only ever the clip owner's own videos
   const [owner] = await db`SELECT v.user_id FROM clips c JOIN videos v ON v.id = c.video_id WHERE c.id = ${clip_id}`
   // Sign the source URL so FFmpeg can stream directly from R2 via HTTP range requests.
@@ -36,6 +41,14 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
 
   try {
     const t0 = Date.now()
+    // Remove pauses and filler words: render from a copy of the clip with those parts cut out,
+    // with every time in the spec moved to match. render.py and audio.py need no changes.
+    let videoInput = videoSignedUrl
+    let renderSpec = baseSpec
+    if (baseSpec.remove_fillers) {
+      const cut = await condenseClip(clip_id, baseSpec, videoSignedUrl, tmp, signal)
+      if (cut) { videoInput = cut.path; renderSpec = cut.spec }
+    }
     type SpecSeg = {
       crop_boxes?: Array<{ source_video_id?: string | null; image_path?: string | null }>
       frame?: { items?: Array<{ kind?: string; source_video_id?: string | null; image_path?: string | null }> } | null
@@ -106,7 +119,7 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
     // __dirname is dist/jobs/ at runtime; Python files live in src/python/ (not copied by tsc)
     const pythonScript = join(__dirname, '../../src/python/render.py')
     const pythonArgs = [
-      '--video', videoSignedUrl, '--spec', specPath, '--output', outputPath,
+      '--video', videoInput, '--spec', specPath, '--output', outputPath,
       '--secondary-videos', JSON.stringify(secondaryVideos),
       '--overlay-images', JSON.stringify(overlayImages),
       '--overlay-videos', JSON.stringify(overlayVideos),
@@ -188,6 +201,7 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
     clip_id: clipId,
     start_ms: clip.start_ms,
     end_ms: clip.end_ms,
+    remove_fillers: clip.remove_fillers === true,
     segments, caption_styles: captionStyles, text_overlays: textOverlays,
     audio_tracks: audioTracks, transitions, overlays, words,
     output_width: dims.w, output_height: dims.h,
@@ -250,4 +264,103 @@ ${text}`
     console.warn('[render] caption emphasis failed, rendering without it:', e instanceof Error ? e.message : e)
     return null
   }
+}
+
+// ── Remove pauses and filler words ──────────────────────────────────────────────
+
+type Spec = Awaited<ReturnType<typeof buildRenderSpec>>
+type Row = Record<string, any> // eslint-disable-line @typescript-eslint/no-explicit-any
+
+async function probeSource(url: string, signal?: AbortSignal) {
+  const { stdout } = await execFileAsync('ffprobe', [
+    '-v', 'error', '-show_entries', 'stream=codec_type,r_frame_rate', '-of', 'json', url,
+  ], { signal })
+  const streams = (JSON.parse(stdout).streams ?? []) as Array<{ codec_type: string; r_frame_rate?: string }>
+  const [n, d] = (streams.find(st => st.codec_type === 'video')?.r_frame_rate ?? '30/1').split('/').map(Number)
+  return { fps: n && d ? n / d : 30, hasAudio: streams.some(st => st.codec_type === 'audio') }
+}
+
+/**
+ * Cuts the clip's pauses and filler words (src/lib/cuts.ts, from the transcript), saves the
+ * ranges on the clip, and writes a shortened copy of the clip: the kept parts joined, audio
+ * faded over 15 ms at each join so there are no clicks, encoded like render.py encodes. Kept
+ * parts start and end on video frames, so video, audio and captions stay in step to the end.
+ * Returns null (render as normal) when nothing is cut.
+ */
+async function condenseClip(clipId: string, spec: Spec, videoUrl: string, tmp: string, signal?: AbortSignal) {
+  const start = spec.start_ms as number, end = spec.end_ms as number
+  const cuts = computeCutRanges(spec.words as Row[] as Parameters<typeof computeCutRanges>[0], start, end)
+  await db`UPDATE clips SET cut_ranges = ${db.json(cuts)} WHERE id = ${clipId}`
+  if (!cuts.length) return null
+
+  const { fps, hasAudio } = await probeSource(videoUrl, signal)
+  const frame = 1000 / fps
+  const snap = (t: number) => start + Math.round((t - start) / frame) * frame
+  const kept = keptRanges(cuts, start, end).map(([a, b]): Range => [snap(a), snap(b)]).filter(([a, b]) => b - a >= frame)
+  const t0 = Date.now()
+
+  const fc: string[] = []
+  kept.forEach(([a, b], i) => {
+    const s = ((a - start) / 1000).toFixed(6), e = ((b - start) / 1000).toFixed(6), d = (b - a) / 1000
+    fc.push(`[0:v]trim=start=${s}:end=${e},setpts=PTS-STARTPTS[v${i}]`)
+    if (hasAudio) {
+      fc.push(`[0:a]atrim=start=${s}:end=${e},asetpts=PTS-STARTPTS,`
+        + `afade=t=in:st=0:d=0.015,afade=t=out:st=${Math.max(0, d - 0.015).toFixed(6)}:d=0.015[a${i}]`)
+    }
+  })
+  const pads = kept.map((_, i) => hasAudio ? `[v${i}][a${i}]` : `[v${i}]`).join('')
+  fc.push(`${pads}concat=n=${kept.length}:v=1:a=${hasAudio ? 1 : 0}${hasAudio ? '[v][a]' : '[v]'}`)
+  const out = join(tmp, 'condensed.mp4')
+  await execFileAsync('ffmpeg', [
+    '-y', '-ss', (start / 1000).toFixed(3), '-t', ((end - start) / 1000).toFixed(3), '-i', videoUrl,
+    '-filter_complex', fc.join(';'),
+    '-map', '[v]', ...(hasAudio ? ['-map', '[a]'] : []),
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuv420p',
+    ...(hasAudio ? ['-c:a', 'aac', '-b:a', '192k'] : []), '-movflags', '+faststart', out,
+  ], { signal, maxBuffer: 32 * 1024 * 1024 })
+  console.log(`[render] Removed ${cuts.length} pause/filler cut(s), ${(removedMs(cuts) / 1000).toFixed(1)}s, in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
+  return { path: out, spec: remapSpec(spec, kept) }
+}
+
+/**
+ * The spec on the shortened clip's timeline: it starts at 0, and every clip-relative time
+ * (segments, crop keyframes, text, overlays, frame lane items) and word time moves to where
+ * that moment now plays. Cut words are dropped; anything left with no time is dropped.
+ */
+function remapSpec(spec: Spec, kept: Range[]): Spec {
+  const start = spec.start_ms as number
+  const src = makeTimeMap(kept)                           // source time → new time
+  const rel = (t: number) => Math.round(src(start + Number(t)))  // clip-relative → new time
+  const inKept = (t: number) => kept.some(([a, b]) => t >= a && t < b)
+  const total = kept.reduce((s, [a, b]) => s + (b - a), 0)
+
+  const words = (spec.words as Row[])
+    .filter(w => inKept((w.start_ms + w.end_ms) / 2))
+    .map(w => ({ ...w, start_ms: Math.round(src(w.start_ms)), end_ms: Math.round(src(w.end_ms)) }))
+
+  const segments: Row[] = (spec.segments as Row[]).map((seg): Row => ({
+    ...seg,
+    start_ms: rel(seg.start_ms), end_ms: rel(seg.end_ms),
+    video_offset_ms: seg.video_offset_ms == null ? seg.video_offset_ms : rel(seg.video_offset_ms),
+    frame: seg.frame?.items ? { ...seg.frame, items: (seg.frame.items as Row[]).map(it => ({ ...it, start_ms: rel(it.start_ms), end_ms: rel(it.end_ms) })) } : seg.frame,
+    crop_boxes: (seg.crop_boxes as Row[]).map(b => ({
+      ...b,
+      // Main-video boxes point into the clip; other videos keep their own offsets
+      source_offset_ms: b.source_offset_ms != null && !b.source_video_id && !b.image_path ? rel(b.source_offset_ms) : b.source_offset_ms,
+      box_keyframes: (b.box_keyframes as Row[]).map(k => ({ ...k, t_ms: rel(k.t_ms) })),
+    })),
+  })).filter(seg => seg.end_ms > seg.start_ms)
+  const segIds = new Set(segments.map(seg => seg.id))
+  const timed = (rows: Row[]) => rows.map(r => ({ ...r, start_ms: rel(r.start_ms), end_ms: rel(r.end_ms) })).filter(r => r.end_ms > r.start_ms)
+
+  return {
+    ...spec,
+    start_ms: 0,
+    end_ms: Math.round(total),
+    words,
+    segments,
+    text_overlays: timed(spec.text_overlays as Row[]),
+    overlays: timed(spec.overlays as Row[]),
+    transitions: (spec.transitions as Row[]).filter(t => segIds.has(t.after_segment_id)),
+  } as unknown as Spec
 }

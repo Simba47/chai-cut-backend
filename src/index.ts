@@ -76,6 +76,9 @@ async function runMigrations() {
   // Words the AI marked as important ({ "<word start_ms>": true }), made once per clip at export
   await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS emphasis JSONB`
   await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS emoji BOOLEAN NOT NULL DEFAULT false`
+  // Remove pauses and filler words: the switch per clip, and the source-time ranges it cut
+  await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS remove_fillers BOOLEAN NOT NULL DEFAULT false`
+  await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS cut_ranges JSONB`
   console.log('[startup] migrations ok')
 }
 
