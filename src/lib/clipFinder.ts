@@ -81,18 +81,6 @@ function mmss(ms: number) {
   return `${Math.floor(s / 60).toString().padStart(2, '0')}:${(s % 60).toString().padStart(2, '0')}`
 }
 
-/** True when most letters are Latin, e.g. a Telugu or Hindi transcript written in Roman letters */
-export function isMostlyRoman(lines: TranscriptLine[]) {
-  let latin = 0, other = 0
-  for (const l of lines) {
-    for (const ch of l.text) {
-      if (/[A-Za-z]/.test(ch)) latin++
-      else if (/\p{L}/u.test(ch)) other++
-    }
-  }
-  return latin >= other
-}
-
 // ── Windows ─────────────────────────────────────────────────────────────────────
 
 /** ~10-minute windows of whole lines, each starting ~1 minute before the previous one ends */
@@ -117,8 +105,14 @@ export function makeWindows(lines: TranscriptLine[]): TranscriptLine[][] {
 
 // ── Prompts ─────────────────────────────────────────────────────────────────────
 
-const LANGUAGE_RULES = (mostlyRoman: boolean) => `The transcript can be in Telugu, Hindi, Tamil or another Indian language, often mixed with English. Judge meaning, humour and emotion in the original language; do not translate it in your head first and lose the nuance.
-Write each "title" in the same language and script the speaker uses${mostlyRoman ? ' — this transcript is mostly in Roman letters, so write titles in Roman letters' : ''}. Write "summary" and "reason" in simple English. Keep all JSON keys in English.`
+/**
+ * Titles and other text for the user are always in Roman letters: the speaker's own language as
+ * people type it (Tenglish, Hinglish, Tanglish…), never Telugu, Devanagari or other scripts.
+ */
+export const ROMAN_RULE = `Write the text in Roman (English) letters, in the speaker's own language the way people type it in chats: Telugu as Tenglish (e.g. "Ee cinema ki audience pichi ekkaru!"), Hindi as Hinglish (e.g. "Yeh scene dekh ke sab hil gaye!"), Tamil as Tanglish, and so on; keep English words as they are, and if the speaker talks in English write English. Never use Telugu, Devanagari, Tamil or any other non-Latin script.`
+
+const LANGUAGE_RULES = `The transcript can be in Telugu, Hindi, Tamil or another Indian language, often mixed with English. Judge meaning, humour and emotion in the original language; do not translate it in your head first and lose the nuance.
+${ROMAN_RULE.replace('the text', 'each "title"')} Write "summary" and "reason" in simple English. Keep all JSON keys in English.`
 
 const SCORING_RULES = `Score every clip with five whole numbers from 0 to 10:
 - "hook": do the first 3 seconds grab attention on their own?
@@ -132,7 +126,7 @@ const LINE_RULES = `Each transcript line is written as "L<number> [mm:ss] text".
 
 const ITEM_SHAPE = `{"start_line":number,"end_line":number,"title":"catchy 3-7 word title","summary":"one sentence","reason":"why it works, max 15 words","hook":0-10,"emotion":0-10,"story":0-10,"value":0-10,"clarity":0-10}`
 
-export function buildPrompt(mode: FinderMode, window: TranscriptLine[], durationMs: number, mostlyRoman: boolean, perWindow = BEST_PER_WINDOW) {
+export function buildPrompt(mode: FinderMode, window: TranscriptLine[], durationMs: number, perWindow = BEST_PER_WINDOW) {
   const transcript = window.map(l => `L${l.index} [${mmss(l.start_ms)}] ${l.text}`).join('\n')
   const part = `Video duration: ${mmss(durationMs)}. This part covers ${mmss(window[0].start_ms)}–${mmss(window[window.length - 1].end_ms)}.`
 
@@ -143,7 +137,7 @@ ${LINE_RULES}
 
 ${SCORING_RULES}
 
-${LANGUAGE_RULES(mostlyRoman)}
+${LANGUAGE_RULES}
 
 Return ONLY a JSON array, no other text. Each element: ${ITEM_SHAPE}`
     return { system, user: `${part}\n\nTranscript:\n${transcript}` }
@@ -159,7 +153,7 @@ ${LINE_RULES} Do not stop at the line that merely contains the key moment — in
 
 ${SCORING_RULES}
 
-${LANGUAGE_RULES(mostlyRoman)} In "summary", say why this moment matches the request.
+${LANGUAGE_RULES} In "summary", say why this moment matches the request.
 
 Return ONLY a JSON array, no other text. Each element: ${ITEM_SHAPE}`
   return { system, user: `What to look for: ${mode.criteria}\n\n${part}\n\nTranscript:\n${transcript}` }
@@ -287,12 +281,11 @@ export async function findClips(opts: {
   const lines = buildLines(opts.words)
   const windows = makeWindows(lines)
   if (windows.length === 0) return []
-  const mostlyRoman = isMostlyRoman(lines)
 
   let failures = 0
   const perWindow = await mapLimit(windows, MAX_PARALLEL, async (window, i) => {
     try {
-      const { system, user } = buildPrompt(opts.mode, window, opts.durationMs, mostlyRoman, opts.perWindow)
+      const { system, user } = buildPrompt(opts.mode, window, opts.durationMs, opts.perWindow)
       return parseCandidates(await opts.ask(system, user), window, lines, i)
     } catch (e) {
       failures++

@@ -8,6 +8,9 @@
  */
 import { GoogleGenerativeAI } from '@google/generative-ai'
 
+// The same rule as clipFinder.ts ROMAN_RULE: text in Roman letters (Tenglish, Hinglish…)
+const ROMAN_RULE = `Write the text in Roman (English) letters, in the speaker's own language the way people type it in chats: Telugu as Tenglish (e.g. "Ee cinema ki audience pichi ekkaru!"), Hindi as Hinglish (e.g. "Yeh scene dekh ke sab hil gaye!"), Tamil as Tanglish, and so on; keep English words as they are, and if the speaker talks in English write English. Never use Telugu, Devanagari, Tamil or any other non-Latin script.`
+
 export interface ClipText { hook: string; title: string; post_caption: string; hashtags: string[] }
 type TextWord = { word: string; word_roman?: string | null; start_ms: number; end_ms: number }
 
@@ -42,8 +45,6 @@ const clean = (v: unknown, max: number) => (typeof v === 'string' ? v.replace(/\
 /** Hook, title, post caption and hashtags for a clip; throws if Gemini fails or answers badly */
 export async function generateClipText(words: TextWord[], videoTitle: string | null, apiKey: string): Promise<ClipText> {
   if (!words.length) throw new Error('This clip has no transcript yet')
-  const latin = words.map(w => w.word).join('').replace(/[^\p{L}]/gu, '')
-  const mostlyRoman = [...latin].filter(ch => /[A-Za-z]/.test(ch)).length >= latin.length / 2
 
   const prompt = `You write the text that goes with a short vertical video clip (Reels / Shorts) for an Indian creator. The speech can be Telugu, Hindi, Tamil or another Indian language, often mixed with English. Judge meaning in the original language.
 
@@ -52,9 +53,10 @@ ${clipLines(words)}
 
 Return ONLY JSON, keys in English:
 {"hook": "...", "title": "...", "post_caption": "...", "hashtags": ["...", ...]}
-- hook: 3-7 words shown over the first 3 seconds that make someone stop scrolling. In the same language and script the speaker uses${mostlyRoman ? ' (this transcript is mostly Roman letters, so use Roman letters)' : ''}. No clickbait lies: it must match what is actually said. No emoji, no hashtags.
-- title: at most 60 characters, same language and script as the hook.
-- post_caption: 1-2 sentences for the post, same language as the speaker (Roman letters are fine for mixed speech).
+${ROMAN_RULE} This applies to the hook, title and post caption.
+- hook: 3-7 words shown over the first 3 seconds that make someone stop scrolling. No clickbait lies: it must match what is actually said. No emoji, no hashtags.
+- title: at most 60 characters.
+- post_caption: 1-2 sentences for the post.
 - hashtags: exactly 5, no # sign needed, no spaces inside a tag, a mix of language-specific and English tags.`
 
   const model = new GoogleGenerativeAI(apiKey).getGenerativeModel({ model: 'gemini-2.5-flash' })
