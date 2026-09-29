@@ -10,6 +10,8 @@ import type { Job, AiEditJobPayload } from '../types.js'
 import { handleTranscribeJob } from './transcribe.js'
 import { findClips, type FoundClip } from '../lib/clipFinder.js'
 import { generateClipText, fontForText, type ClipText } from '../lib/clipText.js'
+import { brollEnabled, pickBrollMoments, searchPexels, downloadStock, withBroll } from '../lib/broll.js'
+import { r2UploadFile } from '../r2.js'
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
 
@@ -22,7 +24,7 @@ interface CropBox { x: number; y: number; w: number; h: number; score?: number; 
 interface FrameDetection { frame_index: number; person_count: number; faces: CropBox[] }
 interface FaceInfo { face_count: number; face_boxes: CropBox[]; frames: FrameDetection[] }
 interface SlotKf { t_ms: number; x: number; y: number; w: number; h: number }
-interface ClipSegment { start_ms: number; end_ms: number; layout: 'vertical' | 'split'; slotKfs: SlotKf[][] }
+interface ClipSegment { start_ms: number; end_ms: number; layout: 'vertical' | 'split'; slotKfs: SlotKf[][]; broll?: string }
 /** What the framing needs to know about a clip */
 export interface ClipAnalysis {
   info: FaceInfo
@@ -658,6 +660,8 @@ async function setProgress(aiEditJobId: string, progress: number) {
 export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
   const payload = job.payload as unknown as AiEditJobPayload
   const { ai_edit_job_id, video_id, clip_count } = payload
+  const addBroll = payload.add_broll === true && brollEnabled()
+  if (payload.add_broll && !addBroll) console.log('[ai_edit] B-roll asked for but AUTO_BROLL is off or PEXELS_API_KEY is missing: skipping it')
   const t0 = Date.now()
 
   await db`UPDATE ai_edit_jobs SET status = 'running', progress = 5 WHERE id = ${ai_edit_job_id}`
@@ -665,7 +669,7 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
   try {
     // 1. Get video info (and the owner's plan, for the export watermark)
     const [video] = await db`
-      SELECT v.id, v.storage_path, v.duration_ms, v.title, u.plan
+      SELECT v.id, v.user_id, v.storage_path, v.duration_ms, v.title, u.plan
       FROM videos v LEFT JOIN users u ON u.id = v.user_id
       WHERE v.id = ${video_id}
     `
@@ -675,9 +679,15 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
 
     // 2. Ensure a whole-video transcript — transcribe inline if there isn't one.
     //    Always from storage (R2), never yt-dlp, so this also runs on Railway.
-    await waitForFullTranscription(video_id, signal)
+    // A complete transcript is used as it is; only a missing or partial one waits for the
+    // upload's full-video captions (if they are running) before transcribing here
     let words = await loadWords(video_id)
-    const knownDurationMs = video.duration_ms ?? (words.length ? words[words.length - 1].end_ms : 0)
+    const durationFor = (w: Word[]) => video.duration_ms ?? (w.length ? w[w.length - 1].end_ms : 0)
+    if (!coversVideo(words, durationFor(words))) {
+      await waitForFullTranscription(video_id, signal)
+      words = await loadWords(video_id)
+    }
+    const knownDurationMs = durationFor(words)
     if (!coversVideo(words, knownDurationMs)) {
       console.log(`[ai_edit] Transcript for ${video_id} missing or partial (${words.length} words) — transcribing now`)
       await handleTranscribeJob({
@@ -735,7 +745,8 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
         const detectS = ((Date.now() - tDetect) / 1000).toFixed(1)
 
         // Brain: dynamically switch layout within the clip
-        const segments = buildSegments(analysis, clipDurationMs)
+        let segments: ClipSegment[] = buildSegments(analysis, clipDurationMs)
+        if (addBroll) segments = await addStockBroll(segments, words, highlight, video.user_id, tmp)
         const clipWords = words.filter(w => w.start_ms >= highlight.start_ms && w.start_ms < highlight.end_ms)
         const caption = captionFontFor(clipWords)
 
@@ -767,6 +778,52 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
     await db`UPDATE ai_edit_jobs SET status = 'failed', error = ${msg} WHERE id = ${ai_edit_job_id}`
     throw err
   }
+}
+
+/**
+ * Stock shots over the clip where a picture helps (src/lib/broll.ts). Any failure (no result,
+ * Pexels down, a bad file) just means fewer or no shots; the clip is still made.
+ */
+async function addStockBroll(segments: ClipSegment[], words: Word[], highlight: FoundClip, userId: string, tmp: string): Promise<ClipSegment[]> {
+  try {
+    const moments = await pickBrollMoments(words, highlight.start_ms, highlight.end_ms, process.env.GEMINI_API_KEY!)
+    const shots: Array<{ start_ms: number; end_ms: number; videoId: string }> = []
+    for (const m of moments) {
+      try {
+        const stock = await searchPexels(m.query)
+        if (!stock) { console.log(`[ai_edit] B-roll: nothing on Pexels for "${m.query}"`); continue }
+        const videoId = await stockAsset(userId, stock.pexelsId, stock.url, m.query, tmp)
+        if (videoId) shots.push({ start_ms: m.start_ms, end_ms: m.end_ms, videoId })
+        console.log(`[ai_edit] B-roll "${m.query}" at ${(m.start_ms / 1000).toFixed(1)}s: pexels ${stock.pexelsId} (${stock.width}x${stock.height})`)
+      } catch (e) {
+        console.warn(`[ai_edit] B-roll "${m.query}" skipped:`, e instanceof Error ? e.message : e)
+      }
+    }
+    return withBroll(segments, shots)
+  } catch (e) {
+    console.warn('[ai_edit] B-roll skipped:', e instanceof Error ? e.message : e)
+    return segments
+  }
+}
+
+/** The user's copy of a Pexels video (an 'asset' video, so the render job may use it), made once */
+async function stockAsset(userId: string, pexelsId: number, url: string, query: string, tmp: string): Promise<string | null> {
+  const ref = `pexels:${pexelsId}`
+  const [existing] = await db`SELECT id FROM videos WHERE user_id = ${userId} AND stock_ref = ${ref} AND storage_path IS NOT NULL LIMIT 1`
+  if (existing) return existing.id as string
+  const path = await downloadStock(url, tmp, pexelsId)
+  const size = await probeSize(path)
+  if (!size) throw new Error('not a readable video')
+  const { stdout } = await execFileAsync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', path])
+  const durationMs = Math.round(parseFloat(stdout) * 1000) || null
+  const storagePath = `raw/${userId}/stock-pexels-${pexelsId}.mp4`
+  await r2UploadFile(storagePath, path, 'video/mp4')
+  const [row] = await db`
+    INSERT INTO videos (user_id, source_type, storage_path, status, duration_ms, title, role, stock_ref)
+    VALUES (${userId}, 'upload', ${storagePath}, 'ready', ${durationMs}, ${`Pexels: ${query}`.slice(0, 120)}, 'asset', ${ref})
+    RETURNING id
+  `
+  return row.id as string
 }
 
 /**
@@ -810,8 +867,11 @@ async function saveClip(
 
     // source_offset_ms is where in the clip this segment's video starts: render.py trims
     // the main video from it, so 0 made every later segment replay the clip's start
+    // A stock shot plays its video from the start, muted (the speaker keeps talking under it)
     const boxInputs = segments.flatMap((seg, si) => seg.slotKfs.map((kfs, slotIdx) => ({
-      row: { segment_id: segIdByOrder.get(si)!, slot_index: slotIdx, source_video_id: null, source_offset_ms: seg.start_ms },
+      row: seg.broll
+        ? { segment_id: segIdByOrder.get(si)!, slot_index: slotIdx, source_video_id: seg.broll, source_offset_ms: 0, muted: true }
+        : { segment_id: segIdByOrder.get(si)!, slot_index: slotIdx, source_video_id: null, source_offset_ms: seg.start_ms, muted: false },
       kfs,
     })))
     const boxRows = await tx`INSERT INTO crop_boxes ${tx(boxInputs.map(b => b.row))} RETURNING id, segment_id, slot_index`

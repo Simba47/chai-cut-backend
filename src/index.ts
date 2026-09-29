@@ -83,6 +83,8 @@ async function runMigrations() {
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS hook_text TEXT`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS post_caption TEXT`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS hashtags TEXT[]`
+  // Stock videos saved as the user's assets for auto B-roll ("pexels:<id>"), reused when picked again
+  await db`ALTER TABLE videos ADD COLUMN IF NOT EXISTS stock_ref TEXT`
   console.log('[startup] migrations ok')
 }
 

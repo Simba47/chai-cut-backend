@@ -183,7 +183,11 @@ def build_segment_audio_args(
             continue
         box = (seg.get("crop_boxes") or [{}])[0]
         vid_id = box.get("source_video_id") if box else None
-        if vid_id and vid_id in secondary_videos:
+        if vid_id and box.get("muted"):
+            # A muted B-roll shot is a cutaway: the speaker keeps talking under it (the main
+            # video's sound at this point of the clip), and the shot's own sound is not used
+            plans.append([(None, int(seg["start_ms"]) / 1000.0, 1.0, 0.0, seg_dur)])
+        elif vid_id and vid_id in secondary_videos:
             plans.append([(vid_id, int(box.get("source_offset_ms") or 0) / 1000.0, 1.0, 0.0, seg_dur)])
         else:
             _cb_off = box.get("source_offset_ms") if box else None
