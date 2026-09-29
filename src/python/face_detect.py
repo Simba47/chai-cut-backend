@@ -143,16 +143,26 @@ def _motion_center(prev_gray, curr_gray, w_px, h_px, threshold=18):
     return float(xs.mean()) / w_px
 
 
-STATIC_DIFF = 3.0       # mean grey-level change per frame below which a face is a picture, not a person
+STATIC_RATIO = 0.85     # a face changing less than this × its surroundings is a picture, not a person
 STATIC_MIN_FRAMES = 8   # judged only on faces seen for at least this many frames (2 s at 4 fps)
 
 
-def _box_diff(prev_gray, gray, b):
-    """Mean grey-level change inside a box since the previous frame"""
+def _change_ratio(prev_gray, gray, b, margin=0.6):
+    """
+    How much a face box changed since the previous frame, relative to the ring of picture around
+    it. A live face (blinking, talking, breathing) changes more than the wall behind it, even on
+    a very still video call; a poster or photo changes no more than its surroundings, even when
+    someone's arm moves in front of it.
+    """
     h, w = gray.shape[:2]
     x0, y0 = int(b["x"] * w), int(b["y"] * h)
     x1, y1 = max(x0 + 1, int((b["x"] + b["w"]) * w)), max(y0 + 1, int((b["y"] + b["h"]) * h))
-    return float(np.abs(gray[y0:y1, x0:x1].astype(np.int16) - prev_gray[y0:y1, x0:x1].astype(np.int16)).mean())
+    mx, my = int(b["w"] * w * margin), int(b["h"] * h * margin)
+    X0, Y0, X1, Y1 = max(0, x0 - mx), max(0, y0 - my), min(w, x1 + mx), min(h, y1 + my)
+    d = np.abs(gray[Y0:Y1, X0:X1].astype(np.int16) - prev_gray[Y0:Y1, X0:X1].astype(np.int16)).astype(np.float32)
+    inner = d[y0 - Y0:y1 - Y0, x0 - X0:x1 - X0]
+    ring = (d.sum() - inner.sum()) / max(1, d.size - inner.size)
+    return float(inner.mean() / (ring + 0.05))
 
 
 def track_faces(frames: list[list[dict]], iou=0.3, resets: set[int] | None = None) -> list[list[int]]:
@@ -234,7 +244,7 @@ def detect_subjects(frames_dir: str) -> dict:
 
         same_shot = prev_gray is not None and prev_gray.shape == gray.shape
         for s in subjects:
-            s["diff"] = _box_diff(prev_gray, gray, s) if same_shot else None
+            s["change"] = _change_ratio(prev_gray, gray, s) if same_shot else None
         # Frame-differencing against the PREVIOUS frame finds WHERE motion is happening right
         # now (scene-change safe: no global background model). A talking / moving person
         # registers as motion; a static backdrop does not.
@@ -245,15 +255,13 @@ def detect_subjects(frames_dir: str) -> dict:
 
     # ── Pass 2: drop faces that never change — posters, photos, paused screens ─────────────
     track_ids = track_faces(raw)
-    diffs: dict[int, list[float]] = {}
+    changes: dict[int, list[float]] = {}
     for faces, ids in zip(raw, track_ids):
         for f, tid in zip(faces, ids):
-            if f["diff"] is not None:
-                diffs.setdefault(tid, []).append(f["diff"])
-    # The quietest quarter of frames decides: a hand or arm passing in front of a poster
-    # makes it change for a while, but a live face is never still for that long
-    static = {tid for tid, d in diffs.items()
-              if len(d) >= STATIC_MIN_FRAMES and float(np.percentile(d, 25)) < STATIC_DIFF}
+            if f["change"] is not None:
+                changes.setdefault(tid, []).append(f["change"])
+    static = {tid for tid, d in changes.items()
+              if len(d) >= STATIC_MIN_FRAMES and float(np.median(d)) < STATIC_RATIO}
 
     # ── Pass 3: per-frame people, with the layout filters ────────────────────────────────
     per_frame = []
