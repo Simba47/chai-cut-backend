@@ -68,7 +68,7 @@ async function runMigrations() {
   // Animated caption presets (render.py _preset_events, editor drawPresetCaptions)
   await db`ALTER TABLE caption_styles DROP CONSTRAINT IF EXISTS caption_styles_animation_check`
   await db`ALTER TABLE caption_styles ADD CONSTRAINT caption_styles_animation_check
-    CHECK (animation IN ('karaoke','fade','none','pop','highlight','bounce','word'))`
+    CHECK (animation IN ('karaoke','fade','none','pop','highlight','bounce','word','hormozi','box','glow'))`
   await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS highlight_color TEXT DEFAULT '#FFE700'`
   await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS words_per_line INTEGER`
   await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS uppercase BOOLEAN NOT NULL DEFAULT false`

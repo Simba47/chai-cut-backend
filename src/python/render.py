@@ -186,20 +186,41 @@ def _write_ass(
             f.write("\n".join(lines) + "\n")
         return
 
+    # Karaoke: the spoken word in the highlight colour, lit until the next word starts (the
+    # editor's drawCaptions does the same)
+    karaoke = (style.get("animation") or "karaoke") == "karaoke"
+    rest_c = _ass_color(color_hex)
+    live_c = _ass_color(_karaoke_live(color_hex, style.get("highlight_color") or "#FFE700"))
+
     sentences = [s for s in _group_sentences(clip_words) if s]
     for i, (sentence, (start_ms, end_ms)) in enumerate(zip(sentences, _line_times(sentences))):
         if end_ms <= start_ms:
             continue
-        text     = " ".join(_word_display(w, roman) for w in sentence if _word_display(w, roman))
+        shown = [(w, _word_display(w, roman)) for w in sentence]
+        shown = [(w, t) for w, t in shown if t]
+        text     = " ".join(t for _, t in shown)
         if not text.strip():
             continue
         # Alignment=5 (center of screen); \pos pins the anchor to exact coordinates. Where a
         # frame shows captions in its text band, that part of the line is centred in the band.
         for a, b, y in _split_by_zones(start_ms, end_ms, band_zones or [], pos_y):
             tag = f"{{\\pos({pos_x},{y})}}"
+            body = text
+            if karaoke:
+                runs = []
+                for j, (w, t) in enumerate(shown):
+                    on = w["start_ms"] - a
+                    off = (shown[j + 1][0]["start_ms"] if j + 1 < len(shown) else end_ms) - a
+                    tags = f"\\1c{live_c if on <= 0 < off else rest_c}"
+                    if on > 0:
+                        tags += f"\\t({on},{on + 1},\\1c{live_c})"
+                    if 0 < off < b - a:
+                        tags += f"\\t({off},{off + 1},\\1c{rest_c})"
+                    runs.append(f"{{{tags}}}{t}")
+                body = " ".join(runs)
             lines.append(
                 f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},"
-                f"Default,,0,0,0,,{tag}{text}"
+                f"Default,,0,0,0,,{tag}{body}"
             )
 
     with open(path, "w", encoding="utf-8") as f:
@@ -251,15 +272,30 @@ def _line_times(sentences: list[list[dict]]) -> list[tuple[int, int]]:
 #   highlight — 3 words a line; a highlight_color box behind the spoken word
 #   bounce    — the line slides up into place and fades in; the spoken word in highlight_color
 #   word      — one big word at a time, centre screen
+#   hormozi   — 3 capitalised words a line, thick outline; the spoken word in highlight_color, 115%
+#   box       — the line on a dark box, no outline; the spoken word in highlight_color
+#   glow      — words glow in highlight_color; the spoken word bright, the others dimmed
 # Emphasised words (caption_styles.emphasis, keyed by the word's start_ms in the video) are drawn
 # in highlight_color and 15% larger.
 
-_PRESETS = {"pop", "highlight", "bounce", "word"}
+_PRESETS = {"pop", "highlight", "bounce", "word", "hormozi", "box", "glow"}
 _POP_MS = 150
 _BOUNCE_MS = 180
 _BOX_PAD = 14          # highlight box padding (px at 1080 wide)
 _WORD_SCALE = 150      # 'word' preset: % of the caption size
 _EMPHASIS_SCALE = 115
+_HORMOZI_SCALE = 115   # the spoken word
+_HORMOZI_STROKE = 2    # added to the outline
+_LINE_BOX = "&H60000000"   # box preset: black, ~62% opaque
+_GLOW_BLUR = 6
+_GLOW_DIM = "&H59&"        # the words not being spoken (~65% opaque)
+
+
+def _karaoke_live(color: str, hl: str) -> str:
+    """The karaoke colour of the spoken word: the highlight colour, unless it is the text's own"""
+    if hl.lower() != color.lower():
+        return hl
+    return "#FFE700" if color.lower() == "#ffffff" else "#FFFFFF"
 
 
 def _ass_color(hex_color: str) -> str:
@@ -291,6 +327,9 @@ def _preset_styles(style: dict, font_name: str, font_size: int) -> list[str]:
         # Opaque box (BorderStyle 3) in the highlight colour; its text is never drawn
         f"Style: PresetBox,{font_name},{font_size},&HFF000000,&H00FFFFFF,{hl},&H00000000,"
         f"1,0,0,0,100,100,0,0,3,{_BOX_PAD},0,5,10,10,10,1",
+        # box preset: one dark box round the whole line; its text is never drawn
+        f"Style: PresetLine,{font_name},{font_size},&HFF000000,&H00FFFFFF,{_LINE_BOX},&H00000000,"
+        f"1,0,0,0,100,100,0,0,3,{_BOX_PAD},0,5,10,10,10,1",
     ]
 
 
@@ -301,7 +340,7 @@ def _esc(text: str) -> str:
 def _preset_events(words: list[dict], style: dict, out_w: int, out_h: int, zones: list[tuple[int, int, int]]) -> list[str]:
     anim = style["animation"]
     roman = style.get("language") == "roman"
-    upper = bool(style.get("uppercase"))
+    upper = bool(style.get("uppercase")) or anim == "hormozi"
     color = style.get("color") or "#ffffff"
     hl = style.get("highlight_color") or "#FFE700"
     emphasis = style.get("emphasis") or {}
@@ -311,7 +350,11 @@ def _preset_events(words: list[dict], style: dict, out_w: int, out_h: int, zones
         except ValueError:
             emphasis = {}
     stroke = int(style.get("stroke_width") if style.get("stroke_width") is not None else 4)
-    per_line = 1 if anim == "word" else int(style.get("words_per_line") or (3 if anim == "highlight" else _MAX_PHRASE_WORDS))
+    if anim == "hormozi":
+        stroke += _HORMOZI_STROKE
+    if anim == "box":
+        stroke = 0
+    per_line = 1 if anim == "word" else int(style.get("words_per_line") or (3 if anim in ("highlight", "hormozi") else _MAX_PHRASE_WORDS))
     pos_y_frac = style.get("position_y")
     pos_y = int(float(pos_y_frac if pos_y_frac is not None else (0.5 if anim == "word" else 0.84)) * out_h)
     pos_x = out_w // 2
@@ -345,7 +388,25 @@ def _preset_events(words: list[dict], style: dict, out_w: int, out_h: int, zones
                         tags = (f"\\alpha&HFF&\\fscx{lo}\\fscy{lo}\\t({on},{on + 1},\\alpha&H00&)"
                                 f"\\t({on},{on + _POP_MS // 2},\\fscx{hi}\\fscy{hi})"
                                 f"\\t({on + _POP_MS // 2},{on + _POP_MS},\\fscx{sc}\\fscy{sc})")
-                if anim == "word":
+                if anim == "hormozi":
+                    big = round(sc * _HORMOZI_SCALE / 100)
+                    if spoken:
+                        tags = f"\\fscx{big}\\fscy{big}"
+                    if on > 0:
+                        tags += f"\\t({on},{on + 1},\\fscx{big}\\fscy{big})"
+                    if 0 < off < b - a:
+                        tags += f"\\t({off},{off + 1},\\fscx{sc}\\fscy{sc})"
+                if anim == "box":
+                    tags += "\\bord0\\shad0"
+                if anim == "glow":
+                    # Text in the caption colour with a soft outline in the highlight colour
+                    dim = "&H00&" if spoken else _GLOW_DIM
+                    tags += f"\\1c{rest}\\3c{_ass_color(hl)}\\bord3\\shad0\\blur{_GLOW_BLUR}\\alpha{dim}"
+                    if on > 0:
+                        tags += f"\\t({on},{on + 1},\\alpha&H00&)"
+                    if 0 < off < b - a:
+                        tags += f"\\t({off},{off + 1},\\alpha{_GLOW_DIM})"
+                elif anim == "word":
                     tags += f"\\1c{rest}"
                 else:
                     tags += f"\\1c{live if spoken else rest}"
@@ -372,6 +433,9 @@ def _preset_events(words: list[dict], style: dict, out_w: int, out_h: int, zones
                 head = f"{{\\move({pos_x},{y + dy},{pos_x},{y},0,{_BOUNCE_MS})\\fad(80,0)}}"
             else:
                 head = f"{{\\pos({pos_x},{y})}}"
+            if anim == "box":
+                plain = " ".join(_esc(t) for _, t in shown)
+                events.append(f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},PresetLine,,0,0,0,,{head}{plain}")
             if box_runs:
                 events.append(f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},PresetBox,,0,0,0,,{head}{' '.join(box_runs)}")
             events.append(f"Dialogue: 1,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},Preset,,0,0,0,,{head}{' '.join(text_runs)}")

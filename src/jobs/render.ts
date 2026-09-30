@@ -229,7 +229,7 @@ function runPython(script: string, args: string[], signal?: AbortSignal): Promis
   })
 }
 
-const PRESETS = new Set(['pop', 'highlight', 'bounce', 'word'])
+const PRESETS = new Set(['pop', 'highlight', 'bounce', 'word', 'hormozi', 'box', 'glow'])
 
 /**
  * The 1–2 most important words in each caption line, as { "<word start_ms>": true } (the key
