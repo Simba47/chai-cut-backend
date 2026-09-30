@@ -16,7 +16,7 @@ RUN curl -fL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmp
     && mv /tmp/ffmpeg-n9.0-latest-linux64-gpl-9.0/bin/ffmpeg /tmp/ffmpeg-n9.0-latest-linux64-gpl-9.0/bin/ffprobe /usr/local/bin/ \
     && rm -rf /tmp/ffmpeg* \
     && ffmpeg -hide_banner -version | head -1 \
-    && for f in subtitles drawtext movie zoompan; do \
+    && for f in subtitles drawtext movie zoompan sendcmd; do \
          ffmpeg -hide_banner -filters | grep -q " $f " || { echo "ffmpeg build is missing the $f filter"; exit 1; }; \
        done
 

@@ -338,7 +338,7 @@ def _frame_text_chain(text: str, bg: str, color: str, size_1080: int, w: int, h:
 
 # ── FFmpeg crop expression builder ────────────────────────────────────────────
 
-_MAX_KF_PER_ATTR = 20  # FFmpeg expression depth limit — lower = faster eval
+_MAX_KF_PER_ATTR = 400  # points per crop after simplification (a balanced if() tree: ~9 levels)
 
 
 def _rdp_simplify(kfs: list[dict], tol: float = 0.005) -> list[dict]:
@@ -372,90 +372,121 @@ def _rdp_simplify(kfs: list[dict], tol: float = 0.005) -> list[dict]:
     right = _rdp_simplify(kfs[max_i:], tol)
     return left[:-1] + right
 
-def _step_expr(kf_list: list[dict], attr: str, seg_start_ms: int) -> str:
-    """Step-interpolated crop coordinate (holds value until next keyframe fires)."""
-    dim = "iw" if attr in ("x", "w") else "ih"
-    defaults = {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
-
-    if not kf_list:
-        return f"{dim}*{defaults[attr]:.6f}"
-
-    sk = _rdp_simplify(sorted(kf_list, key=lambda k: k["t_ms"]))
-
-    deduped: list[dict] = [sk[0]]
-    for kf in sk[1:]:
-        if abs(kf[attr] - deduped[-1][attr]) > 1e-6:
-            deduped.append(kf)
-    sk = deduped
-
-    if len(sk) > _MAX_KF_PER_ATTR:
-        step = (len(sk) - 1) / (_MAX_KF_PER_ATTR - 1)
-        sk = [sk[round(i * step)] for i in range(_MAX_KF_PER_ATTR)]
-
-    if len(sk) == 1:
-        return f"{dim}*{sk[0][attr]:.6f}"
-
-    result = f"{dim}*{sk[-1][attr]:.6f}"
-    for i in range(len(sk) - 2, -1, -1):
-        t_switch = (sk[i + 1]["t_ms"] - seg_start_ms) / 1000.0
-        result = f"if(lt(t,{t_switch:.3f}),{dim}*{sk[i][attr]:.6f},{result})"
-
-    return result
+_ZOOM_STEP_S = 0.1  # a zoom that glides is re-sent this often (10 steps a second)
+_MAX_ZOOM_CMDS = 1500
+_crop_seq = 0       # unique crop@name per filter so sendcmd hits the right one
 
 
-def _linear_expr(kf_list: list[dict], attr: str, seg_start_ms: int) -> str:
+def _view_points(kf_list: list[dict], seg_start_ms: int) -> list[dict]:
     """
-    Linear-interpolated crop coordinate — smoothly pans between keyframes.
-    Used for motion-tracked crops so the crop follows the subject continuously
-    instead of jumping every N seconds.
+    Keyframes as the editor preview plays them: straight lines between keyframes, so a
+    "cut" (a hold keyframe 1ms before the change) switches views instantly and Motion
+    glides. Nothing is dropped by value — a hold carries the previous value on purpose.
+    """
+    pts = [
+        {"t": (k["t_ms"] - seg_start_ms) / 1000.0, "x": k["x"], "y": k["y"], "w": k["w"], "h": k["h"]}
+        for k in sorted(kf_list, key=lambda k: k["t_ms"])
+    ]
+    # Recorded Motion can hold thousands of points; thin only what a straight line already
+    # describes (RDP keeps cuts: the hold sits far off the line to the next view)
+    tol = 0.002
+    simplified = _rdp_simplify([{**p, "t_ms": p["t"]} for p in pts], tol)
+    while len(simplified) > _MAX_KF_PER_ATTR:
+        tol *= 2
+        simplified = _rdp_simplify([{**p, "t_ms": p["t"]} for p in pts], tol)
+    return simplified
+
+
+def _value_at(pts: list[dict], attr: str, t: float) -> float:
+    if t <= pts[0]["t"]:
+        return pts[0][attr]
+    for a, b in zip(pts, pts[1:]):
+        if t < b["t"]:
+            span = b["t"] - a["t"]
+            return a[attr] if span <= 0 else a[attr] + (b[attr] - a[attr]) * (t - a["t"]) / span
+    return pts[-1][attr]
+
+
+def _piecewise_expr(pts: list[dict], attr: str) -> str:
+    """
+    Per-frame expression for one attribute: a balanced if() tree over the keyframe
+    intervals (depth log2(n), so hundreds of view changes stay cheap to evaluate).
     """
     dim = "iw" if attr in ("x", "w") else "ih"
-    defaults = {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+    if len(pts) == 1 or all(abs(p[attr] - pts[0][attr]) < 1e-6 for p in pts):
+        return f"{dim}*{pts[0][attr]:.6f}"
 
-    if not kf_list:
-        return f"{dim}*{defaults[attr]:.6f}"
+    def span(i: int) -> str:
+        a, b = pts[i], pts[i + 1]
+        if abs(b[attr] - a[attr]) < 1e-6:
+            return f"{dim}*{a[attr]:.6f}"
+        dt = max(b["t"] - a["t"], 0.0005)
+        return f"{dim}*({a[attr]:.6f}+({b[attr] - a[attr]:.6f})*clip((t-{a['t']:.4f})/{dt:.4f},0,1))"
 
-    sk = _rdp_simplify(sorted(kf_list, key=lambda k: k["t_ms"]))
+    def tree(lo: int, hi: int) -> str:  # spans lo..hi-1; span i covers [t_i, t_i+1)
+        if hi - lo == 1:
+            return span(lo)
+        mid = (lo + hi) // 2
+        return f"if(lt(t,{pts[mid]['t']:.4f}),{tree(lo, mid)},{tree(mid, hi)})"
 
-    # Deduplicate unchanged values to shrink the expression
-    deduped: list[dict] = [sk[0]]
-    for kf in sk[1:]:
-        if abs(kf[attr] - deduped[-1][attr]) > 1e-4:
-            deduped.append(kf)
-    sk = deduped
+    return tree(0, len(pts) - 1)
 
-    if len(sk) > _MAX_KF_PER_ATTR:
-        step = (len(sk) - 1) / (_MAX_KF_PER_ATTR - 1)
-        sk = [sk[round(i * step)] for i in range(_MAX_KF_PER_ATTR)]
 
-    if len(sk) == 1:
-        return f"{dim}*{sk[0][attr]:.6f}"
+def _zoom_commands(pts: list[dict], name: str) -> list[str]:
+    """
+    FFmpeg's crop reads w/h once when the filter starts, so a view that zooms later would
+    keep the first size. Send the new size at every change: once at a cut, in small steps
+    across a glide.
+    """
+    times: list[float] = []
+    for a, b in zip(pts, pts[1:]):
+        if abs(b["w"] - a["w"]) < 1e-6 and abs(b["h"] - a["h"]) < 1e-6:
+            continue
+        if b["t"] - a["t"] <= 0.05:
+            times.append(b["t"])
+        else:
+            n = max(1, int((b["t"] - a["t"]) / _ZOOM_STEP_S))
+            times.extend(a["t"] + (b["t"] - a["t"]) * i / n for i in range(1, n + 1))
+    if len(times) > _MAX_ZOOM_CMDS:
+        step = len(times) / _MAX_ZOOM_CMDS
+        times = [times[int(i * step)] for i in range(_MAX_ZOOM_CMDS)] + [times[-1]]
 
-    # Build right-to-left: each segment linearly interpolates from kf[i] to kf[i+1]
-    result = f"{dim}*{sk[-1][attr]:.6f}"
-    for i in range(len(sk) - 2, -1, -1):
-        t0 = (sk[i]["t_ms"] - seg_start_ms) / 1000.0
-        t1 = (sk[i + 1]["t_ms"] - seg_start_ms) / 1000.0
-        v0 = sk[i][attr]
-        v1 = sk[i + 1][attr]
-        dt = max(t1 - t0, 0.001)
-        # lerp: v0 + (v1-v0) * (t-t0) / dt
-        lerp = f"{dim}*({v0:.6f}+({v1:.6f}-{v0:.6f})*(t-{t0:.3f})/{dt:.3f})"
-        result = f"if(lt(t,{t1:.3f}),{lerp},{result})"
-
-    return result
+    cmds: list[str] = []
+    last = (_value_at(pts, "w", 0.0), _value_at(pts, "h", 0.0))
+    for t in sorted(set(round(max(t, 0.0), 3) for t in times)):
+        w, h = _value_at(pts, "w", t), _value_at(pts, "h", t)
+        if abs(w - last[0]) < 1e-6 and abs(h - last[1]) < 1e-6:
+            continue
+        last = (w, h)
+        # No commas in the arguments: inside sendcmd a ',' separates commands
+        cmds.append(f"{t:.3f} crop@{name} w iw*{w:.6f}\\, crop@{name} h ih*{h:.6f}")
+    return cmds
 
 
 def _crop_filter(box: dict | None, seg_start_ms: int) -> str:
+    """
+    Crop that plays each view exactly like the editor preview: a view holds until the next
+    change, cuts switch on the frame, Motion glides, and zoom changes apply mid-segment.
+    """
+    global _crop_seq
     kf = box.get("box_keyframes", []) if box else []
-    # Use linear interpolation when there are multiple keyframes (motion tracking)
-    # so the crop smoothly follows the subject instead of jumping at each keyframe.
-    expr = _linear_expr if len(kf) > 1 else _step_expr
-    w = _esc_expr(f"max(2,{expr(kf, 'w', seg_start_ms)})")
-    h = _esc_expr(f"max(2,{expr(kf, 'h', seg_start_ms)})")
-    x = _esc_expr(f"min(iw-2,{expr(kf, 'x', seg_start_ms)})")
-    y = _esc_expr(f"min(ih-2,{expr(kf, 'y', seg_start_ms)})")
-    return f"crop=w={w}:h={h}:x={x}:y={y}"
+    if not kf:
+        return "crop=w=iw:h=ih:x=0:y=0"
+    pts = _view_points(kf, seg_start_ms)
+
+    _crop_seq += 1
+    name = f"c{_crop_seq}"
+    w0, h0 = _value_at(pts, "w", 0.0), _value_at(pts, "h", 0.0)
+    w = _esc_expr(f"max(2,iw*{w0:.6f})")
+    h = _esc_expr(f"max(2,ih*{h0:.6f})")
+    x = _esc_expr(f"min(iw-2,{_piecewise_expr(pts, 'x')})")
+    y = _esc_expr(f"min(ih-2,{_piecewise_expr(pts, 'y')})")
+    crop = f"crop@{name}=w={w}:h={h}:x={x}:y={y}"
+
+    cmds = _zoom_commands(pts, name)
+    if not cmds:
+        return crop
+    return f"sendcmd=c='{';'.join(cmds)}',{crop}"
 
 
 def _scale_cover(w: int, h: int) -> str:
@@ -1006,8 +1037,14 @@ def main(
         fp.append(f"{cur}copy[vout]")
 
         # ── Assemble and run ───────────────────────────────────────────────────
+        # The graph goes in a file: clips with many view changes build graphs larger than a
+        # single command-line argument may be (128 KB on Linux, 32 KB total on Windows)
+        fc_str = ";".join(fp)
+        fc_path = os.path.join(tmp, "graph.txt")
+        with open(fc_path, "w", encoding="utf-8") as f:
+            f.write(fc_str)
         cmd = inputs + [
-            "-filter_complex", ";".join(fp),
+            "-/filter_complex", fc_path,
             "-map", "[vout]",
             "-map", "1:a",
             "-c:v", "libx264",
@@ -1027,7 +1064,6 @@ def main(
             output_path,
         ]
 
-        fc_str = ";".join(fp)
         print(f"[render] filter_complex ({len(fc_str)} chars): {fc_str[:800]}", flush=True)
         print(f"[render] Running FFmpeg (crf={qs['crf']}, {out_w}x{out_h}, {len(segments)} seg(s)) ...", flush=True)
         result = subprocess.run(cmd, capture_output=True, text=True)
