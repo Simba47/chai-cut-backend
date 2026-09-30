@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
+import { GoogleAuth } from 'google-auth-library'
 import { r2, R2_BUCKET, r2DownloadToFile, r2UploadFile } from '../r2.js'
 import db from '../db.js'
 import type { Job, TranscribeJobPayload } from '../types.js'
@@ -934,7 +935,72 @@ async function geminiUploadAudio(buf: Buffer): Promise<{ name: string; uri: stri
   return { name: file.name, uri: file.uri }
 }
 
+// ── Vertex AI (Google Cloud) ─────────────────────────────────────────────────
+// With GOOGLE_CLOUD_PROJECT set, transcription goes to Gemini 3.5 Transcribe on Vertex AI instead
+// of the Gemini API key: Vertex has no daily request cap (the API key's Tier 1 allows 100 a day).
+// Auth is Application Default Credentials: `gcloud auth application-default login` locally,
+// a service account (GOOGLE_APPLICATION_CREDENTIALS) on a server. The model is only served from
+// the 'global' location; audio goes inline (5-minute chunks, well under the 15-minute limit).
+const VERTEX_PROJECT   = process.env.GOOGLE_CLOUD_PROJECT
+const VERTEX_LOCATION  = process.env.GOOGLE_CLOUD_LOCATION || 'global'
+const VERTEX_STT_MODEL = 'gemini-3.5-transcribe-preview'
+let vertexAuth: GoogleAuth | null = null
+
+async function vertexTranscribeChunk(buf: Buffer, languageCode?: string): Promise<SarvamWord[]> {
+  vertexAuth ??= new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/cloud-platform'] })
+  const host = VERTEX_LOCATION === 'global' ? 'aiplatform.googleapis.com' : `${VERTEX_LOCATION}-aiplatform.googleapis.com`
+  const url = `https://${host}/v1/projects/${VERTEX_PROJECT}/locations/${VERTEX_LOCATION}/publishers/google/models/${VERTEX_STT_MODEL}:generateContent`
+  // Verbatim (the default mode), word timestamps, and a speaker per stretch of speech, so
+  // caption lines never mix two speakers
+  const audioTranscriptionConfig: Record<string, unknown> = { wordTimestamp: true, diarization: true }
+  if (languageCode) audioTranscriptionConfig.languageCodes = [toGeminiLang(languageCode)]
+  const body = JSON.stringify({
+    contents: [{ role: 'user', parts: [{ inlineData: { mimeType: 'audio/wav', data: buf.toString('base64') } }] }],
+    generationConfig: { audioTranscriptionConfig },
+  })
+
+  for (let attempt = 1; ; attempt++) {
+    const token = await vertexAuth.getAccessToken()
+    const res = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'x-goog-user-project': VERTEX_PROJECT!, 'Content-Type': 'application/json' },
+      body,
+    }, 300_000)
+    if (res.ok) {
+      const raw = await res.json() as {
+        candidates?: { content?: { parts?: { audioTranscription?: { speakerLabel?: string; words?: { word?: string; startOffset?: string; endOffset?: string }[] } }[] } }[]
+      }
+      const words: SarvamWord[] = []
+      for (const part of raw.candidates?.[0]?.content?.parts ?? []) {
+        const tx = part.audioTranscription
+        for (const w of tx?.words ?? []) {
+          if (!w.word?.trim()) continue
+          words.push({ word: w.word.trim(), start: parseFloat(w.startOffset ?? '0'), end: parseFloat(w.endOffset ?? '0'), speaker: tx?.speakerLabel })
+        }
+      }
+      return words
+    }
+    const text = await res.text()
+    // 429 on Vertex means shared capacity is busy for a moment (there is no daily cap): retry
+    const retryable = res.status === 429 || res.status >= 500
+    if (!retryable || attempt >= GEMINI_MAX_TRIES) throw new Error(`Vertex transcribe ${res.status}: ${text.slice(0, 300)}`)
+    const delaySec = Math.min(30, 5 * attempt)
+    console.warn(`[vertex] ${res.status} on attempt ${attempt}, retrying in ${delaySec}s`)
+    await new Promise(r => setTimeout(r, delaySec * 1000))
+  }
+}
+
+/** Seconds from Gemini's "Please retry in 22h28m7s" / "retry in 13.5s" (0 when not given) */
+function retryHintSec(body: string): number {
+  const m = body.match(/retry in ((?:[\d.]+[hms])+)/i)
+  if (!m) return 0
+  let sec = 0
+  for (const [, n, unit] of m[1].matchAll(/([\d.]+)([hms])/gi)) sec += parseFloat(n) * (unit.toLowerCase() === 'h' ? 3600 : unit.toLowerCase() === 'm' ? 60 : 1)
+  return sec
+}
+
 async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promise<SarvamWord[]> {
+  if (VERTEX_PROJECT) return vertexTranscribeChunk(buf, languageCode)
   for (let attempt = 1; ; attempt++) {
     const file = await geminiUploadAudio(buf)
     try {
@@ -971,8 +1037,13 @@ async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promis
       const body = await res.text()
       const retryable = res.status === 429 || res.status >= 500
       if (!retryable || attempt >= GEMINI_MAX_TRIES) throw new Error(`Gemini transcribe ${res.status}: ${body.slice(0, 300)}`)
-      // Rate limited (10k tokens/min on Tier 1) — wait for the window to reset
-      const hinted = parseFloat(body.match(/retry in ([\d.]+)s/i)?.[1] ?? '0')
+      // Rate limited (10k tokens/min on Tier 1) — wait for the window to reset. A daily limit
+      // ("retry in 22h28m") will not reset while the job waits: stop now and say so.
+      const hinted = retryHintSec(body)
+      if (hinted > 120) {
+        const hours = Math.max(1, Math.round(hinted / 3600))
+        throw new Error(`Transcription limit for today is used up (Gemini API). It resets in about ${hours} hour${hours === 1 ? '' : 's'}.`)
+      }
       const delaySec = Math.max(hinted, res.status === 429 ? 20 : 5 * attempt)
       console.warn(`[gemini] ${res.status} on attempt ${attempt}, retrying in ${delaySec}s`)
       await new Promise(r => setTimeout(r, delaySec * 1000))
@@ -984,8 +1055,8 @@ async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promis
 }
 
 export async function transcribeAudio(audioPath: string, videoId?: string, languageCode?: string, signal?: AbortSignal): Promise<SarvamResponse> {
-  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not set')
-  console.log(`[transcribe] ${GEMINI_STT_MODEL} (verbatim, word timestamps)`)
+  if (!GEMINI_API_KEY && !VERTEX_PROJECT) throw new Error('Set GOOGLE_CLOUD_PROJECT (Vertex AI) or GEMINI_API_KEY for transcription')
+  console.log(`[transcribe] ${VERTEX_PROJECT ? `Vertex AI ${VERTEX_STT_MODEL}` : GEMINI_STT_MODEL} (verbatim, word timestamps)`)
 
   const { stdout } = await execFileAsync('ffprobe', [
     '-v', 'error', '-show_entries', 'format=duration',
