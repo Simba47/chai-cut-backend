@@ -185,6 +185,10 @@ def _motion_center(prev_gray, curr_gray, w_px, h_px, threshold=18):
 
 
 STATIC_RATIO = 0.85     # a face changing less than this × its surroundings is a picture, not a person
+# …or less than its surroundings at all while MediaPipe is unsure it is a face: posters and photos
+# score 0.81–0.86 on the samples, live faces 0.90–0.98 (a motionless video-call face: 1.04, 0.965)
+STATIC_RATIO_UNSURE = 1.0
+UNSURE_SCORE = 0.9
 STATIC_MIN_FRAMES = 8   # judged only on faces seen for at least this many frames (2 s at 4 fps)
 
 
@@ -310,8 +314,17 @@ def detect_subjects(frames_dir: str, lips: bool = False) -> dict:
         for f, tid in zip(faces, ids):
             if f["change"] is not None:
                 changes.setdefault(tid, []).append(f["change"])
-    static = {tid for tid, d in changes.items()
-              if len(d) >= STATIC_MIN_FRAMES and float(np.median(d)) < STATIC_RATIO}
+    scores: dict[int, list[float]] = {}
+    for faces, ids in zip(raw, track_ids):
+        for f, tid in zip(faces, ids):
+            scores.setdefault(tid, []).append(f["score"])
+    static = set()
+    for tid, d in changes.items():
+        if len(d) < STATIC_MIN_FRAMES:
+            continue
+        ratio, score = float(np.median(d)), float(np.median(scores[tid]))
+        if ratio < STATIC_RATIO or (ratio < STATIC_RATIO_UNSURE and score < UNSURE_SCORE):
+            static.add(tid)
 
     # ── Pass 3: per-frame people, with the layout filters ────────────────────────────────
     per_frame = []

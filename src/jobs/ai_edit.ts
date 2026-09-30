@@ -362,8 +362,22 @@ export function planSpeakers(frames: FrameDetection[], tracks: number[][], speec
     }
     plan.push(current)
   }
-  // Per frame
-  return frames.map(f => plan[Math.min(seconds - 1, Math.floor((f.frame_index * FRAME_INTERVAL_MS) / 1000))] ?? null)
+  // Per frame. A switch the transcript marks happens at the turn's first word, not at the
+  // start of the second (so the crop doesn't move a beat early or late)
+  const switchAt = new Map<number, number>()
+  for (let s = 1; s < seconds; s++) {
+    if (plan[s] === plan[s - 1]) continue
+    const turn = turns.find(t => t >= s * 1000 - 500 && t < s * 1000 + 1500)
+    if (turn !== undefined) switchAt.set(s, turn)
+  }
+  return frames.map(f => {
+    const t = f.frame_index * FRAME_INTERVAL_MS
+    const s = Math.min(seconds - 1, Math.floor(t / 1000))
+    const at = switchAt.get(s), next = switchAt.get(s + 1)
+    if (at !== undefined && t < at) return plan[s - 1] ?? null        // switch later in this second
+    if (next !== undefined && t >= next) return plan[s + 1] ?? null   // switch earlier, in the second before
+    return plan[s] ?? null
+  })
 }
 
 // ── Layout brain ──────────────────────────────────────────────────────────────
@@ -464,8 +478,19 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
     }
     const bySize = [...f.faces].sort((a, b) => (b.w * b.h) - (a.w * a.h))
     const top2 = bySize.slice(0, 2).sort((a, b) => (a.x + a.w / 2) - (b.x + b.w / 2))
-    const face = top2[slotIdx] ?? top2[0]
-    return face ? face.x + face.w / 2 : slotIdx === 0 ? 0.3 : 0.7
+    // With one face in a split frame, which half it belongs in is unknown: leave both to the
+    // frames around it (never show the same person in both halves)
+    if (top2.length < 2) return null
+    return top2[slotIdx].x + top2[slotIdx].w / 2
+  }
+  /** Missing values take the nearest known one in the run (the default halves if none) */
+  const fill = (vals: Array<number | null>, fallback: number) => {
+    const out = [...vals]
+    let last: number | null = null
+    for (let i = 0; i < out.length; i++) { if (out[i] == null) out[i] = last; else last = out[i] }
+    last = null
+    for (let i = out.length - 1; i >= 0; i--) { if (vals[i] != null) last = vals[i]; else if (out[i] == null) out[i] = last }
+    return out.map(v => v ?? fallback)
   }
 
   const minFrames = Math.ceil(MIN_SEGMENT_MS / FRAME_INTERVAL_MS)
@@ -503,11 +528,27 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
       if (last && last.mode === mode) last.frames.push(f)
       else shotRuns.push({ mode, start_ms: shotRuns.length ? frameTime(f) : shot.start_ms, frames: [f], cutStart: shotRuns.length === 0 })
     }
+    // The shortest run goes first, and neighbours of the same mode are joined before judging
+    // length: otherwise a long-ish run could be swallowed by a one-frame blip next to it
+    // (a single frame with two faces turned three seconds of one person into split screen)
+    const joinSame = () => {
+      for (let i = shotRuns.length - 1; i > 0; i--) {
+        if (shotRuns[i].mode === shotRuns[i - 1].mode) {
+          shotRuns[i - 1].frames.push(...shotRuns[i].frames)
+          shotRuns.splice(i, 1)
+        }
+      }
+    }
     let changed = true
     while (changed && shotRuns.length > 1) {
       changed = false
-      for (let i = 0; i < shotRuns.length; i++) {
-        if (!shortRun(shotRuns[i])) continue
+      joinSame()
+      if (shotRuns.length < 2) break
+      const shortest = shotRuns
+        .map((r, i) => ({ r, i }))
+        .filter(x => shortRun(x.r))
+        .sort((a, b) => a.r.frames.length - b.r.frames.length)[0]
+      for (const i of shortest ? [shortest.i] : []) {
         const left = i > 0 ? shotRuns[i - 1].frames.length : -1
         const right = i < shotRuns.length - 1 ? shotRuns[i + 1].frames.length : -1
         // Absorbed frames take on the neighbour's mode
@@ -538,7 +579,7 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
   const slotCount = (layout: Layout) => (layout === 'split' ? 2 : 1)
   const edgeCx = (run: Run, slot: number, atEnd: boolean) => {
     const edge = atEnd ? run.frames.slice(-DETECT_FPS) : run.frames.slice(0, DETECT_FPS)
-    return median(edge.map(f => rawCx(f, layoutOfMode(run.mode), slot)))
+    return median(fill(edge.map(f => rawCx(f, layoutOfMode(run.mode), slot)), slot === 0 ? 0.3 : 0.7))
   }
   type Group = { layout: Layout; start_ms: number; frames: FrameDetection[]; resets: number[] }
   const groups: Group[] = []
@@ -564,7 +605,7 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
     // The first keyframe sits on the segment start (the renderer extrapolates before it)
     const kfTime = (f: FrameDetection, i: number) => (i === 0 ? start_ms : Math.max(start_ms, frameTime(f)))
     const slotKfs = Array.from({ length: slotCount(g.layout) }, (_, slot) => {
-      const cx = stabilise(g.frames.map(f => rawCx(f, g.layout, slot)), g.resets)
+      const cx = stabilise(fill(g.frames.map(f => rawCx(f, g.layout, slot)), g.layout === 'split' ? (slot === 0 ? 0.3 : 0.7) : 0.5), g.resets)
       return g.frames.map((f, i) => g.layout === 'vertical' ? vertKf(kfTime(f, i), cx[i]) : splitKf(kfTime(f, i), cx[i]))
     })
     return { start_ms, end_ms, layout: g.layout, slotKfs }
