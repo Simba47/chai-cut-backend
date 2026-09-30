@@ -1,10 +1,15 @@
 import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import { writeFile, readFile, unlink, mkdtemp, readdir, rm } from 'node:fs/promises'
+import { createWriteStream } from 'node:fs'
+import { Readable, Transform } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import type { ReadableStream as WebReadableStream } from 'node:stream/web'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3'
-import { r2, R2_BUCKET } from '../r2.js'
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
+import { r2, R2_BUCKET, r2DownloadToFile, r2UploadFile } from '../r2.js'
 import db from '../db.js'
 import type { Job, TranscribeJobPayload } from '../types.js'
 
@@ -23,11 +28,39 @@ async function r2Upload(key: string, body: Buffer, contentType: string): Promise
 
 const execFileAsync = promisify(execFile)
 
+/** A failure the user can act on: its message is shown on the video's card */
+class UserFacingError extends Error {}
+
 async function setProgress(videoId: string, pct: number) {
   await db`UPDATE videos SET download_progress = ${pct} WHERE id = ${videoId}`
 }
 
-export async function handleTranscribeJob(job: Job) {
+/** Length of a video file or URL in ms, or null if ffprobe can't tell */
+async function probeDurationMs(input: string, signal?: AbortSignal): Promise<number | null> {
+  try {
+    const { stdout } = await execFileAsync('ffprobe', [
+      '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input,
+    ], { signal, timeout: 60_000 })
+    const secs = parseFloat(stdout.trim())
+    return isNaN(secs) ? null : Math.round(secs * 1000)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The browser reads a video's length when it's uploaded, but can't for formats it doesn't play
+ * (MKV, iPhone HEVC…). Fill it in from storage then: ffprobe reads just the header over a signed URL.
+ */
+async function fillMissingDuration(videoId: string, storagePath: string, signal?: AbortSignal) {
+  const [row] = await db`SELECT duration_ms FROM videos WHERE id = ${videoId}`
+  if (!row || row.duration_ms) return
+  const url = await getSignedUrl(r2, new GetObjectCommand({ Bucket: R2_BUCKET, Key: storagePath }), { expiresIn: 600 })
+  const durationMs = await probeDurationMs(url, signal)
+  if (durationMs) await db`UPDATE videos SET duration_ms = ${durationMs} WHERE id = ${videoId} AND duration_ms IS NULL`
+}
+
+export async function handleTranscribeJob(job: Job, signal?: AbortSignal) {
   const raw = job.payload
   const payload = (typeof raw === 'string' ? JSON.parse(raw) : raw) as TranscribeJobPayload
   const isLinkJob = !payload.storage_path
@@ -43,6 +76,8 @@ export async function handleTranscribeJob(job: Job) {
   if (!isLinkJob && !isClipJob && !isRetranscribe) {
     await db`UPDATE videos SET status = 'ready', download_progress = 100 WHERE id = ${payload.video_id}`
     videoReady = true
+    await fillMissingDuration(payload.video_id, payload.storage_path, signal)
+      .catch(e => console.warn('[transcribe] could not read video length:', e))
     if (!isFullJob) {
       console.log(`[transcribe] upload video ${payload.video_id} ready — transcription deferred to clip creation`)
       return
@@ -83,16 +118,34 @@ export async function handleTranscribeJob(job: Job) {
 
     if (!audioCached) {
       if (isLinkJob) {
-        // Link job: yt-dlp → transcode → upload to storage
-        const result = await downloadWithYtDlp(payload.video_id, tmp)
+        // Link job: Google Drive / Dropbox → plain download; other sites → yt-dlp (home worker only).
+        // Either way the file is uploaded to storage.
+        const result = payload.link_source
+          ? await downloadDirectLink(payload.video_id, payload.link_source, tmp, payload.max_bytes, signal)
+          : await downloadWithYtDlp(payload.video_id, tmp, signal)
         videoPath = result.localPath
         storagePath = result.storagePath
         await db`UPDATE videos SET storage_path = ${storagePath} WHERE id = ${payload.video_id}`
+
+        // A link import is ready as soon as the file is stored — the user can start clipping
+        // while captions are made in the background (or not at all on plans without them, in
+        // which case the audio isn't needed and the job ends here)
+        if (!isClipJob && !isRetranscribe) {
+          const durationMs = await probeDurationMs(videoPath, signal)
+          await db`UPDATE videos SET status = 'ready', storage_path = ${storagePath}, download_progress = 100, duration_ms = ${durationMs} WHERE id = ${payload.video_id}`
+          videoReady = true
+          if (!isFullJob) {
+            console.log(`[transcribe] link video ${payload.video_id} ready — no captions on this plan`)
+            return
+          }
+          console.log(`[transcribe] link video ${payload.video_id} ready — captioning full video in background`)
+        }
       } else {
-        // Clip or retranscribe job: download video from storage
+        // Clip or retranscribe job: download video from storage (streamed to disk — a whole
+        // video held in memory could run the worker out of it)
         await setProgress(payload.video_id, 30)
         videoPath = join(tmp, 'video.mp4')
-        await writeFile(videoPath, await r2Download(storagePath))
+        await r2DownloadToFile(storagePath, videoPath, signal)
         await setProgress(payload.video_id, 55)
       }
 
@@ -105,11 +158,11 @@ export async function handleTranscribeJob(job: Job) {
           '-ss', String(startSec), '-i', videoPath,
           '-t', String(durSec),
           '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', audioPath,
-        ])
+        ], { signal })
       } else {
         await execFileAsync('ffmpeg', [
           '-i', videoPath, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', audioPath,
-        ])
+        ], { signal })
         // Cache full-video audio as FLAC for fast retranscription
         const cachePath = audioStoragePath ?? (storagePath ? storagePath.replace(/\.[^.]+$/, '_audio.flac') : null)
         if (cachePath) {
@@ -122,36 +175,22 @@ export async function handleTranscribeJob(job: Job) {
       }
     }
 
-    // ── Link-only jobs (no clip_id): just set video ready, skip transcription ──
-    if (isLinkJob && !isClipJob && !isRetranscribe) {
-      let durationMs: number | null = null
-      try {
-        const { stdout } = await execFileAsync('ffprobe', [
-          '-v', 'error', '-show_entries', 'format=duration',
-          '-of', 'default=noprint_wrappers=1:nokey=1', videoPath,
-        ])
-        const secs = parseFloat(stdout.trim())
-        if (!isNaN(secs)) durationMs = Math.round(secs * 1000)
-      } catch { /* optional */ }
-
-      await db`UPDATE videos SET status = 'ready', storage_path = ${storagePath}, download_progress = 100, duration_ms = ${durationMs} WHERE id = ${payload.video_id}`
-      videoReady = true
-      if (!isFullJob) {
-        console.log(`[transcribe] link video ${payload.video_id} ready — transcription deferred to clip creation`)
-        return
-      }
-      console.log(`[transcribe] link video ${payload.video_id} ready — captioning full video in background`)
-    }
-
     // ── Transcription ─────────────────────────────────────────────────────────
     // Progress only matters while the video is still 'transcribing' (not for background full-video captions)
-    const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, payload.language_code)
+    const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, payload.language_code, signal)
+    signal?.throwIfAborted()
 
-    // Clip retranscribe: replace only this clip's time range in the latest transcript, so
-    // other clips of the same video keep their captions. created_at is bumped so the
-    // editor's "since" poll picks up the new words.
-    const [existing] = isRetranscribe && isClipJob
-      ? await db`SELECT id FROM transcripts WHERE video_id = ${payload.video_id} ORDER BY created_at DESC LIMIT 1`
+    // Clip jobs (first transcription or retranscribe): replace only this clip's time range in the
+    // video's transcript, so other clips of the same video keep their captions. The editor reads
+    // one transcript per video (the newest), so a clip job must never start a separate one —
+    // that hid every other clip's captions. created_at is bumped so the editor's "since" poll
+    // picks up the new words.
+    const [existing] = isClipJob
+      ? await db`
+          SELECT t.id FROM transcripts t
+          WHERE t.video_id = ${payload.video_id}
+            AND EXISTS (SELECT 1 FROM transcript_words w WHERE w.transcript_id = t.id)
+          ORDER BY t.created_at DESC LIMIT 1`
       : []
     let transcript: { id: string }
     if (existing) {
@@ -173,10 +212,13 @@ export async function handleTranscribeJob(job: Job) {
     if (entries.length > 0) {
       const offsetMs = isClipJob ? payload.clip_start_ms! : 0
       const romanized = await transliterateToRoman(entries, sarvamResult.language_code, process.env.SARVAM_API_KEY)
+      // English spoken inside a regional-language video: store it in that language's script too,
+      // so "Auto language" captions are all in one script (word_roman keeps the English spelling)
+      const native = await toNativeScript(entries, sarvamResult.language_code)
 
       const words = entries.map((e, i) => ({
         transcript_id: transcript.id,
-        word: e.word,
+        word: native[i] ?? e.word,
         word_roman: romanized[i] ?? null,
         start_ms: Math.round(e.start * 1000) + offsetMs,
         end_ms:   Math.round(e.end   * 1000) + offsetMs,
@@ -206,7 +248,11 @@ export async function handleTranscribeJob(job: Job) {
     // Only mark failed for fresh download jobs — retranscribe is called inline from ai_edit
     // on an already-ready video, and a failed background caption job leaves the video usable.
     if (!isClipJob && !isRetranscribe && !videoReady) {
-      await db`UPDATE videos SET status = 'failed' WHERE id = ${payload.video_id}`.catch(() => {})
+      // A reason the user can act on is shown on the video's card (e.g. "set sharing to anyone
+      // with the link"); anything else shows the generic "couldn't process" message
+      const reason = err instanceof UserFacingError ? err.message : null
+      await db`UPDATE videos SET status = 'failed', error = ${reason} WHERE id = ${payload.video_id}`
+        .catch(() => db`UPDATE videos SET status = 'failed' WHERE id = ${payload.video_id}`.catch(() => {}))
     }
     throw err
   } finally {
@@ -225,7 +271,118 @@ export async function handleTranscribeJob(job: Job) {
   }
 }
 
-async function downloadWithYtDlp(videoId: string, tmp: string): Promise<{ localPath: string; storagePath: string }> {
+// ── Google Drive / Dropbox share links ─────────────────────────────────────────
+// A public share link downloads with plain HTTP from any server (no yt-dlp, no home IP needed).
+
+const LINK_NAMES = { gdrive: 'Google Drive', dropbox: 'Dropbox' } as const
+const VIDEO_EXT_BY_TYPE: Record<string, string> = {
+  'video/mp4': '.mp4', 'video/quicktime': '.mov', 'video/webm': '.webm', 'video/x-matroska': '.mkv',
+}
+const VIDEO_TYPE_BY_EXT: Record<string, string> = { '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm', '.mkv': 'video/x-matroska' }
+
+/** The URL that returns the file itself rather than the share page */
+function directDownloadUrl(shareUrl: string, source: 'gdrive' | 'dropbox'): string {
+  const u = new URL(shareUrl)
+  if (source === 'dropbox') {
+    u.searchParams.delete('raw')
+    u.searchParams.set('dl', '1')
+    return u.toString()
+  }
+  // drive.google.com/file/d/<id>/view · …/open?id=<id> · …/uc?id=<id>
+  const id = u.pathname.match(/\/file\/d\/([\w-]+)/)?.[1] ?? u.searchParams.get('id')
+  if (!id) throw new UserFacingError('That Google Drive link doesn\'t point to a file. Open the video in Drive and copy its link.')
+  // confirm=t skips Drive's "can't scan this large file for viruses" page
+  return `https://drive.usercontent.google.com/download?id=${encodeURIComponent(id)}&export=download&confirm=t`
+}
+
+function filenameFromDisposition(header: string | null): string | null {
+  if (!header) return null
+  const star = header.match(/filename\*\s*=\s*(?:UTF-8'')?([^;]+)/i)?.[1]
+  if (star) { try { return decodeURIComponent(star.trim().replace(/^"|"$/g, '')) } catch { /* fall through */ } }
+  return header.match(/filename\s*=\s*"?([^";]+)"?/i)?.[1]?.trim() ?? null
+}
+
+async function downloadDirectLink(
+  videoId: string, source: 'gdrive' | 'dropbox', tmp: string, maxBytes: number | undefined, signal?: AbortSignal,
+): Promise<{ localPath: string; storagePath: string }> {
+  const [video] = await db`SELECT source_url, user_id FROM videos WHERE id = ${videoId}`
+  if (!video?.source_url) throw new Error('No source URL for video ' + videoId)
+  const name = LINK_NAMES[source]
+  const tooBig = () => new UserFacingError(`This video is bigger than your plan's ${Math.round((maxBytes ?? 0) / 1024 ** 3)} GB limit.`)
+
+  await setProgress(videoId, 5)
+  let res = await fetch(directDownloadUrl(video.source_url, source), { redirect: 'follow', signal })
+  // Large Drive files can come back as a "can't scan this file for viruses" page whose button
+  // carries the real download link (a form with hidden fields): follow it once
+  if (source === 'gdrive' && res.ok && (res.headers.get('content-type') ?? '').includes('text/html')) {
+    const page = await res.text()
+    const action = page.match(/<form[^>]+id="download-form"[^>]+action="([^"]+)"/i)?.[1]
+    if (action) {
+      const next = new URL(action.replace(/&amp;/g, '&'))
+      for (const [, name, value] of page.matchAll(/<input[^>]+type="hidden"[^>]+name="([^"]+)"[^>]+value="([^"]*)"/gi)) {
+        next.searchParams.set(name, value.replace(/&amp;/g, '&'))
+      }
+      res = await fetch(next, { redirect: 'follow', signal })
+    } else {
+      // No download button: a sign-in or "you need access" page, i.e. the file isn't shared
+      throw new UserFacingError('Google Drive didn\'t share the file. Set sharing to "Anyone with the link" and try again.')
+    }
+  }
+  if (!res.ok || !res.body) {
+    throw new UserFacingError(res.status === 404
+      ? `That file couldn't be found on ${name}. Check the link.`
+      : `Couldn't download the file from ${name} (error ${res.status}). Check the link is shared with "Anyone with the link".`)
+  }
+  const type = (res.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase()
+  // A web page instead of the file: the link isn't public (or it's a folder)
+  if (type.startsWith('text/html')) {
+    res.body.cancel().catch(() => {})
+    throw new UserFacingError(`${name} didn't share the file. Set sharing to "Anyone with the link" and try again.`)
+  }
+  const total = Number(res.headers.get('content-length')) || 0
+  if (maxBytes && total > maxBytes) { res.body.cancel().catch(() => {}); throw tooBig() }
+
+  const filename = filenameFromDisposition(res.headers.get('content-disposition'))
+  const extFromName = filename?.match(/\.[a-z0-9]+$/i)?.[0].toLowerCase()
+  const ext = (extFromName && VIDEO_TYPE_BY_EXT[extFromName]) ? extFromName : VIDEO_EXT_BY_TYPE[type]
+  if (!ext) {
+    res.body.cancel().catch(() => {})
+    throw new UserFacingError('That link isn\'t a video file we support (MP4, MOV, MKV or WebM).')
+  }
+
+  // Stream to disk, counting bytes: stop as soon as it's bigger than the plan allows
+  // (Content-Length can be missing), and report progress as 5–45 %
+  const localPath = join(tmp, `video${ext}`)
+  let received = 0, lastPct = 5
+  const counter = new Transform({
+    transform(chunk: Buffer, _enc, done) {
+      received += chunk.length
+      if (maxBytes && received > maxBytes) { done(tooBig()); return }
+      if (total) {
+        const pct = Math.round(5 + (received / total) * 40)
+        if (pct !== lastPct) { lastPct = pct; setProgress(videoId, pct).catch(() => {}) }
+      }
+      done(null, chunk)
+    },
+  })
+  await pipeline(Readable.fromWeb(res.body as unknown as WebReadableStream), counter, createWriteStream(localPath), { signal })
+
+  // Make sure it really is a video before storing it
+  const { stdout } = await execFileAsync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', localPath], { signal })
+    .catch(() => ({ stdout: '' }))
+  if (!stdout.includes('video')) throw new UserFacingError('That file doesn\'t contain a video we can read.')
+
+  await setProgress(videoId, 47)
+  const storagePath = `raw/${video.user_id}/${videoId}${ext}`
+  await r2UploadFile(storagePath, localPath, VIDEO_TYPE_BY_EXT[ext])
+  // The file's own name becomes the video's title (unless the user already named it)
+  const title = filename?.replace(/\.[^.]+$/, '').trim().slice(0, 120)
+  if (title) await db`UPDATE videos SET title = COALESCE(title, ${title}) WHERE id = ${videoId}`
+  await setProgress(videoId, 58)
+  return { localPath, storagePath }
+}
+
+async function downloadWithYtDlp(videoId: string, tmp: string, signal?: AbortSignal): Promise<{ localPath: string; storagePath: string }> {
   const [video] = await db`SELECT source_url, user_id FROM videos WHERE id = ${videoId}`
   if (!video?.source_url) throw new Error('No source URL for video ' + videoId)
 
@@ -247,7 +404,8 @@ async function downloadWithYtDlp(videoId: string, tmp: string): Promise<{ localP
   ]
 
   await new Promise<void>((resolve, reject) => {
-    const proc = spawn('yt-dlp', ytdlpArgs)
+    const proc = spawn('yt-dlp', ytdlpArgs, { signal })
+    proc.on('error', reject)
 
     let lastUpdate = 0
     proc.stdout.on('data', (chunk: Buffer) => {
@@ -309,7 +467,8 @@ async function downloadWithYtDlp(videoId: string, tmp: string): Promise<{ localP
       '-movflags', '+faststart',
       '-progress', 'pipe:1',
       '-y', localPath,
-    ])
+    ], { signal })
+    proc.on('error', reject)
 
     let outTime = 0
     proc.stdout.on('data', (chunk: Buffer) => {
@@ -335,8 +494,7 @@ async function downloadWithYtDlp(videoId: string, tmp: string): Promise<{ localP
   const storagePath = `raw/${video.user_id}/${videoId}.mp4`
 
   console.log(`[transcribe] uploading to R2: ${storagePath}`)
-  const fileBuffer = await readFile(localPath)
-  await r2Upload(storagePath, fileBuffer, 'video/mp4')
+  await r2UploadFile(storagePath, localPath, 'video/mp4')
 
   await setProgress(videoId, 58)
   return { localPath, storagePath }
@@ -825,7 +983,7 @@ async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promis
   }
 }
 
-async function transcribeAudio(audioPath: string, videoId?: string, languageCode?: string): Promise<SarvamResponse> {
+export async function transcribeAudio(audioPath: string, videoId?: string, languageCode?: string, signal?: AbortSignal): Promise<SarvamResponse> {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not set')
   console.log(`[transcribe] ${GEMINI_STT_MODEL} (verbatim, word timestamps)`)
 
@@ -839,6 +997,8 @@ async function transcribeAudio(audioPath: string, videoId?: string, languageCode
   if (videoId) await setProgress(videoId, 62)
 
   async function chunkWords(i: number, lang: string | undefined): Promise<SarvamWord[]> {
+    // A job that ran past its timeout stops here, between chunks
+    signal?.throwIfAborted()
     const startSec = i * GEMINI_CHUNK_SEC
     const chunkPath = audioPath.replace('.wav', `_gchunk${i}.wav`)
     await execFileAsync('ffmpeg', [
@@ -849,8 +1009,18 @@ async function transcribeAudio(audioPath: string, videoId?: string, languageCode
     await unlink(chunkPath).catch(() => {})
     if (buf.length < 16_000) return []  // < 0.5s of audio — nothing to transcribe
 
-    const words = await geminiTranscribeChunk(buf, lang)
+    let words = await geminiTranscribeChunk(buf, lang)
     console.log(`[gemini] chunk ${i + 1}/${numChunks}: ${words.length} words${lang ? ` (${lang})` : ''}`)
+    // Locked to an Indian language, Gemini drops sentences spoken purely in English — re-read
+    // the stretches it left empty as English and merge those words in
+    if (lang && !lang.startsWith('en')) {
+      const chunkSec = Math.min(GEMINI_CHUNK_SEC, Math.max(0, totalSec - startSec))
+      const extra = await englishGapPass(chunkPath, audioPath, startSec, chunkSec, words)
+      if (extra.length) {
+        console.log(`[gemini] chunk ${i + 1}/${numChunks}: +${extra.length} English words from untranscribed gaps`)
+        words = [...words, ...extra].sort((a, b) => a.start - b.start)
+      }
+    }
     // Speaker labels are only consistent within one request, so scope them to the chunk
     return words.map(w => ({ ...w, start: w.start + startSec, end: w.end + startSec, speaker: w.speaker ? `c${i}:${w.speaker}` : undefined }))
   }
@@ -889,6 +1059,61 @@ async function transcribeAudio(audioPath: string, videoId?: string, languageCode
   }
 
   return { language_code: language, words: allWords }
+}
+
+// ── English re-pass for gaps ──────────────────────────────────────────────────
+// With language_codes locked to e.g. te-IN (auto-detect drops a lot of Telugu speech), a
+// sentence spoken entirely in English comes back with no words at all. Find the stretches of
+// the chunk with no words, stitch them into one clip (short silence between), transcribe that
+// once as English, and map the words back to their real times.
+const GAP_MIN_SEC = 1.8
+const GAP_PAD_SEC = 0.15
+const GAP_SEPARATOR_SEC = 0.6
+
+async function englishGapPass(chunkPathHint: string, audioPath: string, chunkStartSec: number, chunkSec: number, words: SarvamWord[]): Promise<SarvamWord[]> {
+  const gaps: [number, number][] = []
+  let cursor = 0
+  for (const w of [...words].sort((a, b) => a.start - b.start)) {
+    if (w.start - cursor >= GAP_MIN_SEC) gaps.push([cursor, w.start])
+    cursor = Math.max(cursor, w.end)
+  }
+  if (chunkSec - cursor >= GAP_MIN_SEC) gaps.push([cursor, chunkSec])
+  if (!gaps.length) return []
+
+  // Pieces of the full audio (absolute times) and where each lands in the stitched clip
+  const pieces = gaps.map(([a, b]) => ({ from: Math.max(0, a - GAP_PAD_SEC), to: Math.min(chunkSec, b + GAP_PAD_SEC) }))
+  let at = 0
+  const placed = pieces.map(p => { const out = { ...p, at }; at += (p.to - p.from) + GAP_SEPARATOR_SEC; return out })
+  const gapPath = chunkPathHint.replace('.wav', '_gaps.wav')
+  const fc: string[] = []
+  placed.forEach((p, k) => {
+    fc.push(`[0:a]atrim=start=${(chunkStartSec + p.from).toFixed(3)}:end=${(chunkStartSec + p.to).toFixed(3)},asetpts=PTS-STARTPTS[g${k}]`)
+    fc.push(`aevalsrc=0:d=${GAP_SEPARATOR_SEC}:s=16000[z${k}]`)
+  })
+  fc.push(`${placed.map((_, k) => `[g${k}][z${k}]`).join('')}concat=n=${placed.length * 2}:v=0:a=1[out]`)
+  try {
+    await execFileAsync('ffmpeg', ['-i', audioPath, '-filter_complex', fc.join(';'), '-map', '[out]',
+      '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', gapPath])
+    const buf = await readFile(gapPath)
+    if (buf.length < 16_000) return []
+    const found = await geminiTranscribeChunk(buf, 'en-IN')
+    const out: SarvamWord[] = []
+    for (const w of found) {
+      const p = placed.find(x => w.start >= x.at - 0.05 && w.start < x.at + (x.to - x.from))
+      if (!p) continue // landed in a separator
+      const start = p.from + (w.start - p.at)
+      const end = Math.min(p.to, p.from + (w.end - p.at))
+      // Only keep words inside a real gap, so nothing overlaps what the main pass found
+      if (!gaps.some(([a, b]) => start >= a - GAP_PAD_SEC && start < b)) continue
+      out.push({ ...w, start, end: Math.max(end, start + 0.08), speaker: w.speaker ? `en:${w.speaker}` : undefined })
+    }
+    return out
+  } catch (e) {
+    console.warn('[gemini] English gap pass failed, keeping the main pass only:', e)
+    return []
+  } finally {
+    await unlink(gapPath).catch(() => {})
+  }
 }
 
 // ── Rule-based Telugu → Roman transliterator ──────────────────────────────────
@@ -1081,17 +1306,20 @@ async function transliterateWithGemini(
   for (let i = 0; i < entries.length; i += BATCH) {
     const batch = entries.slice(i, i + BATCH)
     const words = batch.map(e => e.word.trim())
-    try {
-      // gemini-2.5-flash writes the most natural Tenglish in tests; Google has started retiring
-      // 2.5 models for new accounts, so fall back to the always-current Flash alias on 404
-      let res: Response | undefined
-      for (const model of ['gemini-2.5-flash', 'gemini-flash-latest']) {
-        res = await fetchWithTimeout(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-          method: 'POST',
-          headers: { 'x-goog-api-key': GEMINI_API_KEY!, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text:
+    // A batch occasionally comes back merged/split despite temperature 0 and explicit
+    // instructions — one retry before falling back recovers most of these for free.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        // gemini-2.5-flash writes the most natural Tenglish in tests; Google has started retiring
+        // 2.5 models for new accounts, so fall back to the always-current Flash alias on 404
+        let res: Response | undefined
+        for (const model of ['gemini-2.5-flash', 'gemini-flash-latest']) {
+          res = await fetchWithTimeout(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+            method: 'POST',
+            headers: { 'x-goog-api-key': GEMINI_API_KEY!, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text:
 `You convert ${langName} caption words into ${style}: the way ${langName} speakers write their language in English letters on WhatsApp or YouTube comments.
 Rules:
 - Exactly one output string per input word, same order. Never merge, split, drop or add words.
@@ -1099,15 +1327,89 @@ Rules:
 - English words written in ${langName} script get their normal English spelling (ఇట్స్ → "it's", ట్రూ → "true", కాటన్ → "cotton", యాక్టర్స్ → "actors", యాడ్ → "ad").
 - Numbers and words already in English letters stay as they are. Drop trailing punctuation.
 - Lowercase, except names and the pronoun "I".` }] },
-            contents: [{ role: 'user', parts: [{ text: JSON.stringify(words) }] }],
-            generationConfig: {
-              temperature: 0,
-              responseMimeType: 'application/json',
-              responseSchema: { type: 'ARRAY', items: { type: 'STRING' } },
-              thinkingConfig: { thinkingBudget: 0 },
-            },
-          }),
-        }, 60_000)
+              contents: [{ role: 'user', parts: [{ text: JSON.stringify(words) }] }],
+              generationConfig: {
+                temperature: 0,
+                responseMimeType: 'application/json',
+                responseSchema: { type: 'ARRAY', items: { type: 'STRING' } },
+                thinkingConfig: { thinkingBudget: 0 },
+              },
+            }),
+          }, 60_000)
+          if (res.status !== 404) break
+        }
+        if (!res!.ok) throw new Error(`Gemini ${res!.status}: ${(await res!.text()).slice(0, 200)}`)
+        const data = await res!.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] }
+        const arr = JSON.parse(data.candidates?.[0]?.content?.parts?.[0]?.text ?? '[]') as unknown[]
+        if (!Array.isArray(arr) || arr.length !== batch.length) {
+          throw new Error(`expected ${batch.length} words, got ${Array.isArray(arr) ? arr.length : 'non-array'}`)
+        }
+        for (let j = 0; j < batch.length; j++) {
+          const v = arr[j]
+          result[i + j] = typeof v === 'string' && v.trim() ? stripDiacritics(v.trim()).replace(/[.,!?।]+$/g, '') : undefined
+        }
+        break
+      } catch (err) {
+        if (attempt === 2) console.warn(`[transliterate] Gemini batch ${i}-${i + batch.length} failed, using fallback:`, err)
+      }
+    }
+  }
+
+  console.log(`[transliterate] ${languageCode} → ${style} via Gemini for ${entries.length} word(s)`)
+  return result
+}
+
+/** Script ranges of the languages LANG_NAMES covers — a word containing any of these is already native */
+const NATIVE_SCRIPT = /[\u0900-\u0D7F\u0B00-\u0B7F]/
+const LATIN = /[A-Za-z]/
+
+/**
+ * Words in English letters inside a regional-language transcript (English phrases the speaker
+ * used, or sentences recovered by the English gap pass), written in that language's script the
+ * way its speakers spell English words: so → సో, think → థింక్. Returns one entry per input
+ * word: the native spelling, or undefined to keep the word as it is. Trailing punctuation is
+ * kept, since captions break lines at sentence ends.
+ */
+export async function toNativeScript(entries: SarvamWord[], languageCode: string): Promise<(string | undefined)[]> {
+  const out: (string | undefined)[] = new Array(entries.length).fill(undefined)
+  const langName = LANG_NAMES[languageCode]
+  if (!langName || !GEMINI_API_KEY) return out
+  const todo = entries
+    .map((e, i) => ({ i, word: e.word.trim() }))
+    .filter(x => LATIN.test(x.word) && !NATIVE_SCRIPT.test(x.word))
+  if (!todo.length) return out
+
+  const BATCH = 80
+  for (let b = 0; b < todo.length; b += BATCH) {
+    const batch = todo.slice(b, b + BATCH)
+    // Punctuation stays outside the conversion and goes back on afterwards
+    const split = batch.map(x => {
+      const m = x.word.match(/^(.*?)([.,!?।…:;"')\]]*)$/)!
+      return { core: m[1], tail: m[2] }
+    })
+    try {
+      let res: Response | undefined
+      for (const model of ['gemini-2.5-flash', 'gemini-flash-latest']) {
+        res = await fetchWithTimeout(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+            method: 'POST',
+            headers: { 'x-goog-api-key': GEMINI_API_KEY!, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text:
+`You write English words in ${langName} script, the way ${langName} captions and news write English words spoken in a ${langName} video (phonetically, as ${langName} speakers pronounce them).
+Rules:
+- Exactly one output string per input word, same order. Never merge, split, drop or add words.
+- Spell by sound in ${langName} script${langName === 'Telugu' ? ' (so → "సో", think → "థింక్", actually → "యాక్చువల్లీ", I → "ఐ", it\'s → "ఇట్స్", brand → "బ్రాండ్", YouTube → "యూట్యూబ్")' : ''}.
+- Numbers stay as digits. Keep capital-letter brand names readable by sound. No English letters in the output unless the input is only digits.` }] },
+              contents: [{ role: 'user', parts: [{ text: JSON.stringify(split.map(x => x.core)) }] }],
+              generationConfig: {
+                temperature: 0,
+                responseMimeType: 'application/json',
+                responseSchema: { type: 'ARRAY', items: { type: 'STRING' } },
+                thinkingConfig: { thinkingBudget: 0 },
+              },
+            }),
+          }, 60_000)
         if (res.status !== 404) break
       }
       if (!res!.ok) throw new Error(`Gemini ${res!.status}: ${(await res!.text()).slice(0, 200)}`)
@@ -1116,17 +1418,17 @@ Rules:
       if (!Array.isArray(arr) || arr.length !== batch.length) {
         throw new Error(`expected ${batch.length} words, got ${Array.isArray(arr) ? arr.length : 'non-array'}`)
       }
-      for (let j = 0; j < batch.length; j++) {
+      batch.forEach((x, j) => {
         const v = arr[j]
-        result[i + j] = typeof v === 'string' && v.trim() ? stripDiacritics(v.trim()).replace(/[.,!?।]+$/g, '') : undefined
-      }
+        // Only take real conversions; anything still in English letters keeps the original
+        if (typeof v === 'string' && v.trim() && NATIVE_SCRIPT.test(v) && !LATIN.test(v)) out[x.i] = v.trim() + split[j].tail
+      })
     } catch (err) {
-      console.warn(`[transliterate] Gemini batch ${i}-${i + batch.length} failed, using fallback:`, err)
+      console.warn(`[native-script] batch ${b}-${b + batch.length} failed, keeping English letters:`, err)
     }
   }
-
-  console.log(`[transliterate] ${languageCode} → ${style} via Gemini for ${entries.length} word(s)`)
-  return result
+  console.log(`[native-script] ${todo.length} English word(s) → ${langName} script`)
+  return out
 }
 
 // Strip IAST diacritics → plain ASCII so captions read as normal English letters.

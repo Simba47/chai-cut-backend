@@ -1,11 +1,10 @@
 import { GoogleGenerativeAI } from '@google/generative-ai'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { writeFile, mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { GetObjectCommand } from '@aws-sdk/client-s3'
-import { r2, R2_BUCKET } from '../r2.js'
+import { r2DownloadToFile } from '../r2.js'
 import db from '../db.js'
 import type { Job, AiEditJobPayload } from '../types.js'
 import { handleTranscribeJob } from './transcribe.js'
@@ -27,13 +26,6 @@ interface FrameDetection { frame_index: number; person_count: number; faces: Cro
 interface FaceInfo { face_count: number; face_boxes: CropBox[]; frames: FrameDetection[] }
 interface SlotKf { t_ms: number; x: number; y: number; w: number; h: number }
 interface ClipSegment { start_ms: number; end_ms: number; layout: 'vertical' | 'split'; slotKfs: SlotKf[][] }
-
-async function r2Download(key: string): Promise<Buffer> {
-  const res = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }))
-  const chunks: Buffer[] = []
-  for await (const chunk of res.Body as AsyncIterable<Uint8Array>) chunks.push(Buffer.from(chunk))
-  return Buffer.concat(chunks)
-}
 
 async function extractFrames(videoPath: string, startMs: number, endMs: number, outDir: string): Promise<void> {
   const startS = startMs / 1000
@@ -312,7 +304,7 @@ CRITICAL RULES:
     .slice(0, clipCount)
 }
 
-export async function handleAiEditJob(job: Job) {
+export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
   const payload = job.payload as unknown as AiEditJobPayload
   const { ai_edit_job_id, video_id, clip_count } = payload
 
@@ -335,7 +327,7 @@ export async function handleAiEditJob(job: Job) {
         error: null,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
-      })
+      }, signal)
     }
 
     // 3. Load transcript words
@@ -362,7 +354,7 @@ export async function handleAiEditJob(job: Job) {
     try {
       const videoPath = join(tmp, 'source.mp4')
       console.log(`[ai_edit] Downloading video ${video.storage_path}`)
-      await writeFile(videoPath, await r2Download(video.storage_path))
+      await r2DownloadToFile(video.storage_path, videoPath, signal)
 
       // 6. Face detection + create DB records for all clips
       const createdClipIds: string[] = []
@@ -392,9 +384,11 @@ export async function handleAiEditJob(job: Job) {
           const seg_id = segRow.id
 
           for (let slotIdx = 0; slotIdx < seg.slotKfs.length; slotIdx++) {
+            // source_offset_ms is where in the clip this segment's video starts: render.py trims
+            // the main video from it, so 0 made every later segment replay the clip's start
             const [boxRow] = await db`
               INSERT INTO crop_boxes (segment_id, slot_index, source_video_id, source_offset_ms)
-              VALUES (${seg_id}, ${slotIdx}, NULL, 0)
+              VALUES (${seg_id}, ${slotIdx}, NULL, ${seg.start_ms})
               RETURNING id
             `
             for (const kf of seg.slotKfs[slotIdx]) {
@@ -418,7 +412,7 @@ export async function handleAiEditJob(job: Job) {
       const RENDER_PARALLEL = 3
       for (let i = 0; i < createdClipIds.length; i += RENDER_PARALLEL) {
         const batch = createdClipIds.slice(i, i + RENDER_PARALLEL)
-        await Promise.all(batch.map(id => renderClipWithLocalVideo(id, videoPath, video.storage_path)))
+        await Promise.all(batch.map(id => renderClipWithLocalVideo(id, videoPath, video.storage_path, signal)))
         console.log(`[ai_edit] Rendered batch ${Math.floor(i / RENDER_PARALLEL) + 1}/${Math.ceil(createdClipIds.length / RENDER_PARALLEL)}`)
       }
     } finally {

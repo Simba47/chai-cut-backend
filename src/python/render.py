@@ -23,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges
+from frames import is_frame, frame_rows, wrap_band_text, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry
 
 # ── Quality presets (identical to previous version) ───────────────────────────
 _QUALITY: dict[int, dict] = {
@@ -78,8 +79,9 @@ def _ms_to_ass_ts(ms: int) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def _word_display(w: dict) -> str:
-    return w.get("word_roman") or w.get("word", "")
+def _word_display(w: dict, roman: bool = False) -> str:
+    """A caption word in the letters the user picked: English letters (word_roman) or its own script."""
+    return (w.get("word_roman") if roman else None) or w.get("word", "")
 
 
 def _is_sentence_end(word: str) -> bool:
@@ -131,12 +133,15 @@ def _write_ass(
     out_w: int,
     out_h: int,
     path: str,
+    band_zones: list[tuple[int, int, int]] | None = None,
 ) -> None:
     font_id   = style.get("font") or "noto-sans-telugu"
     font_name = _FONT_NAMES.get(font_id, "Roboto")
     font_size = int(style.get("size") or 52)
     color_hex = style.get("color") or "#ffffff"
     pos_y_frac = float(style.get("position_y") or 0.84)
+    # The editor's Caption language: 'roman' = English letters, anything else = the spoken script
+    roman     = style.get("language") == "roman"
 
     primary = _hex_to_ass(color_hex, 0)
     shadow  = "&H80000000"
@@ -206,23 +211,134 @@ def _write_ass(
             end_ms = min(end_ms, next_start)
         if end_ms <= start_ms:
             continue
-        text     = " ".join(_word_display(w) for w in sentence if _word_display(w))
+        text     = " ".join(_word_display(w, roman) for w in sentence if _word_display(w, roman))
         if not text.strip():
             continue
-        # Alignment=5 (center of screen); \pos pins the anchor to exact coordinates
-        tag = f"{{\\pos({pos_x},{pos_y})}}"
-        lines.append(
-            f"Dialogue: 0,{_ms_to_ass_ts(start_ms)},{_ms_to_ass_ts(end_ms)},"
-            f"Default,,0,0,0,,{tag}{text}"
-        )
+        # Alignment=5 (center of screen); \pos pins the anchor to exact coordinates. Where a
+        # frame shows captions in its text band, that part of the line is centred in the band.
+        for a, b, y in _split_by_zones(start_ms, end_ms, band_zones or [], pos_y):
+            tag = f"{{\\pos({pos_x},{y})}}"
+            lines.append(
+                f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},"
+                f"Default,,0,0,0,,{tag}{text}"
+            )
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
 
+def _split_by_zones(start_ms: int, end_ms: int, zones: list[tuple[int, int, int]], default_y: int) -> list[tuple[int, int, int]]:
+    """Cut [start, end) where caption band zones begin/end: (start, end, y) pieces."""
+    cuts = {start_ms, end_ms}
+    for a, b, _ in zones:
+        if start_ms < a < end_ms:
+            cuts.add(a)
+        if start_ms < b < end_ms:
+            cuts.add(b)
+    pts = sorted(cuts)
+    out: list[tuple[int, int, int]] = []
+    for a, b in zip(pts, pts[1:]):
+        mid = (a + b) / 2
+        y = next((zy for za, zb, zy in zones if za <= mid < zb), default_y)
+        if out and out[-1][2] == y and out[-1][1] == a:
+            out[-1] = (out[-1][0], b, y)
+        else:
+            out.append((a, b, y))
+    return out
+
+
+# ── Frames ────────────────────────────────────────────────────────────────────
+
+_probe_cache: dict[str, tuple[float, bool]] = {}
+
+
+def _probe(path: str) -> tuple[float, bool]:
+    """(duration in s or 0 if unknown, has an audio stream) of a media file."""
+    if path in _probe_cache:
+        return _probe_cache[path]
+    dur, has_audio = 0.0, True
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type", "-of", "json", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        info = json.loads(r.stdout or "{}")
+        dur = float((info.get("format") or {}).get("duration") or 0)
+        has_audio = any(st.get("codec_type") == "audio" for st in info.get("streams") or [])
+    except Exception:
+        pass
+    _probe_cache[path] = (dur, has_audio)
+    return _probe_cache[path]
+
+
+def _hex6(v: str | None, fallback: str) -> str:
+    h = (v or "").lstrip("#")
+    return h[:6] if len(h) >= 6 and all(c in "0123456789abcdefABCDEF" for c in h[:6]) else fallback
+
+
+def _filter_path(p: str) -> str:
+    """A file path as a quoted filter option (forward slashes; ':' still escaped inside the quotes)."""
+    return "'" + p.replace("\\", "/").replace(":", "\\:").replace("'", "") + "'"
+
+
+def _corner_mask(tmp: str, w: int, h: int, m: int, r: int) -> str:
+    """
+    A w×h RGBA image that is black except for a transparent rounded box inset by m with corner
+    radius r. Laid over media padded with black, it gives the media rounded corners and a black
+    border. Drawn at twice the size and scaled down for smooth corners; made once per size.
+    """
+    path = os.path.join(tmp, f"corners_{w}x{h}_{m}_{r}.png")
+    if os.path.exists(path):
+        return path
+    W, H, M, R = w * 2, h * 2, m * 2, r * 2
+    dx = f"max(max({M + R}-X\\,X-{W - M - 1 - R})\\,0)"
+    dy = f"max(max({M + R}-Y\\,Y-{H - M - 1 - R})\\,0)"
+    inside = (f"lte({dx}*{dx}+{dy}*{dy}\\,{R * R})*gte(X\\,{M})*lt(X\\,{W - M})*gte(Y\\,{M})*lt(Y\\,{H - M})")
+    vf = f"format=rgba,geq=r=0:g=0:b=0:a=255*(1-{inside}),scale={w}:{h}:flags=area"
+    res = subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"color=c=black:s={W}x{H}:d=1",
+                          "-vf", vf, "-frames:v", "1", path], capture_output=True, text=True)
+    if res.returncode != 0 or not os.path.exists(path):
+        raise RuntimeError(f"corner mask failed: {res.stderr[-400:]}")
+    return path
+
+
+def _frame_text_font(text: str) -> str:
+    """Montserrat Bold for Latin text; Noto for Indian scripts Montserrat can't draw."""
+    if any("\u0c00" <= c <= "\u0c7f" for c in text):
+        path = _find_font_path("noto-sans-telugu")
+    elif any("\u0900" <= c <= "\u097f" for c in text):
+        path = _find_font_path("noto-sans-devanagari")
+    else:
+        path = _find_font_path("montserrat-bold")
+    path = path or _find_font_path("roboto")
+    # Quoted in the filter; inside the quotes ':' (Windows drive letters) still needs escaping
+    return path.replace("\\", "/").replace(":", "\\:") if path else ""
+
+
+def _frame_text_chain(text: str, bg: str, color: str, size_1080: int, w: int, h: int, dur_s: float,
+                      cx: float = 0.5, cy: float = 0.5) -> str:
+    """A solid w×h card with wrapped text centred on (cx, cy) — shares of the card, set by dragging it in the editor."""
+    chain = f"color=c=0x{bg}:s={w}x{h}:d={dur_s:.3f}:r=30,format=yuv420p"
+    text = (text or "").strip()
+    font = _frame_text_font(text) if text else ""
+    if text and font:
+        size = max(8, int(round(size_1080 * w / 1080)))
+        # Wrap at 1080-wide scale, like the editor preview, so lines break in the same places
+        lines = wrap_band_text(text, 1080, size_1080)
+        lh = int(size * 1.2)
+        top = cy * h - lh * len(lines) / 2
+        for li, ln in enumerate(lines):
+            if not ln:
+                continue
+            y = int(top + li * lh + (lh - size) / 2)
+            chain += (f",drawtext=fontfile='{font}':text='{_escape_drawtext(ln)}':fontsize={size}"
+                      f":fontcolor=0x{color}:x={cx * w:.1f}-tw/2:y={y}")
+    return f"{chain},setsar=1"
+
+
 # ── FFmpeg crop expression builder ────────────────────────────────────────────
 
-_MAX_KF_PER_ATTR = 20  # FFmpeg expression depth limit — lower = faster eval
+_MAX_KF_PER_ATTR = 400  # points per crop after simplification (a balanced if() tree: ~9 levels)
 
 
 def _rdp_simplify(kfs: list[dict], tol: float = 0.005) -> list[dict]:
@@ -256,90 +372,121 @@ def _rdp_simplify(kfs: list[dict], tol: float = 0.005) -> list[dict]:
     right = _rdp_simplify(kfs[max_i:], tol)
     return left[:-1] + right
 
-def _step_expr(kf_list: list[dict], attr: str, seg_start_ms: int) -> str:
-    """Step-interpolated crop coordinate (holds value until next keyframe fires)."""
-    dim = "iw" if attr in ("x", "w") else "ih"
-    defaults = {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
-
-    if not kf_list:
-        return f"{dim}*{defaults[attr]:.6f}"
-
-    sk = _rdp_simplify(sorted(kf_list, key=lambda k: k["t_ms"]))
-
-    deduped: list[dict] = [sk[0]]
-    for kf in sk[1:]:
-        if abs(kf[attr] - deduped[-1][attr]) > 1e-6:
-            deduped.append(kf)
-    sk = deduped
-
-    if len(sk) > _MAX_KF_PER_ATTR:
-        step = (len(sk) - 1) / (_MAX_KF_PER_ATTR - 1)
-        sk = [sk[round(i * step)] for i in range(_MAX_KF_PER_ATTR)]
-
-    if len(sk) == 1:
-        return f"{dim}*{sk[0][attr]:.6f}"
-
-    result = f"{dim}*{sk[-1][attr]:.6f}"
-    for i in range(len(sk) - 2, -1, -1):
-        t_switch = (sk[i + 1]["t_ms"] - seg_start_ms) / 1000.0
-        result = f"if(lt(t,{t_switch:.3f}),{dim}*{sk[i][attr]:.6f},{result})"
-
-    return result
+_ZOOM_STEP_S = 0.1  # a zoom that glides is re-sent this often (10 steps a second)
+_MAX_ZOOM_CMDS = 1500
+_crop_seq = 0       # unique crop@name per filter so sendcmd hits the right one
 
 
-def _linear_expr(kf_list: list[dict], attr: str, seg_start_ms: int) -> str:
+def _view_points(kf_list: list[dict], seg_start_ms: int) -> list[dict]:
     """
-    Linear-interpolated crop coordinate — smoothly pans between keyframes.
-    Used for motion-tracked crops so the crop follows the subject continuously
-    instead of jumping every N seconds.
+    Keyframes as the editor preview plays them: straight lines between keyframes, so a
+    "cut" (a hold keyframe 1ms before the change) switches views instantly and Motion
+    glides. Nothing is dropped by value — a hold carries the previous value on purpose.
+    """
+    pts = [
+        {"t": (k["t_ms"] - seg_start_ms) / 1000.0, "x": k["x"], "y": k["y"], "w": k["w"], "h": k["h"]}
+        for k in sorted(kf_list, key=lambda k: k["t_ms"])
+    ]
+    # Recorded Motion can hold thousands of points; thin only what a straight line already
+    # describes (RDP keeps cuts: the hold sits far off the line to the next view)
+    tol = 0.002
+    simplified = _rdp_simplify([{**p, "t_ms": p["t"]} for p in pts], tol)
+    while len(simplified) > _MAX_KF_PER_ATTR:
+        tol *= 2
+        simplified = _rdp_simplify([{**p, "t_ms": p["t"]} for p in pts], tol)
+    return simplified
+
+
+def _value_at(pts: list[dict], attr: str, t: float) -> float:
+    if t <= pts[0]["t"]:
+        return pts[0][attr]
+    for a, b in zip(pts, pts[1:]):
+        if t < b["t"]:
+            span = b["t"] - a["t"]
+            return a[attr] if span <= 0 else a[attr] + (b[attr] - a[attr]) * (t - a["t"]) / span
+    return pts[-1][attr]
+
+
+def _piecewise_expr(pts: list[dict], attr: str) -> str:
+    """
+    Per-frame expression for one attribute: a balanced if() tree over the keyframe
+    intervals (depth log2(n), so hundreds of view changes stay cheap to evaluate).
     """
     dim = "iw" if attr in ("x", "w") else "ih"
-    defaults = {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+    if len(pts) == 1 or all(abs(p[attr] - pts[0][attr]) < 1e-6 for p in pts):
+        return f"{dim}*{pts[0][attr]:.6f}"
 
-    if not kf_list:
-        return f"{dim}*{defaults[attr]:.6f}"
+    def span(i: int) -> str:
+        a, b = pts[i], pts[i + 1]
+        if abs(b[attr] - a[attr]) < 1e-6:
+            return f"{dim}*{a[attr]:.6f}"
+        dt = max(b["t"] - a["t"], 0.0005)
+        return f"{dim}*({a[attr]:.6f}+({b[attr] - a[attr]:.6f})*clip((t-{a['t']:.4f})/{dt:.4f},0,1))"
 
-    sk = _rdp_simplify(sorted(kf_list, key=lambda k: k["t_ms"]))
+    def tree(lo: int, hi: int) -> str:  # spans lo..hi-1; span i covers [t_i, t_i+1)
+        if hi - lo == 1:
+            return span(lo)
+        mid = (lo + hi) // 2
+        return f"if(lt(t,{pts[mid]['t']:.4f}),{tree(lo, mid)},{tree(mid, hi)})"
 
-    # Deduplicate unchanged values to shrink the expression
-    deduped: list[dict] = [sk[0]]
-    for kf in sk[1:]:
-        if abs(kf[attr] - deduped[-1][attr]) > 1e-4:
-            deduped.append(kf)
-    sk = deduped
+    return tree(0, len(pts) - 1)
 
-    if len(sk) > _MAX_KF_PER_ATTR:
-        step = (len(sk) - 1) / (_MAX_KF_PER_ATTR - 1)
-        sk = [sk[round(i * step)] for i in range(_MAX_KF_PER_ATTR)]
 
-    if len(sk) == 1:
-        return f"{dim}*{sk[0][attr]:.6f}"
+def _zoom_commands(pts: list[dict], name: str) -> list[str]:
+    """
+    FFmpeg's crop reads w/h once when the filter starts, so a view that zooms later would
+    keep the first size. Send the new size at every change: once at a cut, in small steps
+    across a glide.
+    """
+    times: list[float] = []
+    for a, b in zip(pts, pts[1:]):
+        if abs(b["w"] - a["w"]) < 1e-6 and abs(b["h"] - a["h"]) < 1e-6:
+            continue
+        if b["t"] - a["t"] <= 0.05:
+            times.append(b["t"])
+        else:
+            n = max(1, int((b["t"] - a["t"]) / _ZOOM_STEP_S))
+            times.extend(a["t"] + (b["t"] - a["t"]) * i / n for i in range(1, n + 1))
+    if len(times) > _MAX_ZOOM_CMDS:
+        step = len(times) / _MAX_ZOOM_CMDS
+        times = [times[int(i * step)] for i in range(_MAX_ZOOM_CMDS)] + [times[-1]]
 
-    # Build right-to-left: each segment linearly interpolates from kf[i] to kf[i+1]
-    result = f"{dim}*{sk[-1][attr]:.6f}"
-    for i in range(len(sk) - 2, -1, -1):
-        t0 = (sk[i]["t_ms"] - seg_start_ms) / 1000.0
-        t1 = (sk[i + 1]["t_ms"] - seg_start_ms) / 1000.0
-        v0 = sk[i][attr]
-        v1 = sk[i + 1][attr]
-        dt = max(t1 - t0, 0.001)
-        # lerp: v0 + (v1-v0) * (t-t0) / dt
-        lerp = f"{dim}*({v0:.6f}+({v1:.6f}-{v0:.6f})*(t-{t0:.3f})/{dt:.3f})"
-        result = f"if(lt(t,{t1:.3f}),{lerp},{result})"
-
-    return result
+    cmds: list[str] = []
+    last = (_value_at(pts, "w", 0.0), _value_at(pts, "h", 0.0))
+    for t in sorted(set(round(max(t, 0.0), 3) for t in times)):
+        w, h = _value_at(pts, "w", t), _value_at(pts, "h", t)
+        if abs(w - last[0]) < 1e-6 and abs(h - last[1]) < 1e-6:
+            continue
+        last = (w, h)
+        # No commas in the arguments: inside sendcmd a ',' separates commands
+        cmds.append(f"{t:.3f} crop@{name} w iw*{w:.6f}\\, crop@{name} h ih*{h:.6f}")
+    return cmds
 
 
 def _crop_filter(box: dict | None, seg_start_ms: int) -> str:
+    """
+    Crop that plays each view exactly like the editor preview: a view holds until the next
+    change, cuts switch on the frame, Motion glides, and zoom changes apply mid-segment.
+    """
+    global _crop_seq
     kf = box.get("box_keyframes", []) if box else []
-    # Use linear interpolation when there are multiple keyframes (motion tracking)
-    # so the crop smoothly follows the subject instead of jumping at each keyframe.
-    expr = _linear_expr if len(kf) > 1 else _step_expr
-    w = _esc_expr(f"max(2,{expr(kf, 'w', seg_start_ms)})")
-    h = _esc_expr(f"max(2,{expr(kf, 'h', seg_start_ms)})")
-    x = _esc_expr(f"min(iw-2,{expr(kf, 'x', seg_start_ms)})")
-    y = _esc_expr(f"min(ih-2,{expr(kf, 'y', seg_start_ms)})")
-    return f"crop=w={w}:h={h}:x={x}:y={y}"
+    if not kf:
+        return "crop=w=iw:h=ih:x=0:y=0"
+    pts = _view_points(kf, seg_start_ms)
+
+    _crop_seq += 1
+    name = f"c{_crop_seq}"
+    w0, h0 = _value_at(pts, "w", 0.0), _value_at(pts, "h", 0.0)
+    w = _esc_expr(f"max(2,iw*{w0:.6f})")
+    h = _esc_expr(f"max(2,ih*{h0:.6f})")
+    x = _esc_expr(f"min(iw-2,{_piecewise_expr(pts, 'x')})")
+    y = _esc_expr(f"min(ih-2,{_piecewise_expr(pts, 'y')})")
+    crop = f"crop@{name}=w={w}:h={h}:x={x}:y={y}"
+
+    cmds = _zoom_commands(pts, name)
+    if not cmds:
+        return crop
+    return f"sendcmd=c='{';'.join(cmds)}',{crop}"
 
 
 def _scale_cover(w: int, h: int) -> str:
@@ -382,12 +529,15 @@ def main(
     overlay_images: dict[str, str] | None = None,
     overlay_videos: dict[str, str] | None = None,
     watermark: bool = False,
+    frame_images: dict[str, str] | None = None,
 ) -> None:
     secondary_videos = secondary_videos or {}
     overlay_images   = overlay_images   or {}
     overlay_videos   = overlay_videos   or {}
+    frame_images     = frame_images     or {}
 
-    spec           = json.load(open(spec_path))
+    # UTF-8 explicitly: Windows defaults to cp1252 and fails on Telugu/Hindi captions
+    spec           = json.load(open(spec_path, encoding="utf-8"))
     clip_start_ms  = int(spec["start_ms"])
     clip_end_ms    = int(spec["end_ms"])
     clip_dur_ms    = clip_end_ms - clip_start_ms
@@ -420,6 +570,27 @@ def main(
         _filtered.append(_s)
         _next_start = _s["end_ms"]
     segments = _filtered
+    # Formats are independent in the editor, so parts of the clip can have no format. Those parts
+    # use the default framing: a full-frame box, which the cover scale crops to a centred 9:16
+    # (the same default the editor preview shows). Filling them keeps video, audio and captions
+    # the same length and in sync.
+    _filled: list[dict] = []
+    _cursor = 0
+    for _s in segments + [None]:
+        _gap_end = clip_dur_ms if _s is None else int(_s["start_ms"])
+        if _gap_end - _cursor >= 50:
+            print(f"[render] default framing for uncovered {_cursor}ms–{_gap_end}ms", flush=True)
+            _filled.append({
+                "start_ms": _cursor, "end_ms": _gap_end, "layout": "vertical", "sort_order": 0,
+                "crop_boxes": [{
+                    "slot_index": 0, "source_video_id": None, "source_offset_ms": _cursor,
+                    "box_keyframes": [{"t_ms": _cursor, "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}],
+                }],
+            })
+        if _s is not None:
+            _filled.append(_s)
+            _cursor = max(_cursor, int(_s["end_ms"]))
+    segments = _filled
     for _s in segments:
         broll = bool((_s.get("crop_boxes") or [{}])[0].get("source_video_id"))
         print(f"[render] seg: start={_s['start_ms']}ms end={_s['end_ms']}ms video_offset={_s.get('video_offset_ms')} broll={broll}", flush=True)
@@ -460,15 +631,24 @@ def main(
 
         # ── ASS captions ───────────────────────────────────────────────────────
         ass_path = None
-        if clip_words and caption_style:
+        # enabled False = the user turned captions off (styles saved before that field count as on)
+        if clip_words and caption_style and caption_style.get("enabled") is not False:
             ass_path = os.path.join(tmp, "captions.ass")
-            _write_ass(clip_words, caption_style, clip_start_ms, out_w, out_h, ass_path)
+            _write_ass(clip_words, caption_style, clip_start_ms, out_w, out_h, ass_path,
+                       band_zones=caption_band_zones(segments, out_h))
 
         # ── Count how many times each source video is needed ───────────────────
         # FFmpeg requires explicit split() when a stream is consumed more than once.
         slot_counts: dict[str | None, int] = {None: 0}
         for seg in segments:
             boxes   = sorted(seg.get("crop_boxes", []), key=lambda b: b.get("slot_index", 0))
+            if is_frame(seg.get("layout")):
+                # Only slots showing the main video read it; lane items are inputs of their own
+                main_slots = set(frame_state(seg).get("main_slots") or [])
+                for kind, slot, _ in frame_rows(seg["layout"], out_h, frame_band_shown(seg)):
+                    if kind == "slot" and slot in main_slots:
+                        slot_counts[None] = slot_counts.get(None, 0) + 1
+                continue
             n_slots = {"split": 2, "trio": 3}.get(seg.get("layout", "vertical"), 1)
             # For B-roll INSERT segments, remember the primary (slot-0) source so empty
             # extra slots fall back to it instead of the main video.
@@ -498,7 +678,7 @@ def main(
         sec_input_idx: dict[str, int] = {}
         for i, (vid_id, path) in enumerate(secondary_videos.items()):
             sec_input_idx[vid_id] = i + 2
-            inputs += ["-i", path]
+            inputs += ["-stream_loop", "-1", "-i", path]
 
         img_base = 2 + len(secondary_videos)
         valid_img: list[tuple[dict, str]] = []
@@ -515,6 +695,35 @@ def main(
             if lp and os.path.exists(lp):
                 inputs += ["-i", lp]
                 valid_vid.append((ov, f"[{vid_base + len(valid_vid)}:v]"))
+
+        # Frame lane items: every video and photo is an input of its own, opened at the point it
+        # starts, so nothing has to be buffered until the item appears
+        next_input = vid_base + len(valid_vid)
+        frame_item_in: dict[tuple[int, str], str] = {}
+        for si, seg in enumerate(segments):
+            if not is_frame(seg.get("layout")):
+                continue
+            st = frame_state(seg)
+            for kind, slot, _ in frame_rows(seg["layout"], out_h, frame_band_shown(seg)):
+                if kind != "slot":
+                    continue
+                for it in lane_items(seg, st, slot):
+                    if it.get("kind") == "video" and it.get("source_video_id") in secondary_videos:
+                        path = secondary_videos[it["source_video_id"]]
+                        off = it["off_ms"] / 1000.0
+                        length, _ = _probe(path)
+                        if length > 0:
+                            off = off % length  # videos loop: a start past the end wraps around
+                        # thread_queue_size: without it, a looped input feeding a complex filter graph
+                        # alongside other inputs can overflow ffmpeg's default demuxer->filter queue
+                        # ("Failed to inject frame into filter network: Resource temporarily unavailable")
+                        inputs += ["-thread_queue_size", "1024", "-stream_loop", "-1", "-ss", f"{off:.3f}", "-i", path]
+                    elif it.get("kind") == "photo" and os.path.exists(frame_images.get(it.get("image_path") or "", "")):
+                        inputs += ["-thread_queue_size", "1024", "-loop", "1", "-framerate", "30", "-t", f"{it['dur_s']:.3f}", "-i", frame_images[it["image_path"]]]
+                    else:
+                        continue
+                    frame_item_in[(si, it["id"])] = f"[{next_input}:v]"
+                    next_input += 1
 
         # ── Build filter_complex ───────────────────────────────────────────────
         fp: list[str] = []
@@ -571,6 +780,95 @@ def main(
             start_s = vid_start_ms / 1000.0
             end_s   = (vid_start_ms + dur_ms) / 1000.0
             out_lbl = f"[seg{si}]"
+
+            if is_frame(layout):
+                dur_s = dur_ms / 1000.0
+                st = frame_state(seg)
+
+                def media_size(corners, rh: int) -> tuple[int, int, int, int]:
+                    """(width, height) the media is scaled to, plus the border m and radius r (0, 0 = edge to edge)."""
+                    g = corner_geometry(corners)
+                    if not g:
+                        return out_w, rh, 0, 0
+                    inset, radius = g
+                    m = max(2, int(round(inset * out_w / 1080 / 2)) * 2)
+                    return out_w - 2 * m, rh - 2 * m, m, max(2, int(round(radius * out_w / 1080)))
+
+                def rounded(chain: str, rh: int, m: int, r: int, key: str) -> str:
+                    """Pad media to the full slot on black and lay the rounded-corner mask over it."""
+                    if not m:
+                        return chain
+                    mask = _corner_mask(tmp, out_w, rh, m, r)
+                    fp.append(f"{chain},pad={out_w}:{rh}:{m}:{m}:color=black,format=yuv420p[{key}p]")
+                    fp.append(f"movie=filename={_filter_path(mask)},format=rgba[{key}k]")
+                    return f"[{key}p][{key}k]overlay=0:0,format=yuv420p,setsar=1"
+
+                main_slots = set(st.get("main_slots") or [])
+                band = st.get("band") or {}
+                band_bg = _hex6(band.get("bg"), "000000")
+                row_lbls: list[str] = []
+                for ri, (kind, slot, rh) in enumerate(frame_rows(layout, out_h, frame_band_shown(seg))):
+                    lbl = f"[fr{si}r{ri}]"
+                    cur_row = f"[fr{si}r{ri}b]"
+                    # Underneath: the band colour, the main video (framed by this slot's crop box), or an empty dark slot
+                    if kind == "band":
+                        fp.append(f"color=c=0x{band_bg}:s={out_w}x{rh}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{cur_row}")
+                    elif slot in main_slots:
+                        box = next((b for b in boxes if b.get("slot_index") == slot), None)
+                        off_ms = seg.get("video_offset_ms")
+                        if off_ms is None:
+                            off_ms = box.get("source_offset_ms") if box and box.get("source_offset_ms") is not None else smss
+                        ts = int(off_ms) / 1000.0
+                        mw, mh, mm, mr = media_size((st.get("main_corners") or {}).get(str(slot)), rh)
+                        chain = (f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,"
+                                 f"{_crop_filter(box, smss)},{_scale_cover(mw, mh)},setsar=1,format=yuv420p")
+                        fp.append(f"{rounded(chain, rh, mm, mr, f'fr{si}r{ri}m')}{cur_row}")
+                    else:
+                        fp.append(f"color=c=0x111111:s={out_w}x{rh}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{cur_row}")
+
+                    # On top: this lane's items, each only during its own time
+                    for ii, it in enumerate(lane_items(seg, st, "band" if kind == "band" else slot)):
+                        d, rel = it["dur_s"], it["rel_s"]
+                        ik = it.get("kind")
+                        if ik == "text":
+                            if it.get("captions"):
+                                continue  # the captions themselves are moved into the band (see _write_ass)
+                            chain = _frame_text_chain(
+                                it.get("text") or "", _hex6(it.get("bg"), band_bg if kind == "band" else "000000"),
+                                _hex6(it.get("color"), "ffffff"), int(it.get("size") or 64), out_w, rh, d,
+                                float(it["x"]) if it.get("x") is not None else 0.5,
+                                float(it["y"]) if it.get("y") is not None else 0.5)
+                        elif ik == "photo" and (si, it["id"]) in frame_item_in:
+                            src = frame_item_in[(si, it["id"])]
+                            mw, mh, mm, mr = media_size(it.get("corners"), rh)
+                            zp = photo_motion_filter(it.get("motion") or "none", mw, mh, d)
+                            if zp:
+                                chain = (f"{src}scale={mw * 2}:{mh * 2}:force_original_aspect_ratio=increase,crop={mw * 2}:{mh * 2},"
+                                         f"{zp},setsar=1,format=yuv420p,trim=duration={d:.3f},setpts=PTS-STARTPTS")
+                            else:
+                                chain = f"{src}{_scale_cover(mw, mh)},setsar=1,format=yuv420p,trim=duration={d:.3f},setpts=PTS-STARTPTS"
+                            chain = rounded(chain, rh, mm, mr, f"fr{si}r{ri}i{ii}c")
+                        elif ik == "video" and (si, it["id"]) in frame_item_in:
+                            src = frame_item_in[(si, it["id"])]
+                            mw, mh, mm, mr = media_size(it.get("corners"), rh)
+                            chain = f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{_scale_cover(mw, mh)},setsar=1,format=yuv420p"
+                            chain = rounded(chain, rh, mm, mr, f"fr{si}r{ri}i{ii}c")
+                        else:
+                            print(f"[render] frame item skipped (media missing): {ik} {it.get('id')}", flush=True)
+                            continue
+                        il, ol = f"[fr{si}r{ri}i{ii}]", f"[fr{si}r{ri}o{ii}]"
+                        fp.append(f"{chain},setpts=PTS+{rel:.3f}/TB{il}")
+                        fp.append(f"{cur_row}{il}overlay=0:0:eof_action=pass:enable='between(t,{rel:.3f},{rel + d:.3f})'{ol}")
+                        cur_row = ol
+                    fp.append(f"{cur_row}null{lbl}")
+                    row_lbls.append(lbl)
+                # One row (e.g. Single with no text yet) is the whole frame; vstack needs two or more
+                if len(row_lbls) == 1:
+                    fp.append(f"{row_lbls[0]}null{out_lbl}")
+                else:
+                    fp.append(f"{''.join(row_lbls)}vstack=inputs={len(row_lbls)}{out_lbl}")
+                seg_labels.append(out_lbl)
+                continue
 
             # Primary (slot-0) B-roll source for this segment, used as fallback for empty slots.
             _primary_broll = _primary_box_vid_id if (_primary_box_vid_id and _primary_box_vid_id in secondary_videos) else None
@@ -647,12 +945,13 @@ def main(
 
         # ── Subtitles (ASS captions) ───────────────────────────────────────────
         if ass_path:
-            # Escape path for FFmpeg filter option (colons and spaces are separators)
+            # Escape path for FFmpeg filter option: quoted, forward slashes, and inside the quotes
+            # ':' (Windows drive letters) still needs escaping
             def _esc_path(p: str) -> str:
-                return p.replace("\\", "\\\\").replace(":", "\\:").replace(" ", "\\ ")
+                return "'" + p.replace("\\", "/").replace(":", "\\:").replace("'", "") + "'"
             esc_ass   = _esc_path(ass_path)
             esc_fonts = _esc_path(_FONTS_DIR)
-            fp.append(f"{cur}subtitles={esc_ass}:fontsdir={esc_fonts}[vcap]")
+            fp.append(f"{cur}subtitles=filename={esc_ass}:fontsdir={esc_fonts}[vcap]")
             cur = "[vcap]"
 
         # ── Text overlays (drawtext) ───────────────────────────────────────────
@@ -738,8 +1037,14 @@ def main(
         fp.append(f"{cur}copy[vout]")
 
         # ── Assemble and run ───────────────────────────────────────────────────
+        # The graph goes in a file: clips with many view changes build graphs larger than a
+        # single command-line argument may be (128 KB on Linux, 32 KB total on Windows)
+        fc_str = ";".join(fp)
+        fc_path = os.path.join(tmp, "graph.txt")
+        with open(fc_path, "w", encoding="utf-8") as f:
+            f.write(fc_str)
         cmd = inputs + [
-            "-filter_complex", ";".join(fp),
+            "-/filter_complex", fc_path,
             "-map", "[vout]",
             "-map", "1:a",
             "-c:v", "libx264",
@@ -759,7 +1064,6 @@ def main(
             output_path,
         ]
 
-        fc_str = ";".join(fp)
         print(f"[render] filter_complex ({len(fc_str)} chars): {fc_str[:800]}", flush=True)
         print(f"[render] Running FFmpeg (crf={qs['crf']}, {out_w}x{out_h}, {len(segments)} seg(s)) ...", flush=True)
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -779,6 +1083,7 @@ if __name__ == "__main__":
     parser.add_argument("--overlay-images",   default="{}", help="JSON: storage_path → local_path")
     parser.add_argument("--overlay-videos",   default="{}", help="JSON: source_video_id → local_path")
     parser.add_argument("--watermark",        action="store_true", help="Burn in Chai Cut watermark")
+    parser.add_argument("--frame-images",     default="{}", help="JSON: frame slot image_path → local_path")
     args = parser.parse_args()
     main(
         args.video, args.spec, args.output,
@@ -786,4 +1091,5 @@ if __name__ == "__main__":
         overlay_images=json.loads(args.overlay_images),
         overlay_videos=json.loads(args.overlay_videos),
         watermark=args.watermark,
+        frame_images=json.loads(args.frame_images),
     )
