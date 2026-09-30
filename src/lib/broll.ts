@@ -1,9 +1,11 @@
 /**
- * Automatic B-roll: short stock shots (Pexels, free; attribution "Videos from Pexels") over the
- * moments where a picture helps. The speaker keeps talking underneath: the shots are cutaways,
- * not inserts, and their own sound is muted.
+ * Automatic B-roll: short stock shots over the moments where a picture helps. The speaker keeps
+ * talking underneath: the shots are cutaways, not inserts, and their own sound is muted.
  *
- * Env: AUTO_BROLL=on to enable (default off), PEXELS_API_KEY. PEXELS_API_URL only for testing.
+ * Stock source: Pexels when PEXELS_API_KEY is set (attribution "Videos from Pexels"), otherwise
+ * Pixabay with PIXABAY_API_KEY (show users the videos are from Pixabay; search results are cached
+ * 24 h as its API terms ask). Both free for commercial use.
+ * Env: AUTO_BROLL=on to enable (default off). PEXELS_API_URL / PIXABAY_API_URL only for testing.
  */
 import { GoogleGenerativeAI } from '@google/generative-ai'
 import { createWriteStream } from 'node:fs'
@@ -19,10 +21,19 @@ const TAIL_MS = 2000       // …or the last 2 s
 const APART_MS = 5000
 
 export interface BrollMoment { start_ms: number; end_ms: number; query: string }
-export interface StockVideo { pexelsId: number; url: string; width: number; height: number }
+export interface StockVideo {
+  /** "pexels:<id>" / "pixabay:<id>" — the same video is saved once per user */
+  ref: string
+  url: string; width: number; height: number
+}
 
 export function brollEnabled() {
-  return process.env.AUTO_BROLL === 'on' && !!process.env.PEXELS_API_KEY
+  return process.env.AUTO_BROLL === 'on' && !!(process.env.PEXELS_API_KEY || process.env.PIXABAY_API_KEY)
+}
+
+/** The first result with a file of at least 720p, from whichever stock library is set up */
+export async function searchStock(query: string): Promise<StockVideo | null> {
+  return process.env.PEXELS_API_KEY ? searchPexels(query) : searchPixabay(query)
 }
 
 /**
@@ -68,7 +79,7 @@ type PexelsFile = { link: string; width: number; height: number; file_type?: str
 type PexelsVideo = { id: number; width: number; height: number; video_files: PexelsFile[] }
 
 /** The first Pexels result with a file of at least 720p (portrait results first, then landscape) */
-export async function searchPexels(query: string): Promise<StockVideo | null> {
+async function searchPexels(query: string): Promise<StockVideo | null> {
   const base = process.env.PEXELS_API_URL ?? 'https://api.pexels.com'
   for (const orientation of ['portrait', 'landscape']) {
     const res = await fetch(`${base}/videos/search?${new URLSearchParams({ query, orientation, per_page: '10' })}`, {
@@ -81,17 +92,44 @@ export async function searchPexels(query: string): Promise<StockVideo | null> {
       const files = (v.video_files ?? [])
         .filter(f => (f.file_type ?? 'video/mp4') === 'video/mp4' && Math.min(f.width, f.height) >= 720)
         .sort((a, b) => a.width * a.height - b.width * b.height)
-      if (files[0]) return { pexelsId: v.id, url: files[0].link, width: files[0].width, height: files[0].height }
+      if (files[0]) return { ref: `pexels:${v.id}`, url: files[0].link, width: files[0].width, height: files[0].height }
     }
   }
   return null
 }
 
+type PixabayFile = { url: string; width: number; height: number }
+type PixabayHit = { id: number; videos: Record<string, PixabayFile> }
+const pixabayCache = new Map<string, { at: number; hits: PixabayHit[] }>()
+
+/**
+ * The first Pixabay result with a file of at least 720p, vertical videos first (the API has no
+ * orientation filter). Searches are cached for 24 h, as Pixabay's API terms ask.
+ */
+async function searchPixabay(query: string): Promise<StockVideo | null> {
+  const key = query.toLowerCase()
+  let hits = pixabayCache.get(key)
+  if (!hits || Date.now() - hits.at > 24 * 3600_000) {
+    const base = process.env.PIXABAY_API_URL ?? 'https://pixabay.com'
+    const params = new URLSearchParams({ key: process.env.PIXABAY_API_KEY!, q: query.slice(0, 100), safesearch: 'true', per_page: '20' })
+    const res = await fetch(`${base}/api/videos/?${params}`)
+    if (!res.ok) throw new Error(`Pixabay ${res.status}`)
+    hits = { at: Date.now(), hits: ((await res.json()) as { hits?: PixabayHit[] }).hits ?? [] }
+    pixabayCache.set(key, hits)
+  }
+  const pick = (hit: PixabayHit) => Object.values(hit.videos ?? {})
+    .filter(f => f?.url && Math.min(f.width, f.height) >= 720)
+    .sort((a, b) => a.width * a.height - b.width * b.height)[0]
+  const withFile = hits.hits.map(h => ({ h, f: pick(h) })).filter((x): x is { h: PixabayHit; f: PixabayFile } => !!x.f)
+  const best = withFile.find(x => x.f.height > x.f.width) ?? withFile[0]
+  return best ? { ref: `pixabay:${best.h.id}`, url: best.f.url, width: best.f.width, height: best.f.height } : null
+}
+
 /** Download a stock file to disk */
-export async function downloadStock(url: string, dir: string, pexelsId: number): Promise<string> {
+export async function downloadStock(url: string, dir: string, ref: string): Promise<string> {
   const res = await fetch(url)
   if (!res.ok || !res.body) throw new Error(`Stock download ${res.status}`)
-  const path = join(dir, `pexels-${pexelsId}.mp4`)
+  const path = join(dir, `${ref.replace(':', '-')}.mp4`)
   await pipeline(Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]), createWriteStream(path))
   return path
 }

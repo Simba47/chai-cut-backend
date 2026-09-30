@@ -10,7 +10,7 @@ import type { Job, AiEditJobPayload } from '../types.js'
 import { handleTranscribeJob } from './transcribe.js'
 import { findClips, type FoundClip } from '../lib/clipFinder.js'
 import { generateClipText, fontForText, type ClipText } from '../lib/clipText.js'
-import { brollEnabled, pickBrollMoments, searchPexels, downloadStock, withBroll } from '../lib/broll.js'
+import { brollEnabled, pickBrollMoments, searchStock, downloadStock, withBroll } from '../lib/broll.js'
 import { r2UploadFile } from '../r2.js'
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
@@ -703,7 +703,7 @@ export async function handleAiEditJob(job: Job, signal?: AbortSignal) {
   const payload = job.payload as unknown as AiEditJobPayload
   const { ai_edit_job_id, video_id, clip_count } = payload
   const addBroll = payload.add_broll === true && brollEnabled()
-  if (payload.add_broll && !addBroll) console.log('[ai_edit] B-roll asked for but AUTO_BROLL is off or PEXELS_API_KEY is missing: skipping it')
+  if (payload.add_broll && !addBroll) console.log('[ai_edit] B-roll asked for but AUTO_BROLL is off or no stock API key (PEXELS_API_KEY / PIXABAY_API_KEY): skipping it')
   const t0 = Date.now()
 
   await db`UPDATE ai_edit_jobs SET status = 'running', progress = 5 WHERE id = ${ai_edit_job_id}`
@@ -836,11 +836,11 @@ async function addStockBroll(segments: ClipSegment[], words: Word[], highlight: 
     const shots: Array<{ start_ms: number; end_ms: number; videoId: string }> = []
     for (const m of moments) {
       try {
-        const stock = await searchPexels(m.query)
-        if (!stock) { console.log(`[ai_edit] B-roll: nothing on Pexels for "${m.query}"`); continue }
-        const videoId = await stockAsset(userId, stock.pexelsId, stock.url, m.query, tmp)
+        const stock = await searchStock(m.query)
+        if (!stock) { console.log(`[ai_edit] B-roll: no stock video for "${m.query}"`); continue }
+        const videoId = await stockAsset(userId, stock.ref, stock.url, m.query, tmp)
         if (videoId) shots.push({ start_ms: m.start_ms, end_ms: m.end_ms, videoId })
-        console.log(`[ai_edit] B-roll "${m.query}" at ${(m.start_ms / 1000).toFixed(1)}s: pexels ${stock.pexelsId} (${stock.width}x${stock.height})`)
+        console.log(`[ai_edit] B-roll "${m.query}" at ${(m.start_ms / 1000).toFixed(1)}s: ${stock.ref} (${stock.width}x${stock.height})`)
       } catch (e) {
         console.warn(`[ai_edit] B-roll "${m.query}" skipped:`, e instanceof Error ? e.message : e)
       }
@@ -852,21 +852,20 @@ async function addStockBroll(segments: ClipSegment[], words: Word[], highlight: 
   }
 }
 
-/** The user's copy of a Pexels video (an 'asset' video, so the render job may use it), made once */
-async function stockAsset(userId: string, pexelsId: number, url: string, query: string, tmp: string): Promise<string | null> {
-  const ref = `pexels:${pexelsId}`
+/** The user's copy of a stock video (an 'asset' video, so the render job may use it), made once */
+async function stockAsset(userId: string, ref: string, url: string, query: string, tmp: string): Promise<string | null> {
   const [existing] = await db`SELECT id FROM videos WHERE user_id = ${userId} AND stock_ref = ${ref} AND storage_path IS NOT NULL LIMIT 1`
   if (existing) return existing.id as string
-  const path = await downloadStock(url, tmp, pexelsId)
+  const path = await downloadStock(url, tmp, ref)
   const size = await probeSize(path)
   if (!size) throw new Error('not a readable video')
   const { stdout } = await execFileAsync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', path])
   const durationMs = Math.round(parseFloat(stdout) * 1000) || null
-  const storagePath = `raw/${userId}/stock-pexels-${pexelsId}.mp4`
+  const storagePath = `raw/${userId}/stock-${ref.replace(':', '-')}.mp4`
   await r2UploadFile(storagePath, path, 'video/mp4')
   const [row] = await db`
     INSERT INTO videos (user_id, source_type, storage_path, status, duration_ms, title, role, stock_ref)
-    VALUES (${userId}, 'upload', ${storagePath}, 'ready', ${durationMs}, ${`Pexels: ${query}`.slice(0, 120)}, 'asset', ${ref})
+    VALUES (${userId}, 'upload', ${storagePath}, 'ready', ${durationMs}, ${`${ref.startsWith('pixabay') ? 'Pixabay' : 'Pexels'}: ${query}`.slice(0, 120)}, 'asset', ${ref})
     RETURNING id
   `
   return row.id as string
