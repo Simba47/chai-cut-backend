@@ -9,6 +9,10 @@ if (missing.length) {
   console.error(`[startup] Missing required env vars: ${missing.join(', ')}`)
   process.exit(1)
 }
+// Captions: Vertex AI when GOOGLE_CLOUD_PROJECT is set (no daily request cap), else the Gemini API key
+console.log(process.env.GOOGLE_CLOUD_PROJECT
+  ? `[startup] Captions via Vertex AI (project ${process.env.GOOGLE_CLOUD_PROJECT}, ${process.env.GOOGLE_CREDENTIALS_JSON ? 'service account key from GOOGLE_CREDENTIALS_JSON' : 'default credentials'})`
+  : '[startup] Captions via the Gemini API key (100 requests/day on Tier 1). Set GOOGLE_CLOUD_PROJECT to use Vertex AI.')
 
 // Every job shells out to ffmpeg. A worker without it would still claim jobs from the shared
 // queue and fail each one (users see "Render failed"), so refuse to start instead.

@@ -135,7 +135,7 @@ export async function downloadStock(url: string, dir: string, ref: string): Prom
 }
 
 /** A kept part of a framing segment, or a stock shot over it */
-export interface FramedPart<K> { start_ms: number; end_ms: number; layout: 'vertical' | 'split'; slotKfs: K[][]; broll?: string }
+export interface FramedPart<K> { start_ms: number; end_ms: number; layout: 'vertical' | 'split' | 'trio'; slotKfs: K[][]; broll?: string; slotSources?: Array<number | null> }
 
 /**
  * Cuts the clip's framing segments around the B-roll shots: each shot becomes its own vertical
@@ -154,6 +154,8 @@ export function withBroll<K extends { t_ms: number; x: number; y: number; w: num
         if (to - from < 100) return
         next.push({
           ...seg, start_ms: from, end_ms: to,
+          // Borrowed footage moves on with the cut: a later piece starts later in it
+          ...(seg.slotSources ? { slotSources: seg.slotSources.map(v => (v === null ? null : v + (from - seg.start_ms))) } : {}),
           slotKfs: seg.slotKfs.map(kfs => {
             const before = [...kfs].reverse().find(k => k.t_ms <= from) ?? kfs[0]
             const inside = kfs.filter(k => k.t_ms > from && k.t_ms < to)

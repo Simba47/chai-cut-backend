@@ -178,7 +178,18 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal) {
 
     // ── Transcription ─────────────────────────────────────────────────────────
     // Progress only matters while the video is still 'transcribing' (not for background full-video captions)
-    const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, payload.language_code, signal)
+    // Captioning part of a video again (a clip, or "fresh captions"): the video's language is
+    // already known, so skip detecting it (for a clip that meant reading the clip twice). Only an
+    // Indian language is reused; English runs on auto detection, which reads the audio once anyway.
+    let languageCode = payload.language_code
+    if (!languageCode && (isClipJob || isRetranscribe)) {
+      const [known] = await db`
+        SELECT language FROM transcripts WHERE video_id = ${payload.video_id} AND language IS NOT NULL
+        ORDER BY created_at DESC LIMIT 1`
+      const lang = known?.language as string | undefined
+      if (lang && lang !== 'unknown' && !lang.startsWith('en')) languageCode = lang
+    }
+    const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, languageCode, signal)
     signal?.throwIfAborted()
 
     // Clip jobs (first transcription or retranscribe): replace only this clip's time range in the
@@ -895,6 +906,8 @@ const GEMINI_API_KEY    = process.env.GEMINI_API_KEY
 const GEMINI_BASE       = 'https://generativelanguage.googleapis.com'
 const GEMINI_STT_MODEL  = 'gemini-3.5-transcribe'
 const GEMINI_CHUNK_SEC  = 300
+/** Seconds of audio read to detect the spoken language (see transcribeAudio) */
+const PROBE_SEC         = 60
 const GEMINI_MAX_TRIES  = 8
 
 // Our language codes (Sarvam style) → BCP-47 codes Gemini accepts
@@ -938,16 +951,35 @@ async function geminiUploadAudio(buf: Buffer): Promise<{ name: string; uri: stri
 // ── Vertex AI (Google Cloud) ─────────────────────────────────────────────────
 // With GOOGLE_CLOUD_PROJECT set, transcription goes to Gemini 3.5 Transcribe on Vertex AI instead
 // of the Gemini API key: Vertex has no daily request cap (the API key's Tier 1 allows 100 a day).
-// Auth is Application Default Credentials: `gcloud auth application-default login` locally,
-// a service account (GOOGLE_APPLICATION_CREDENTIALS) on a server. The model is only served from
-// the 'global' location; audio goes inline (5-minute chunks, well under the 15-minute limit).
+// Auth: a service account key in GOOGLE_CREDENTIALS_JSON (the key file's contents, as JSON or
+// base64 — Railway has env vars, not files), else Application Default Credentials
+// (`gcloud auth application-default login` locally, or a GOOGLE_APPLICATION_CREDENTIALS file).
+// The model is only served from the 'global' location; audio goes inline (5-minute chunks, well
+// under the 15-minute limit).
 const VERTEX_PROJECT   = process.env.GOOGLE_CLOUD_PROJECT
 const VERTEX_LOCATION  = process.env.GOOGLE_CLOUD_LOCATION || 'global'
 const VERTEX_STT_MODEL = 'gemini-3.5-transcribe-preview'
 let vertexAuth: GoogleAuth | null = null
 
+/** The service account key from GOOGLE_CREDENTIALS_JSON (raw JSON or base64), if set */
+export function vertexCredentials(): Record<string, unknown> | undefined {
+  const raw = process.env.GOOGLE_CREDENTIALS_JSON?.trim()
+  if (!raw) return undefined
+  try {
+    return JSON.parse(raw.startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8'))
+  } catch {
+    throw new Error('GOOGLE_CREDENTIALS_JSON is set but is not a valid service account key (paste the whole JSON file)')
+  }
+}
+
+export function vertexAuthClient(): GoogleAuth {
+  const credentials = vertexCredentials()
+  vertexAuth ??= new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/cloud-platform'], ...(credentials ? { credentials } : {}) })
+  return vertexAuth
+}
+
 async function vertexTranscribeChunk(buf: Buffer, languageCode?: string): Promise<SarvamWord[]> {
-  vertexAuth ??= new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/cloud-platform'] })
+  const auth = vertexAuthClient()
   const host = VERTEX_LOCATION === 'global' ? 'aiplatform.googleapis.com' : `${VERTEX_LOCATION}-aiplatform.googleapis.com`
   const url = `https://${host}/v1/projects/${VERTEX_PROJECT}/locations/${VERTEX_LOCATION}/publishers/google/models/${VERTEX_STT_MODEL}:generateContent`
   // Verbatim (the default mode), word timestamps, and a speaker per stretch of speech, so
@@ -960,7 +992,7 @@ async function vertexTranscribeChunk(buf: Buffer, languageCode?: string): Promis
   })
 
   for (let attempt = 1; ; attempt++) {
-    const token = await vertexAuth.getAccessToken()
+    const token = await auth.getAccessToken()
     const res = await fetchWithTimeout(url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'x-goog-user-project': VERTEX_PROJECT!, 'Content-Type': 'application/json' },
@@ -1067,13 +1099,16 @@ export async function transcribeAudio(audioPath: string, videoId?: string, langu
   console.log(`[transcribe] audio ${totalSec.toFixed(1)}s → ${numChunks} chunk(s)`)
   if (videoId) await setProgress(videoId, 62)
 
-  async function chunkWords(i: number, lang: string | undefined): Promise<SarvamWord[]> {
+  // Chunk i of the audio; `skipSec` starts it part-way (its first seconds were already read)
+  const chunkWords = (i: number, lang: string | undefined, skipSec = 0) =>
+    rangeWords(i * GEMINI_CHUNK_SEC + skipSec, GEMINI_CHUNK_SEC - skipSec, lang, `${i}`)
+
+  async function rangeWords(startSec: number, durSec: number, lang: string | undefined, tag: string): Promise<SarvamWord[]> {
     // A job that ran past its timeout stops here, between chunks
     signal?.throwIfAborted()
-    const startSec = i * GEMINI_CHUNK_SEC
-    const chunkPath = audioPath.replace('.wav', `_gchunk${i}.wav`)
+    const chunkPath = audioPath.replace('.wav', `_gchunk${tag}.wav`)
     await execFileAsync('ffmpeg', [
-      '-i', audioPath, '-ss', String(startSec), '-t', String(GEMINI_CHUNK_SEC),
+      '-i', audioPath, '-ss', String(startSec), '-t', String(durSec),
       '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', chunkPath,
     ])
     const buf = await readFile(chunkPath)
@@ -1081,34 +1116,63 @@ export async function transcribeAudio(audioPath: string, videoId?: string, langu
     if (buf.length < 16_000) return []  // < 0.5s of audio — nothing to transcribe
 
     let words = await geminiTranscribeChunk(buf, lang)
-    console.log(`[gemini] chunk ${i + 1}/${numChunks}: ${words.length} words${lang ? ` (${lang})` : ''}`)
+    console.log(`[gemini] ${tag.startsWith('probe') ? `language ${tag}` : `chunk ${parseInt(tag, 10) + 1}/${numChunks}`} (${Math.round(durSec)}s): ${words.length} words${lang ? ` (${lang})` : ''}`)
     // Locked to an Indian language, Gemini drops sentences spoken purely in English — re-read
     // the stretches it left empty as English and merge those words in
     if (lang && !lang.startsWith('en')) {
-      const chunkSec = Math.min(GEMINI_CHUNK_SEC, Math.max(0, totalSec - startSec))
+      const chunkSec = Math.min(durSec, Math.max(0, totalSec - startSec))
       const extra = await englishGapPass(chunkPath, audioPath, startSec, chunkSec, words)
       if (extra.length) {
-        console.log(`[gemini] chunk ${i + 1}/${numChunks}: +${extra.length} English words from untranscribed gaps`)
+        console.log(`[gemini] chunk ${parseInt(tag, 10) + 1}/${numChunks}: +${extra.length} English words from untranscribed gaps`)
         words = [...words, ...extra].sort((a, b) => a.start - b.start)
       }
     }
     // Speaker labels are only consistent within one request, so scope them to the chunk
-    return words.map(w => ({ ...w, start: w.start + startSec, end: w.end + startSec, speaker: w.speaker ? `c${i}:${w.speaker}` : undefined }))
+    return words.map(w => ({ ...w, start: w.start + startSec, end: w.end + startSec, speaker: w.speaker ? `c${tag}:${w.speaker}` : undefined }))
   }
 
-  // Auto-detect drops a lot of Telugu speech, so detect the language from the
-  // first chunk's script, then lock it for every chunk (re-running chunk 1).
+  // Auto-detect drops a lot of Telugu speech, so detect the language from the script of what
+  // is said, then lock it for every chunk. Long audio: detect from 1-minute samples (the start,
+  // then the middle if the start has no speech or only English) instead of captioning the whole
+  // first 5-minute chunk twice. Short audio (a clip): one auto pass is the sample.
   let lang = (languageCode && languageCode !== 'unknown') ? languageCode : undefined
   const allWords: SarvamWord[] = []
-  let probe: SarvamWord[] | null = null
+  let probe: SarvamWord[] | null = null   // short audio: the auto pass of chunk 1
+  // Long audio: the 1-minute samples read on auto. If the language stays auto (English), their
+  // words are kept and those minutes aren't sent again.
+  const samples: { from: number; to: number; words: SarvamWord[] }[] = []
   if (!lang) {
-    probe = await chunkWords(0, undefined)
-    lang = detectSarvamLang(probe.map(w => w.word).join(' '))
+    if (totalSec <= PROBE_SEC * 1.5) {
+      probe = await chunkWords(0, undefined)
+      lang = detectSarvamLang(probe.map(w => w.word).join(' '))
+    } else {
+      const sample = async (from: number, tag: string) => {
+        const words = await rangeWords(from, PROBE_SEC, undefined, tag)
+        samples.push({ from, to: from + PROBE_SEC, words })
+        return detectSarvamLang(words.map(w => w.word).join(' '))
+      }
+      lang = await sample(0, 'probe-start')
+      // The start can be music or an English intro: check the middle before settling on auto
+      if (!lang) lang = await sample(Math.max(PROBE_SEC, Math.min(totalSec / 2, totalSec - PROBE_SEC)), 'probe-middle')
+    }
     if (lang) console.log(`[transcribe] detected language: ${lang} — locking for all chunks`)
   }
   for (let i = 0; i < numChunks; i++) {
     if (i === 0 && probe && !lang) { allWords.push(...probe); continue }  // English / Latin script: keep auto result
     if (videoId) await setProgress(videoId, Math.round(63 + (i / numChunks) * 33))
+    const from = i * GEMINI_CHUNK_SEC, to = Math.min(totalSec, from + GEMINI_CHUNK_SEC)
+    const inChunk = lang ? [] : samples.filter(sm => sm.to > from && sm.from < to)
+    if (inChunk.length) {
+      // Staying on auto: read only the parts of this chunk the samples didn't cover
+      let cursor = from, part = 0
+      for (const sm of inChunk.sort((x, y) => x.from - y.from)) {
+        if (sm.from - cursor >= 1) allWords.push(...await rangeWords(cursor, sm.from - cursor, undefined, `${i}-${part++}`))
+        allWords.push(...sm.words.filter(w => w.start >= from && w.start < to))
+        cursor = Math.max(cursor, sm.to)
+      }
+      if (to - cursor >= 1) allWords.push(...await rangeWords(cursor, to - cursor, undefined, `${i}-${part++}`))
+      continue
+    }
     const words = await chunkWords(i, lang)
     // Chunk 1 was transcribed twice (auto + locked) — keep whichever caught more speech
     allWords.push(...(i === 0 && probe && probe.length > words.length ? probe : words))
@@ -1150,6 +1214,14 @@ async function englishGapPass(chunkPathHint: string, audioPath: string, chunkSta
   }
   if (chunkSec - cursor >= GAP_MIN_SEC) gaps.push([cursor, chunkSec])
   if (!gaps.length) return []
+  // Most gaps are pauses: drop their silent parts so only stretches with sound are paid for
+  const voiced = await voicedParts(audioPath, chunkStartSec, chunkSec, gaps)
+  if (voiced.length < gaps.length || voiced.some((v, k) => v[1] - v[0] < gaps[k][1] - gaps[k][0])) {
+    const before = gaps.reduce((t, [a, b]) => t + b - a, 0), after = voiced.reduce((t, [a, b]) => t + b - a, 0)
+    console.log(`[gemini] English gap pass: ${after.toFixed(0)}s with sound of ${before.toFixed(0)}s of gaps`)
+  }
+  gaps.splice(0, gaps.length, ...voiced)
+  if (!gaps.length) return []
 
   // Pieces of the full audio (absolute times) and where each lands in the stitched clip
   const pieces = gaps.map(([a, b]) => ({ from: Math.max(0, a - GAP_PAD_SEC), to: Math.min(chunkSec, b + GAP_PAD_SEC) }))
@@ -1185,6 +1257,45 @@ async function englishGapPass(chunkPathHint: string, audioPath: string, chunkSta
   } finally {
     await unlink(gapPath).catch(() => {})
   }
+}
+
+/**
+ * The parts of each gap (chunk-relative seconds) that are not silence, using FFmpeg's
+ * silencedetect on the chunk. Blips shorter than VOICED_MIN_SEC are dropped.
+ * On any error the gaps are returned unchanged, so this can only save audio, never lose words.
+ */
+const SILENCE_DB = -40
+const VOICED_MIN_SEC = 0.6
+async function voicedParts(audioPath: string, chunkStartSec: number, chunkSec: number, gaps: [number, number][]): Promise<[number, number][]> {
+  let silences: [number, number][]
+  try {
+    const { stderr } = await execFileAsync('ffmpeg', ['-hide_banner', '-nostats', '-ss', String(chunkStartSec), '-t', String(chunkSec), '-i', audioPath,
+      '-af', `silencedetect=noise=${SILENCE_DB}dB:d=0.5`, '-f', 'null', '-'])
+    silences = []
+    let open: number | null = null
+    for (const line of stderr.split('\n')) {
+      const s0 = line.match(/silence_start: (-?[\d.]+)/)
+      const s1 = line.match(/silence_end: (-?[\d.]+)/)
+      if (s0) open = Math.max(0, parseFloat(s0[1]))
+      if (s1 && open !== null) { silences.push([open, parseFloat(s1[1])]); open = null }
+    }
+    if (open !== null) silences.push([open, chunkSec])
+  } catch {
+    return gaps
+  }
+  const out: [number, number][] = []
+  for (const [a, b] of gaps) {
+    let pieces: [number, number][] = [[a, b]]
+    for (const [sa, sb] of silences) {
+      pieces = pieces.flatMap(([pa, pb]): [number, number][] => {
+        if (sb <= pa || sa >= pb) return [[pa, pb]]
+        return [[pa, Math.max(pa, sa)], [Math.min(pb, sb), pb]].filter(([x, y]) => y > x) as [number, number][]
+      })
+    }
+    // A short English word ("okay", "yes") is ~0.5 s, so keep any sound from 0.6 s up
+    out.push(...pieces.filter(([x, y]) => y - x >= VOICED_MIN_SEC))
+  }
+  return out
 }
 
 // ── Rule-based Telugu → Roman transliterator ──────────────────────────────────
