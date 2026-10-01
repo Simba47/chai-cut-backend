@@ -24,7 +24,11 @@ Output: JSON to stdout:
   }
   All coordinates are fractions of the frame (0.0–1.0). score is the detection confidence
   (MediaPipe), 1.0 for Haar faces and 0.0 for motion boxes. With --lips, "lip" is how open the
-  mouth is (inner lip gap / face height), given only on frames with 2+ faces.
+  mouth is (inner lip gap / face height), and "ex" the face's expression (MediaPipe blendshapes,
+  0–1 each: sm smile, jo jaw open, bu brows raised, bd brows lowered, ew eyes wide, fr frown),
+  on every real face (who is talking, and who is reacting — also across camera shots).
+  "sig" is a colour signature of the face and the clothes below it (24 numbers): shots of the
+  same person look alike, which tells apart who each one-person camera shot shows.
 """
 import argparse
 import json
@@ -130,9 +134,21 @@ class _Lips:
         self._mp = mp
         self._landmarker = vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=LANDMARKER_PATH), num_faces=1,
+            output_face_blendshapes=True,
         ))
 
+    # Blendshapes that show a strong reaction (laugh, shock, anger, sadness), averaged left/right
+    _EXPR = {
+        "sm": ("mouthSmileLeft", "mouthSmileRight"),
+        "jo": ("jawOpen",),
+        "bu": ("browInnerUp",),
+        "bd": ("browDownLeft", "browDownRight"),
+        "ew": ("eyeWideLeft", "eyeWideRight"),
+        "fr": ("mouthFrownLeft", "mouthFrownRight"),
+    }
+
     def gap(self, bgr, face):
+        """(lip gap / face height, expression dict) for one face, or (None, None)"""
         import cv2
         h_px, w_px = bgr.shape[:2]
         # The face box plus a margin, as a square
@@ -141,16 +157,37 @@ class _Lips:
         x0, y0 = int(max(0, cx - side / 2)), int(max(0, cy - side / 2))
         x1, y1 = int(min(w_px, cx + side / 2)), int(min(h_px, cy + side / 2))
         if x1 - x0 < 8 or y1 - y0 < 8:
-            return None
+            return None, None
         crop = cv2.resize(bgr[y0:y1, x0:x1], (256, 256), interpolation=cv2.INTER_LINEAR)
         rgb = np.ascontiguousarray(crop[:, :, ::-1])
         res = self._landmarker.detect(self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb))
         if not res.face_landmarks:
-            return None
+            return None, None
         lm = res.face_landmarks[0]
         dist = lambda a, b: float(np.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y))
         height = dist(self.TOP, self.CHIN)
-        return round(dist(self.UPPER, self.LOWER) / height, 4) if height > 0 else None
+        lip = round(dist(self.UPPER, self.LOWER) / height, 4) if height > 0 else None
+        expr = None
+        if getattr(res, "face_blendshapes", None):
+            by_name = {c.category_name: c.score for c in res.face_blendshapes[0]}
+            expr = {k: round(sum(by_name.get(n, 0.0) for n in names) / len(names), 3) for k, names in self._EXPR.items()}
+        return lip, expr
+
+
+def _signature(bgr, face):
+    """Hue/saturation histogram (8×3 bins) of the face and the clothes below it, summing to 1"""
+    import cv2
+    h_px, w_px = bgr.shape[:2]
+    x0 = int(max(0, (face["x"] - face["w"] * 0.5) * w_px))
+    x1 = int(min(w_px, (face["x"] + face["w"] * 1.5) * w_px))
+    y0 = int(max(0, face["y"] * h_px))
+    y1 = int(min(h_px, (face["y"] + face["h"] * 3.0) * h_px))
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    hsv = cv2.cvtColor(bgr[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [8, 3], [0, 180, 0, 256]).flatten()
+    total = float(hist.sum())
+    return [round(float(v) / total, 3) for v in hist] if total > 0 else None
 
 
 def _detect_haar(cascade, gray, w_px, h_px):
@@ -364,17 +401,25 @@ def detect_subjects(frames_dir: str, lips: bool = False) -> dict:
         subjects.sort(key=lambda b: b["cx"])
 
         # Mouth opening, only where there is more than one person to choose between
+        # Mouth opening and expression on every real face (one-person camera shots included: who
+        # talks and who reacts across shots), and a colour signature to tell people apart
         lip_values = [None] * len(subjects)
+        expr_values = [None] * len(subjects)
+        sig_values = [None] * len(subjects)
         real = [s for s in subjects if s["score"] > 0]
-        if lip_reader is not None and len(real) >= 2:
+        if real:
             img = cv2.imread(paths[fi])
             for i, s in enumerate(subjects):
-                if s["score"] > 0:
+                if s["score"] <= 0:
+                    continue
+                sig_values[i] = _signature(img, s)
+                if lip_reader is not None:
                     try:
-                        lip_values[i] = lip_reader.gap(img, s)
+                        lip_values[i], expr_values[i] = lip_reader.gap(img, s)
                     except Exception as e:
                         print(f"[detect] FaceLandmarker failed on frame {fi}: {e}", file=sys.stderr)
-            lip_frames += 1
+            if lip_reader is not None:
+                lip_frames += 1
 
         person_count = len(subjects)
         max_person_count = max(max_person_count, person_count)
@@ -383,7 +428,9 @@ def detect_subjects(frames_dir: str, lips: bool = False) -> dict:
             "frame_index": fi,
             "person_count": person_count,
             "faces": [{"x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"], "score": round(s["score"], 3),
-                       **({"lip": lip_values[i]} if lip_values[i] is not None else {})}
+                       **({"lip": lip_values[i]} if lip_values[i] is not None else {}),
+                       **({"ex": expr_values[i]} if expr_values[i] is not None else {}),
+                       **({"sig": sig_values[i]} if sig_values[i] is not None else {})}
                       for i, s in enumerate(subjects[:4])],
         })
 

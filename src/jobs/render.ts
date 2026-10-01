@@ -62,6 +62,9 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
     }
     const secondaryVideos: Record<string, string> = {}
     for (const videoId of otherVideoIds) {
+      // The clip's own video (borrowed reaction slots): streamed from the same signed URL as the
+      // main input, opened at each moment — never downloaded whole
+      if (videoId === baseSpec.main_video_id) { secondaryVideos[videoId] = videoSignedUrl; continue }
       const [vRow] = await db`SELECT storage_path FROM videos WHERE id = ${videoId} AND user_id = ${owner?.user_id ?? null}`
       if (!vRow?.storage_path) continue
       try {
@@ -199,6 +202,8 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
   const dims = QUALITY_DIMS[quality] ?? QUALITY_DIMS['1080p']
   return {
     clip_id: clipId,
+    // Crop boxes showing this id show the clip's own video at another moment (borrowed reactions)
+    main_video_id: clip.video_id,
     start_ms: clip.start_ms,
     end_ms: clip.end_ms,
     remove_fillers: clip.remove_fillers === true,

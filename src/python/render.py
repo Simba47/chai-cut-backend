@@ -763,6 +763,13 @@ def main(
 
     # UTF-8 explicitly: Windows defaults to cp1252 and fails on Telugu/Hindi captions
     spec           = json.load(open(spec_path, encoding="utf-8"))
+    # A crop box showing this id shows the clip's own video at another moment (a "borrowed"
+    # reaction, from source_offset_ms): read through its own input, seeked straight there
+    main_video_id  = spec.get("main_video_id")
+
+    def is_borrowed(box) -> bool:
+        return bool(box and main_video_id and box.get("source_video_id") == main_video_id
+                    and main_video_id in secondary_videos)
     clip_start_ms  = int(spec["start_ms"])
     clip_end_ms    = int(spec["end_ms"])
     clip_dur_ms    = clip_end_ms - clip_start_ms
@@ -878,9 +885,11 @@ def main(
             # For B-roll INSERT segments, remember the primary (slot-0) source so empty
             # extra slots fall back to it instead of the main video.
             primary_vid = (boxes[0].get("source_video_id") if boxes else None)
-            primary_vid = primary_vid if (primary_vid and primary_vid in secondary_videos) else None
+            primary_vid = primary_vid if (primary_vid and primary_vid in secondary_videos and not is_borrowed(boxes[0])) else None
             for i in range(n_slots):
                 box    = boxes[i] if i < len(boxes) else None
+                if is_borrowed(box):
+                    continue  # its own input (below)
                 vid_id = box.get("source_video_id") if box else None
                 if not (vid_id and vid_id in secondary_videos) and i > 0 and primary_vid:
                     vid_id = primary_vid
@@ -901,11 +910,13 @@ def main(
         ]
 
         sec_input_idx: dict[str, int] = {}
-        for i, (vid_id, path) in enumerate(secondary_videos.items()):
+        # The clip's own video is only read by borrowed slots (their own seeked inputs, below)
+        looped = [(vid_id, path) for vid_id, path in secondary_videos.items() if vid_id != main_video_id]
+        for i, (vid_id, path) in enumerate(looped):
             sec_input_idx[vid_id] = i + 2
             inputs += ["-stream_loop", "-1", "-i", path]
 
-        img_base = 2 + len(secondary_videos)
+        img_base = 2 + len(looped)
         valid_img: list[tuple[dict, str]] = []
         for ov in img_overlays:
             lp = ov.get("local_path", "")
@@ -950,6 +961,21 @@ def main(
                     frame_item_in[(si, it["id"])] = f"[{next_input}:v]"
                     next_input += 1
 
+        # Borrowed reaction slots: the clip's own video from another moment, one input each, opened
+        # at that moment (the whole video is never decoded up to it)
+        borrowed_in: dict[tuple[int, int], str] = {}
+        for si, seg in enumerate(segments):
+            if is_frame(seg.get("layout")):
+                continue
+            for box in seg.get("crop_boxes", []):
+                if not is_borrowed(box):
+                    continue
+                off = max(0.0, int(box.get("source_offset_ms", 0)) / 1000.0)
+                dur = (int(seg["end_ms"]) - int(seg["start_ms"])) / 1000.0
+                inputs += ["-thread_queue_size", "1024", "-ss", f"{off:.3f}", "-t", f"{dur + 0.5:.3f}", "-i", secondary_videos[main_video_id]]
+                borrowed_in[(si, int(box.get("slot_index", 0)))] = f"[{next_input}:v]"
+                next_input += 1
+
         # ── Build filter_complex ───────────────────────────────────────────────
         fp: list[str] = []
 
@@ -993,7 +1019,8 @@ def main(
             # For non-pushed main-video segments, fall back to crop_box[0].source_offset_ms,
             # which stores the correct video position (e.g. after Part B, the continuation
             # starts at the video position where Part B left off, not at start_ms).
-            _primary_box = boxes[0] if boxes else None
+            # Borrowed slots show another moment, so the segment's own position comes from a live slot
+            _primary_box = next((b for b in boxes if not is_borrowed(b)), boxes[0] if boxes else None)
             _primary_box_vid_id = _primary_box.get("source_video_id") if _primary_box else None
             _is_main_video = not (_primary_box_vid_id and _primary_box_vid_id in secondary_videos)
             if seg.get("video_offset_ms") is not None:
@@ -1102,6 +1129,13 @@ def main(
                 box    = boxes[slot_i] if slot_i < len(boxes) else None
                 vid_id = box.get("source_video_id") if box else None
 
+                if (si, slot_i) in borrowed_in:
+                    # Already opened at its moment: only the length and the crop
+                    crop  = _crop_filter(box, smss)
+                    scale = _scale_fit(dst_w, dst_h) if fit else _scale_cover(dst_w, dst_h)
+                    fp.append(f"{borrowed_in[(si, slot_i)]}setpts=PTS-STARTPTS,trim=duration={dur_ms / 1000.0:.3f},{crop},{scale},setsar=1{lbl}")
+                    return
+
                 # If this extra slot has no B-roll source but the primary slot does, inherit
                 # the primary B-roll so the split renders the INSERT video everywhere (matching
                 # the editor preview, which paints brollVid for all slots).
@@ -1204,7 +1238,7 @@ def main(
             t1   = ov.get("end_ms", clip_dur_ms) / 1000.0
             olbl = f"[vdt{oi}]"
             fp.append(
-                f"{cur}drawtext=fontfile={font_path}:text='{text}':fontsize={sz}"
+                f"{cur}drawtext=fontfile={_filter_path(font_path)}:text='{text}':fontsize={sz}"
                 f":fontcolor=0x{r:02X}{g:02X}{b2:02X}:x={sx}:y={sy}"
                 f":shadowx=2:shadowy=2:shadowcolor=black@0.7{outline}"
                 f":enable='between(t,{t0:.3f},{t1:.3f})'{olbl}"
@@ -1259,7 +1293,7 @@ def main(
             wm_text = _escape_drawtext("Chai Cut")
             if wm_font:
                 fp.append(
-                    f"{cur}drawtext=fontfile={wm_font}:text='{wm_text}'"
+                    f"{cur}drawtext=fontfile={_filter_path(wm_font)}:text='{wm_text}'"
                     f":fontsize={max(24, out_w // 36)}:fontcolor=white@0.55"
                     f":x=w-tw-{max(16, out_w // 60)}:y=h-th-{max(16, out_h // 120)}"
                     f":shadowx=1:shadowy=1:shadowcolor=black@0.5[vwm]"
