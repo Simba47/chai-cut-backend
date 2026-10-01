@@ -1,4 +1,14 @@
 # Render pipeline is FFmpeg-native; audio.py, interpolation.py use only stdlib.
-# OpenCV is required for AI editing face detection (face_detect.py).
-# haarcascade_frontalface_default.xml must be present in this directory (checked in).
-opencv-python-headless
+# OpenCV + MediaPipe are for AI editing face detection (face_detect.py).
+# haarcascade_frontalface_default.xml and blaze_face_short_range.tflite are checked in next to it.
+#
+# OpenCV stays on 4.x: 5.0 moved the Haar cascade (CascadeClassifier) out of the main package.
+opencv-python-headless==4.14.0.94
+numpy
+# What MediaPipe needs at runtime. MediaPipe itself is installed from requirements-nodeps.txt
+# without its declared dependencies: those pull in opencv-contrib-python (needs libGL, and
+# clashes with opencv-python-headless) and sounddevice (needs PortAudio), neither used here.
+absl-py~=2.3
+flatbuffers~=25.9
+certifi
+matplotlib
