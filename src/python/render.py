@@ -704,6 +704,13 @@ def _crop_filter(box: dict | None, seg_start_ms: int) -> str:
     return f"sendcmd=c='{';'.join(cmds)}',{crop}"
 
 
+def _is_full_frame(box: dict | None) -> bool:
+    """Every keyframe of the box frames the whole picture"""
+    kfs = (box or {}).get("box_keyframes") or []
+    return bool(kfs) and all(abs(float(k.get("x", 0))) < 0.005 and abs(float(k.get("y", 0))) < 0.005
+                             and float(k.get("w", 0)) > 0.995 and float(k.get("h", 0)) > 0.995 for k in kfs)
+
+
 def _scale_cover(w: int, h: int) -> str:
     """Scale to fill w×h (cover crop — no black bars, excess is cropped center)."""
     return (
@@ -1128,6 +1135,10 @@ def main(
             def trim_slot(slot_i: int, dst_w: int, dst_h: int, fit: bool, lbl: str) -> None:
                 box    = boxes[slot_i] if slot_i < len(boxes) else None
                 vid_id = box.get("source_video_id") if box else None
+                # A split/trio slot framing the whole picture shows it whole (a related visual):
+                # fitted with bars, not cropped to fill the slot
+                if not fit and layout in ("split", "trio") and _is_full_frame(box):
+                    fit = True
 
                 if (si, slot_i) in borrowed_in:
                     # Already opened at its moment: only the length and the crop

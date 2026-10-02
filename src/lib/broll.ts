@@ -147,6 +147,8 @@ export function withBroll<K extends { t_ms: number; x: number; y: number; w: num
 ): FramedPart<K>[] {
   let out = segments
   for (const shot of shots) {
+    // Never over a split or trio (a reaction or a related visual is on screen there)
+    if (out.some(seg => seg.layout !== 'vertical' && seg.start_ms < shot.end_ms && seg.end_ms > shot.start_ms)) continue
     const next: FramedPart<K>[] = []
     for (const seg of out) {
       if (seg.broll || shot.end_ms <= seg.start_ms || shot.start_ms >= seg.end_ms) { next.push(seg); continue }

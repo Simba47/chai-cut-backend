@@ -5,8 +5,10 @@
  * labelled with its layout.
  *
  *   npx tsx src/scripts/reframe-local.ts --video <file or URL> [--start 60] [--end 120] [--out out.mp4]
- *                                        [--words-from <video id>]
+ *                                        [--words-from <video id>] [--visuals]
  *
+ * --visuals finds the whole video's own visuals and picks related ones for the clip (two small
+ * Gemini calls, with GEMINI_API_KEY from .env).
  * --words-from reads that video's transcript (read-only) for real sentence endings and speakers.
  * Without it, someone is assumed to be talking the whole time (one speaker label).
  */
@@ -24,7 +26,8 @@ process.env.R2_ENDPOINT ||= 'http://localhost'
 process.env.R2_ACCESS_KEY_ID ||= 'unused'
 process.env.R2_SECRET_ACCESS_KEY ||= 'unused'
 process.env.GEMINI_API_KEY ||= 'unused'
-const { analyseClip, buildSegments, probeSize, trackFaces, planSpeakers, reactionStrength, personShots } = await import('../jobs/ai_edit.js')
+const { analyseClip, buildSegments, probeSize, trackFaces, planSpeakers, reactionStrength, personShots, visualWindows, withShotReactions } = await import('../jobs/ai_edit.js')
+const { findVisuals, describeVisuals, pickVisualMoments, detectPanels, refinePanels } = await import('../lib/visuals.js')
 
 const exec = promisify(execFile)
 const arg = (name: string, fallback?: string) => {
@@ -73,7 +76,44 @@ try {
   console.log('• Finding faces, expressions and camera cuts (4 frames a second) …')
   const t0 = Date.now()
   const analysis = await analyseClip(tmp, clip, 0, durMs, size, words)
-  const segments = buildSegments(analysis, durMs)
+  if (process.argv.includes('--visuals')) {
+    const { config } = await import('dotenv')
+    const key = (config({ processEnv: {} }).parsed ?? {}).GEMINI_API_KEY!
+    analysis.panels = await refinePanels(await detectPanels(clip, 0, durMs, tmp, key), analysis.cuts, durMs, clip, 0)
+    for (const p of analysis.panels) console.log(`  graphic panel ${(p.start_ms / 1000).toFixed(1)}–${(p.end_ms / 1000).toFixed(1)}s at x ${p.x.toFixed(2)} y ${p.y.toFixed(2)} w ${p.w.toFixed(2)} h ${p.h.toFixed(2)}`)
+  }
+  let segments = buildSegments(analysis, durMs)
+
+  // Related visuals (the speaker on top, what they talk about below), from the whole video
+  if (process.argv.includes('--visuals')) {
+    const { config } = await import('dotenv')
+    const key = (config({ processEnv: {} }).parsed ?? {}).GEMINI_API_KEY
+    if (!key) throw new Error('--visuals needs GEMINI_API_KEY in .env')
+    console.log('• Finding the video\'s own visuals (key frames of the whole video) …')
+    const found = await findVisuals(video, join(tmp, 'visuals'))
+    const visuals = await describeVisuals(found, key)
+    console.log(`  ${found.length} faceless stretch(es), ${visuals.length} worth showing:`)
+    for (const v of visuals) console.log(`    ${(v.start_ms / 1000).toFixed(1)}s  ${v.about}`)
+    // The transcript's words in source time, for picking
+    const from = startS * 1000
+    const srcWords = words.map(w => ({ word: '', start_ms: w.start_ms + from, end_ms: w.end_ms + from }))
+    if (wordsFrom) {
+      const { config: cfg } = await import('dotenv')
+      const env = cfg({ processEnv: {} }).parsed ?? {}
+      const postgres = (await import('postgres')).default
+      const sql = postgres(env.DATABASE_URL!, { ssl: 'require', max: 1, onnotice: () => {} })
+      const rows = await sql.begin('read only', tx => tx`
+        SELECT tw.word, tw.start_ms, tw.end_ms FROM transcript_words tw
+        WHERE tw.transcript_id = (SELECT t.id FROM transcripts t WHERE t.video_id = ${wordsFrom}
+            AND EXISTS (SELECT 1 FROM transcript_words WHERE transcript_id = t.id) ORDER BY t.created_at DESC LIMIT 1)
+          AND tw.start_ms >= ${from} AND tw.start_ms < ${from + durMs} ORDER BY tw.start_ms`)
+      await sql.end()
+      srcWords.splice(0, srcWords.length, ...rows.map(w => ({ word: w.word as string, start_ms: w.start_ms as number, end_ms: w.end_ms as number })))
+    }
+    const moments = await pickVisualMoments(srcWords, from, from + durMs, visuals, key)
+    for (const m of moments) console.log(`  related visual at ${(m.start_ms / 1000).toFixed(1)}–${(m.end_ms / 1000).toFixed(1)}s: ${m.visual.about}`)
+    segments = withShotReactions(segments, visualWindows(moments, analysis, from), analysis.reelW)
+  }
   const exFrames = analysis.info.frames.filter(f => f.faces.some(face => face.ex)).length
   console.log(`  ${analysis.info.frames.length} frames in ${((Date.now() - t0) / 1000).toFixed(0)}s · up to ${analysis.info.face_count} people · expressions read on ${exFrames} frames · ${analysis.cuts.length} camera cut(s)`)
 
@@ -109,7 +149,10 @@ try {
   }
 
   const label = (s: typeof segments[number]) =>
-    s.layout === 'trio' && s.slotSources ? 'TRIO — borrowed reactions + speaker (middle)'
+    s.layout === 'split' && (analysis.panels ?? []).some(p => s.start_ms >= p.start_ms - 1 && s.end_ms <= p.end_ms + 1) ? 'SPLIT — speaker + graphic panel'
+      : s.layout === 'split' && s.slotKfs[1]?.[0]?.w === 1 ? 'SPLIT — speaker + related visual'
+
+      : s.layout === 'trio' && s.slotSources ? 'TRIO — borrowed reactions + speaker (middle)'
       : s.layout === 'trio' ? 'TRIO — reactors + speaker (middle)'
       : s.layout === 'split' && s.slotSources?.[0] === null ? 'SPLIT — reaction shot (top) + speaker (borrowed)'
       : s.layout === 'split' && s.slotSources ? 'SPLIT — borrowed reaction (top) + speaker'
@@ -127,8 +170,9 @@ try {
       crop_boxes: s.slotKfs.map((kfs, slot) => ({
         id: `seg${i}-box${slot}`, slot_index: slot,
         // Borrowed footage: the same video from another moment (the cut file starts at the clip start)
+        // Borrowed footage reads the source video itself, at its own moment (source ms)
         ...(s.slotSources?.[slot] != null
-          ? { source_video_id: 'MAIN', source_offset_ms: s.slotSources[slot], muted: true }
+          ? { source_video_id: 'MAIN', source_offset_ms: startS * 1000 + s.slotSources[slot]!, muted: true }
           : { source_video_id: null, source_offset_ms: s.start_ms, muted: false }),
         volume: 1,
         box_keyframes: kfs.map(k => ({ t_ms: k.t_ms, x: k.x, y: k.y, w: k.w, h: k.h })),
@@ -144,7 +188,7 @@ try {
   console.log(`\n• Rendering ${out} …`)
   const script = join(dirname(fileURLToPath(import.meta.url)), '../python/render.py')
   await new Promise<void>((ok, fail) => {
-    const p = spawn('python3', [script, '--video', clip, '--spec', specPath, '--output', out, '--secondary-videos', JSON.stringify({ MAIN: clip })],
+    const p = spawn('python3', [script, '--video', clip, '--spec', specPath, '--output', out, '--secondary-videos', JSON.stringify({ MAIN: video })],
       { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } })
     let err = ''
     p.stderr.on('data', d => { err += d })

@@ -11,7 +11,7 @@ import type { Job, RenderJobPayload } from '../types.js'
 import { GoogleGenerativeAI } from '@google/generative-ai'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { computeCutRanges, keptRanges, makeTimeMap, removedMs, type Range } from '../lib/cuts.js'
+import { computeCutRanges, keptRanges, makeTimeMap, reactionRanges, removedMs, type Range } from '../lib/cuts.js'
 
 const execFileAsync = promisify(execFile)
 import { fileURLToPath } from 'node:url'
@@ -294,7 +294,16 @@ async function probeSource(url: string, signal?: AbortSignal) {
  */
 async function condenseClip(clipId: string, spec: Spec, videoUrl: string, tmp: string, signal?: AbortSignal) {
   const start = spec.start_ms as number, end = spec.end_ms as number
-  const cuts = computeCutRanges(spec.words as Row[] as Parameters<typeof computeCutRanges>[0], start, end)
+  const words = spec.words as Row[] as Parameters<typeof computeCutRanges>[0]
+  // Reaction parts (splits, trios) are never cut, and neither is a "pause" that isn't silent: a
+  // laugh, a gasp, applause between the words is a reaction, not dead air
+  const reactions = reactionRanges((spec.segments ?? []) as unknown as Array<{ start_ms: number; end_ms: number; layout: string }>, start)
+  let cuts = computeCutRanges(words, start, end, reactions)
+  const loud = await loudPauses(cuts, words, videoUrl, start, end, signal)
+  if (loud.length) {
+    console.log(`[render] Keeping ${loud.length} pause(s) with sound in them (laughs/reactions): ${loud.map(([a, b]) => `${((a - start) / 1000).toFixed(1)}-${((b - start) / 1000).toFixed(1)}s`).join(', ')}`)
+    cuts = computeCutRanges(words, start, end, [...reactions, ...loud])
+  }
   await db`UPDATE clips SET cut_ranges = ${db.json(cuts)} WHERE id = ${clipId}`
   if (!cuts.length) return null
 
@@ -325,6 +334,33 @@ async function condenseClip(clipId: string, spec: Spec, videoUrl: string, tmp: s
   ], { signal, maxBuffer: 32 * 1024 * 1024 })
   console.log(`[render] Removed ${cuts.length} pause/filler cut(s), ${(removedMs(cuts) / 1000).toFixed(1)}s, in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
   return { path: out, spec: remapSpec(spec, kept) }
+}
+
+/**
+ * The pause cuts (no word inside them) that are not actually silent — someone laughs or reacts
+ * there — found with FFmpeg's silencedetect over the clip's audio. A pause counts as silent when
+ * at least 80% of it is below -35 dB. On any error nothing is protected (pauses are cut as before).
+ */
+async function loudPauses(cuts: Range[], words: Array<{ start_ms: number; end_ms: number }>, videoUrl: string, start: number, end: number, signal?: AbortSignal): Promise<Range[]> {
+  const pauses = cuts.filter(([a, b]) => b - a >= 300 && !words.some(w => w.end_ms > a && w.start_ms < b))
+  if (!pauses.length) return []
+  let silent: Range[] = []
+  try {
+    const { stderr } = await execFileAsync('ffmpeg', ['-hide_banner', '-nostats', '-ss', (start / 1000).toFixed(3), '-t', ((end - start) / 1000).toFixed(3),
+      '-i', videoUrl, '-vn', '-af', 'silencedetect=noise=-35dB:d=0.2', '-f', 'null', '-'], { signal, maxBuffer: 16 * 1024 * 1024 })
+    let open: number | null = null
+    for (const line of stderr.split(/\r?\n/)) {
+      const s0 = line.match(/silence_start: (-?[\d.]+)/), s1 = line.match(/silence_end: (-?[\d.]+)/)
+      if (s0) open = start + Math.max(0, parseFloat(s0[1])) * 1000
+      if (s1 && open !== null) { silent.push([open, start + parseFloat(s1[1]) * 1000]); open = null }
+    }
+    if (open !== null) silent.push([open, end])
+  } catch (e) {
+    console.warn('[render] could not check pauses for sound:', e instanceof Error ? e.message : e)
+    return []
+  }
+  const quiet = (a: number, b: number) => silent.reduce((t, [x, y]) => t + Math.max(0, Math.min(b, y) - Math.max(a, x)), 0)
+  return pauses.filter(([a, b]) => quiet(a, b) < 0.8 * (b - a))
 }
 
 /**

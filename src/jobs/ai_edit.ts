@@ -11,6 +11,7 @@ import { handleTranscribeJob } from './transcribe.js'
 import { findClips, type FoundClip } from '../lib/clipFinder.js'
 import { generateClipText, fontForText, type ClipText } from '../lib/clipText.js'
 import { brollEnabled, pickBrollMoments, searchStock, downloadStock, withBroll } from '../lib/broll.js'
+import { findVisuals, describeVisuals, pickVisualMoments, detectPanels, refinePanels, type Visual, type VisualMoment, type Panel } from '../lib/visuals.js'
 import { r2UploadFile } from '../r2.js'
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
@@ -43,6 +44,8 @@ export interface ClipAnalysis {
   portrait: boolean
   /** Spoken words in the clip, ms from its start (speaker tracking) */
   speech: SpokenWord[]
+  /** Graphics the video's editor put next to the speaker (lib/visuals detectPanels) */
+  panels?: Panel[]
 }
 export interface SpokenWord { start_ms: number; end_ms: number; speaker_id?: string | null }
 
@@ -62,6 +65,8 @@ const MIN_SEGMENT_MS = 3000
 const MIN_SHOT_MS = 1000
 // A cut only starts a new segment when the crop would move at least this much (fraction of width)
 const CUT_MOVE = 0.05
+// The subject's centre moving this far between two frames (a quarter second) is a camera cut
+const JUMP_CUT = 0.12
 
 const EMPTY: FaceInfo = { face_count: 0, face_boxes: [], frames: [] }
 
@@ -515,14 +520,20 @@ export interface PersonShot {
 
 /** Part of a slot's picture: from start_ms to end_ms (clip time) it shows this moment
  *  (source_ms null) or footage borrowed from source_ms on, framed on a face at cx, cy */
-export interface SlotPiece { start_ms: number; end_ms: number; source_ms: number | null; cx: number; cy: number }
+export interface SlotPiece {
+  start_ms: number; end_ms: number; source_ms: number | null; cx: number; cy: number
+  /** Show the whole picture (a related visual, fitted in its slot) instead of a person's crop */
+  full?: boolean
+  /** An exact crop instead (a graphic panel, already in the slot's shape) */
+  crop?: { x: number; y: number; w: number; h: number }
+}
 
 /** A stretch of the clip shown as a reaction layout; per slot (top first) its pieces in order */
 export interface ReactionWindow {
   start_ms: number; end_ms: number
   layout: 'split' | 'trio'
   slots: SlotPiece[][]
-  kind: 'replace' | 'borrow'
+  kind: 'replace' | 'borrow' | 'visual' | 'panel'
 }
 
 const l1 = (a: number[], b: number[]) => a.reduce((t, v, i) => t + Math.abs(v - (b[i] ?? 0)), 0)
@@ -796,11 +807,76 @@ export function withShotReactions(segments: ClipSegment[], windows: ReactionWind
       const at = w.slots.map(ps => ps.find(p => p.start_ms <= a && p.end_ms > a) ?? ps[ps.length - 1])
       next.push({
         start_ms: a, end_ms: b, layout: w.layout,
-        slotKfs: at.map(p => [{ t_ms: a, ...personCrop(w.layout, p.cx, p.cy, reelW) }]),
+        // A related visual covers the whole frame: the renderer and preview fit it in its slot
+        slotKfs: at.map(p => [{ t_ms: a, ...(p.crop ?? (p.full ? { x: 0, y: 0, w: 1, h: 1 } : personCrop(w.layout, p.cx, p.cy, reelW))) }]),
         slotSources: at.map(p => (p.source_ms === null ? null : p.source_ms + (a - p.start_ms))),
       })
     }
     out = next.sort((a, b) => a.start_ms - b.start_ms)
+  }
+  return out
+}
+
+// ── Related visuals ───────────────────────────────────────────────────────────
+
+/**
+ * Related-visual windows for a clip: the speaker live on top (their face in this stretch), the
+ * visual below (borrowed from its own moment in the video, whole). Only over a stretch where a
+ * face is on screen: a cutaway is already a visual.
+ */
+export function visualWindows(moments: VisualMoment[], analysis: ClipAnalysis, clipStartMs: number): ReactionWindow[] {
+  const out: ReactionWindow[] = []
+  for (const m of moments) {
+    const faces = analysis.info.frames
+      .filter(f => f.frame_index * FRAME_INTERVAL_MS >= m.start_ms && f.frame_index * FRAME_INTERVAL_MS < m.end_ms)
+      .map(f => [...f.faces].filter(x => (x.score ?? 0) > 0).sort((a, b) => b.w * b.h - a.w * a.h)[0])
+      .filter((x): x is CropBox => !!x)
+    if (faces.length < 3) continue
+    const cx = median(faces.map(x => x.x + x.w / 2)), cy = median(faces.map(x => x.y + x.h / 2))
+    // From a moment into the visual (past a fade in), within its own length
+    const len = m.end_ms - m.start_ms
+    const from = Math.max(m.visual.start_ms, Math.min(m.visual.start_ms + 300, m.visual.end_ms - len))
+    out.push({
+      start_ms: m.start_ms, end_ms: m.end_ms, layout: 'split', kind: 'visual',
+      slots: [
+        [{ start_ms: m.start_ms, end_ms: m.end_ms, source_ms: null, cx, cy }],
+        [{ start_ms: m.start_ms, end_ms: m.end_ms, source_ms: from - clipStartMs, cx: 0.5, cy: 0.5, full: true }],
+      ],
+    })
+  }
+  return out
+}
+
+/**
+ * Panel windows: while a graphic sits next to the speaker, the speaker on top and the graphic
+ * below, both from this moment. The graphic's crop is its box grown to the slot's shape (what's
+ * around it fills the rest, as editors cut it), so nothing of it is cut off.
+ */
+export function panelWindows(analysis: ClipAnalysis): ReactionWindow[] {
+  const out: ReactionWindow[] = []
+  const slotA = (1080 / 960) / ((9 / 16) / analysis.reelW)   // split slot shape, source units
+  for (const p of analysis.panels ?? []) {
+    const faces = analysis.info.frames
+      .filter(f => f.frame_index * FRAME_INTERVAL_MS >= p.start_ms && f.frame_index * FRAME_INTERVAL_MS < p.end_ms)
+      // The speaker: the biggest real face outside the panel
+      .map(f => [...f.faces].filter(x => (x.score ?? 0) > 0 && (x.x + x.w / 2 < p.x || x.x + x.w / 2 > p.x + p.w))
+        .sort((a, b) => b.w * b.h - a.w * a.h)[0])
+      .filter((x): x is CropBox => !!x)
+    if (faces.length < 2) continue
+    const cx = median(faces.map(x => x.x + x.w / 2)), cy = median(faces.map(x => x.y + x.h / 2))
+    // Grow the panel's box to the slot's shape, centred on it, inside the frame
+    let w = p.w, h = p.h
+    if (w / h > slotA) h = w / slotA; else w = h * slotA
+    if (w > 1) { w = 1; h = w / slotA }
+    if (h > 1) { h = 1; w = h * slotA }
+    const crop = { w, h, x: Math.max(0, Math.min(1 - w, p.x + p.w / 2 - w / 2)), y: Math.max(0, Math.min(1 - h, p.y + p.h / 2 - h / 2)) }
+    out.push({
+      start_ms: p.start_ms, end_ms: p.end_ms, layout: 'split', kind: 'panel',
+      slots: [
+        [{ start_ms: p.start_ms, end_ms: p.end_ms, source_ms: null, cx, cy }],
+        [{ start_ms: p.start_ms, end_ms: p.end_ms, source_ms: null, cx: 0.5, cy: 0.5, crop }],
+      ],
+    })
   }
   return out
 }
@@ -863,9 +939,9 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
   // What a frame shows: its layout, vertical on one tracked speaker, a reaction split
   // (reactor above the speaker), a reaction trio (reactor / speaker / reactor), or a still
   // centre crop (a cutaway shot)
-  type Mode = 'vertical' | 'split' | 'center' | `speaker:${number}` | `react:${number}:${number}` | `trio:${number}:${number}:${number}`
+  type Mode = 'vertical' | 'split' | 'center' | 'group' | `speaker:${number}` | `react:${number}:${number}` | `trio:${number}:${number}:${number}`
   const frameTime = (f: FrameDetection) => f.frame_index * FRAME_INTERVAL_MS
-  const layoutOfMode = (m: Mode): Layout => (m === 'split' || m.startsWith('react:') ? 'split' : m.startsWith('trio:') ? 'trio' : 'vertical')
+  const layoutOfMode = (m: Mode): Layout => (m === 'split' || m.startsWith('react:') ? 'split' : m.startsWith('trio:') || m === 'group' ? 'trio' : 'vertical')
   /** The track ids a mode shows, slot by slot (null: framed by face size / position instead) */
   const slotIdsOf = (m: Mode): number[] | null => {
     if (m.startsWith('react:')) { const [, spk, r] = m.split(':').map(Number); return [r, spk] }
@@ -895,8 +971,11 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
       const r = reactors[i]
       if (r.length >= 2) { const [a, b] = byX(f, i, r.slice(0, 2)); return [f, `trio:${pick}:${a}:${b}`] }
       if (r.length === 1) return [f, `react:${pick}:${r[0]}`]
+      // A wide shot of three or more: everyone, not one small face cut out of it
+      if (people >= 3) return [f, 'group']
       return [f, `speaker:${pick}`]
     }
+    if (people >= 3) return [f, 'group']
     return [f, people >= 2 ? 'split' : 'vertical']
   }))
 
@@ -909,6 +988,26 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
     frames.forEach((f, i) => {
       tracks[i].forEach((id, k) => running.set(id, f.faces[k].x + f.faces[k].w / 2))
       seenAt.set(f, new Map(running))
+    })
+  }
+
+  /**
+   * A wide shot of 3+ people as a trio, left to right: 3 people one each; 4 → the outer two alone
+   * and the middle two together (as editors cut it); more → three groups of neighbours. Per slot:
+   * centre, width covering its people with some air, and face height.
+   */
+  const groupSlots = (f: FrameDetection) => {
+    const faces = [...f.faces].filter(x => (x.score ?? 0) > 0).sort((a, b) => (a.x + a.w / 2) - (b.x + b.w / 2))
+    const n = faces.length
+    if (n < 3) return null
+    const sizes = n === 3 ? [1, 1, 1] : n === 4 ? [1, 2, 1] : [Math.floor(n / 3) + (n % 3 > 0 ? 1 : 0), Math.floor(n / 3), 0]
+    sizes[2] = n - sizes[0] - sizes[1]
+    let k = 0
+    return sizes.map(cnt => {
+      const g = faces.slice(k, k += cnt)
+      const left = Math.min(...g.map(x => x.x)), right = Math.max(...g.map(x => x.x + x.w))
+      const faceW = g.reduce((t, x) => t + x.w, 0) / g.length
+      return { cx: (left + right) / 2, w: Math.min(0.6, Math.max(0.18, right - left + 3 * faceW)), cy: g.reduce((t, x) => t + x.y + x.h / 2, 0) / g.length }
     })
   }
 
@@ -926,6 +1025,7 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
   const rawCx = (f: FrameDetection, layout: Layout, slotIdx: number) => {
     const mode = modeOf.get(f)
     if (mode === 'center') return 0.5
+    if (mode === 'group') return groupSlots(f)?.[slotIdx]?.cx ?? null
     const ids = mode ? slotIdsOf(mode) : null
     if (ids) return cxOfTrack(f, ids[slotIdx])
     if (layout === 'vertical') {
@@ -996,7 +1096,7 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
   // Step 2: within each shot, runs of the same mode; runs under MIN_SEGMENT_MS (SPEAKER_HOLD_MS
   // for a speaker or a reaction) merge into their bigger neighbour (in that shot only)
   type Run = { mode: Mode; start_ms: number; frames: FrameDetection[]; cutStart: boolean }
-  const heldMode = (m: Mode) => m.startsWith('speaker:') || m.startsWith('react:') || m.startsWith('trio:')
+  const heldMode = (m: Mode) => m.startsWith('speaker:') || m.startsWith('react:') || m.startsWith('trio:') || m === 'group'
   const shortRun = (r: Run) => r.frames.length < (heldMode(r.mode) ? minSpeakerFrames : minFrames)
   const runs: Run[] = []
   for (const shot of merged) {
@@ -1090,11 +1190,38 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
     // The first keyframe sits on the segment start (the renderer extrapolates before it)
     const kfTime = (f: FrameDetection, i: number) => (i === 0 ? start_ms : Math.max(start_ms, frameTime(f)))
     const slotKfs = Array.from({ length: slotCount(g.layout) }, (_, slot) => {
-      const cx = stabilise(fill(g.frames.map(f => rawCx(f, g.layout, slot)), slotFallback(g.layout, slot)), g.resets)
+      const raw = fill(g.frames.map(f => rawCx(f, g.layout, slot)), slotFallback(g.layout, slot))
+      // A camera cut the scene detector missed shows as the subject jumping across the frame
+      // between two frames: start the smoothing afresh there too, so the crop jumps with the
+      // picture instead of sliding across for seconds
+      const jumps = raw.map((v, i) => (i > 0 && Math.abs(v - raw[i - 1]) > JUMP_CUT ? i : -1)).filter(i => i > 0)
+      const cx = stabilise(raw, [...new Set([...g.resets, ...jumps])].sort((a, b) => a - b))
+      if (g.mode === 'group') {
+        // A wide shot holds still: one crop per slot from the frames' medians
+        const slots = g.frames.map(groupSlots).filter((v): v is NonNullable<typeof v> => !!v)
+        if (slots.length) {
+          const cxs = median(slots.map(sl => sl[slot].cx)), w = median(slots.map(sl => sl[slot].w)), cy = median(slots.map(sl => sl[slot].cy))
+          const a = (1080 / 640) / ((9 / 16) / reelW)   // trio slot shape, in source units
+          const h = Math.min(1, w / a)
+          return [{ t_ms: kfTime(g.frames[0], 0), w, h, x: Math.max(0, Math.min(1 - w, cxs - w / 2)), y: Math.max(0, Math.min(1 - h, cy - h * 0.45)) }]
+        }
+      }
       if (slotIdsOf(g.mode)) {
         // A reaction layout: one person per slot, at one height (their median face centre)
         const cy = median(g.frames.map(f => rawCy(f, slot)).filter((v): v is number => v !== null))
         return g.frames.map((f, i) => personKf(g.layout, kfTime(f, i), cx[i], cy))
+      }
+      if (g.layout === 'split') {
+        // Two people side by side: a tight crop on each (half the frame each would show the
+        // person sitting between them in both halves), at that person's face height
+        const cys = g.frames.map(f => {
+          const top2 = [...f.faces].sort((a, b) => (b.w * b.h) - (a.w * a.h)).slice(0, 2).sort((a, b) => (a.x + a.w / 2) - (b.x + b.w / 2))
+          return top2.length === 2 ? top2[slot].y + top2[slot].h / 2 : null
+        }).filter((v): v is number => v !== null)
+        if (cys.length) {
+          const cy = median(cys)
+          return g.frames.map((f, i) => personKf('split', kfTime(f, i), cx[i], cy))
+        }
       }
       return g.frames.map((f, i) => g.layout === 'vertical' ? vertKf(kfTime(f, i), cx[i]) : splitKf(kfTime(f, i), cx[i]))
     })
@@ -1102,7 +1229,9 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
   })
   // Interviews filmed one person per camera: reactions across shots
   if (!REACTIONS) return built
-  const windows = planShotReactions(personShots(analysis, clipDurationMs), analysis.speech)
+  const panels = panelWindows(analysis)
+  const windows = [...panels, ...planShotReactions(personShots(analysis, clipDurationMs), analysis.speech)
+    .filter(w => panels.every(p => w.end_ms <= p.start_ms || w.start_ms >= p.end_ms))]
   if (windows.length) console.log(`[ai_edit] reaction layouts across shots: ${windows.map(w => `${w.layout}/${w.kind} ${(w.start_ms / 1000).toFixed(1)}s`).join(', ')}`)
   return withShotReactions(built, windows, reelW)
 }
@@ -1300,6 +1429,15 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       console.log(`[ai_edit] Downloading video ${video.storage_path}`)
       await r2DownloadToFile(video.storage_path, videoPath, signal)
       const size = await probeSize(videoPath)
+      // The video's own visuals (screen recordings, product shots…), described once, to show
+      // under the speaker when they talk about them
+      let visuals: Visual[] = []
+      try {
+        visuals = await describeVisuals(await findVisuals(videoPath, join(tmp, 'visuals'), signal), process.env.GEMINI_API_KEY!)
+        console.log(`[ai_edit] ${visuals.length} related visual(s) available${visuals.length ? `: ${visuals.slice(0, 5).map(v => v.about).join('; ')}` : ''}`)
+      } catch (e) {
+        console.warn('[ai_edit] related visuals skipped:', e instanceof Error ? e.message : e)
+      }
       await setProgress(ai_edit_job_id, 45)
 
       // 5. Frame each clip and save it as a draft. Nothing is exported: the user previews the
@@ -1312,10 +1450,24 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         // Faces 4× a second and camera cuts across the entire clip
         const tDetect = Date.now()
         const analysis = await analyseClip(tmp, videoPath, highlight.start_ms, highlight.end_ms, size, words, signal)
+        // Graphics the video's editor put next to the speaker (shown under them, not cut off)
+        analysis.panels = await detectPanels(videoPath, highlight.start_ms, highlight.end_ms, tmp, process.env.GEMINI_API_KEY!, signal)
+          .then(found => refinePanels(found, analysis.cuts, clipDurationMs, videoPath, highlight.start_ms))
+          .catch(e => { console.warn('[ai_edit] panel detection skipped:', e instanceof Error ? e.message : e); return [] })
         const detectS = ((Date.now() - tDetect) / 1000).toFixed(1)
 
         // Brain: dynamically switch layout within the clip
         let segments: ClipSegment[] = buildSegments(analysis, clipDurationMs)
+        // Related visuals: the speaker on top, what they're talking about below
+        if (visuals.length) {
+          const moments = await pickVisualMoments(words, highlight.start_ms, highlight.end_ms, visuals, process.env.GEMINI_API_KEY!)
+            .catch(e => { console.warn('[ai_edit] related visual picking failed:', e instanceof Error ? e.message : e); return [] })
+          const vw = visualWindows(moments, analysis, highlight.start_ms)
+          if (vw.length) {
+            segments = withShotReactions(segments, vw, analysis.reelW)
+            console.log(`[ai_edit] related visuals: ${moments.map(m => `${(m.start_ms / 1000).toFixed(1)}s "${m.visual.about}"`).join(', ')}`)
+          }
+        }
         if (addBroll) segments = await addStockBroll(segments, words, highlight, video.user_id, tmp)
         const clipWords = words.filter(w => w.start_ms >= highlight.start_ms && w.start_ms < highlight.end_ms)
         const caption = captionFontFor(clipWords)

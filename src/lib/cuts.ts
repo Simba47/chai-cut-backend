@@ -45,8 +45,12 @@ const forms = (w: CutWord) => [norm(w.word), norm(w.word_roman)].filter(Boolean)
 const isIn = (set: Set<string>, w: CutWord) => forms(w).some(f => set.has(f))
 const same = (a: CutWord, b: CutWord) => forms(a).some(f => forms(b).includes(f))
 
-/** Source-time ranges to remove from the clip [clipStart, clipEnd), sorted and non-overlapping */
-export function computeCutRanges(allWords: CutWord[], clipStart: number, clipEnd: number): Range[] {
+/**
+ * Source-time ranges to remove from the clip [clipStart, clipEnd), sorted and non-overlapping.
+ * `protect`: ranges never cut (reaction moments: see reactionRanges; laughter found in a pause
+ * at export), so a laugh or a reaction is never taken out as a "pause".
+ */
+export function computeCutRanges(allWords: CutWord[], clipStart: number, clipEnd: number, protect: Range[] = []): Range[] {
   const words = allWords
     .filter(w => w.start_ms >= clipStart && w.end_ms <= clipEnd && w.end_ms >= w.start_ms)
     .sort((a, b) => a.start_ms - b.start_ms)
@@ -94,7 +98,25 @@ export function computeCutRanges(allWords: CutWord[], clipStart: number, clipEnd
     }
   }
 
-  return cleanRanges(cuts, clipStart, clipEnd)
+  return cleanRanges(withoutRanges(cuts, protect), clipStart, clipEnd)
+}
+
+/** `ranges` with every part that falls inside `remove` taken out */
+export function withoutRanges(ranges: Range[], remove: Range[]): Range[] {
+  let out = ranges
+  for (const [pa, pb] of remove) {
+    out = out.flatMap(([a, b]): Range[] => (b <= pa || a >= pb ? [[a, b]] : [[a, Math.min(b, pa)], [Math.max(a, pb), b]].filter(([x, y]) => y > x) as Range[]))
+  }
+  return out
+}
+
+/**
+ * Reaction moments of a clip, in source time: its split and trio parts (a reactor shown next to
+ * the speaker, a laughing group). Never cut as pauses: the reaction is the point of them.
+ * Segment times are clip-relative.
+ */
+export function reactionRanges(segments: Array<{ start_ms: number; end_ms: number; layout: string }>, clipStart: number): Range[] {
+  return segments.filter(s => s.layout === 'split' || s.layout === 'trio').map(s => [clipStart + s.start_ms, clipStart + s.end_ms])
 }
 
 /** Clamped to the clip, merged when close, and without cuts too short to matter */
