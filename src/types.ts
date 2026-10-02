@@ -43,6 +43,8 @@ export interface AiEditJobPayload {
   ai_edit_job_id: string
   video_id: string
   clip_count: number
+  /** Add stock B-roll (also needs AUTO_BROLL=on and PEXELS_API_KEY on the worker) */
+  add_broll?: boolean
 }
 
 export const JOB_POLL_INTERVAL_MS = 2000

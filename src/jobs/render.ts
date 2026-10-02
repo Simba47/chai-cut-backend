@@ -8,6 +8,12 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { r2, R2_BUCKET, r2DownloadToFile, r2UploadFile } from '../r2.js'
 import db from '../db.js'
 import type { Job, RenderJobPayload } from '../types.js'
+import { GoogleGenerativeAI } from '@google/generative-ai'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { computeCutRanges, keptRanges, makeTimeMap, reactionRanges, removedMs, type Range } from '../lib/cuts.js'
+
+const execFileAsync = promisify(execFile)
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
 
@@ -20,7 +26,7 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
   // The quality the export asked for (it used to be ignored: every render came out 1080p)
   const quality = payload.quality && QUALITY_DIMS[payload.quality] ? payload.quality : '1080p'
 
-  const renderSpec = await buildRenderSpec(clip_id, video_storage_path, quality)
+  const baseSpec = await buildRenderSpec(clip_id, video_storage_path, quality)
   // Other videos shown in the clip are fetched by ID: only ever the clip owner's own videos
   const [owner] = await db`SELECT v.user_id FROM clips c JOIN videos v ON v.id = c.video_id WHERE c.id = ${clip_id}`
   // Sign the source URL so FFmpeg can stream directly from R2 via HTTP range requests.
@@ -35,6 +41,14 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
 
   try {
     const t0 = Date.now()
+    // Remove pauses and filler words: render from a copy of the clip with those parts cut out,
+    // with every time in the spec moved to match. render.py and audio.py need no changes.
+    let videoInput = videoSignedUrl
+    let renderSpec = baseSpec
+    if (baseSpec.remove_fillers) {
+      const cut = await condenseClip(clip_id, baseSpec, videoSignedUrl, tmp, signal)
+      if (cut) { videoInput = cut.path; renderSpec = cut.spec }
+    }
     type SpecSeg = {
       crop_boxes?: Array<{ source_video_id?: string | null; image_path?: string | null }>
       frame?: { items?: Array<{ kind?: string; source_video_id?: string | null; image_path?: string | null }> } | null
@@ -48,6 +62,9 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
     }
     const secondaryVideos: Record<string, string> = {}
     for (const videoId of otherVideoIds) {
+      // The clip's own video (borrowed reaction slots): streamed from the same signed URL as the
+      // main input, opened at each moment — never downloaded whole
+      if (videoId === baseSpec.main_video_id) { secondaryVideos[videoId] = videoSignedUrl; continue }
       const [vRow] = await db`SELECT storage_path FROM videos WHERE id = ${videoId} AND user_id = ${owner?.user_id ?? null}`
       if (!vRow?.storage_path) continue
       try {
@@ -105,7 +122,7 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
     // __dirname is dist/jobs/ at runtime; Python files live in src/python/ (not copied by tsc)
     const pythonScript = join(__dirname, '../../src/python/render.py')
     const pythonArgs = [
-      '--video', videoSignedUrl, '--spec', specPath, '--output', outputPath,
+      '--video', videoInput, '--spec', specPath, '--output', outputPath,
       '--secondary-videos', JSON.stringify(secondaryVideos),
       '--overlay-images', JSON.stringify(overlayImages),
       '--overlay-videos', JSON.stringify(overlayVideos),
@@ -145,7 +162,7 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
           'id', cb.id, 'segment_id', cb.segment_id, 'slot_index', cb.slot_index,
           'source_video_id', cb.source_video_id, 'source_offset_ms', cb.source_offset_ms,
           'image_path', cb.image_path, 'image_motion', cb.image_motion,
-          'volume', cb.volume, 'muted', cb.muted,
+          'volume', cb.volume, 'muted', cb.muted, 'hidden', cb.hidden,
           'box_keyframes', COALESCE((
             SELECT json_agg(bk.* ORDER BY bk.t_ms) FROM box_keyframes bk WHERE bk.box_id = cb.id
           ), '[]')
@@ -170,44 +187,42 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
     ? await db`SELECT word, word_roman, start_ms, end_ms, speaker_id FROM transcript_words WHERE transcript_id = ${transcriptRow.id} ORDER BY start_ms`
     : []
 
+  // Animated presets emphasise the words that matter; asked once per clip and kept
+  const style = captionStyles[0]
+  if (style && PRESETS.has(style.animation) && style.emphasis == null && words.length) {
+    const clipWords = words.filter(w => w.start_ms >= clip.start_ms && w.start_ms < clip.end_ms)
+    const emphasis = await pickEmphasis(clipWords.map(w => ({ word: w.word as string, start_ms: w.start_ms as number, end_ms: w.end_ms as number })))
+    if (emphasis) {
+      await db`UPDATE caption_styles SET emphasis = ${db.json(emphasis)} WHERE id = ${style.id}`
+        .catch(e => console.warn('[render] could not save caption emphasis:', e))
+      style.emphasis = emphasis
+    }
+  }
+
   const dims = QUALITY_DIMS[quality] ?? QUALITY_DIMS['1080p']
   return {
     clip_id: clipId,
+    // Crop boxes showing this id show the clip's own video at another moment (borrowed reactions)
+    main_video_id: clip.video_id,
     start_ms: clip.start_ms,
     end_ms: clip.end_ms,
-    segments, caption_styles: captionStyles, text_overlays: textOverlays,
-    audio_tracks: audioTracks, transitions, overlays, words,
+    remove_fillers: clip.remove_fillers === true,
+    // Hidden in the editor = not in the export (as in the preview): a hidden added video leaves its
+    // time to the main video (default framing); hidden photos, videos and text in a frame are left out
+    segments: shownSegments(segments as Row[], clip.video_id),
+    // Where the main video is hidden: black (captions, text and photos still go on top)
+    blank_ranges: blankRanges(segments as Row[], clip.video_id),
+    caption_styles: captionStyles,
+    text_overlays: (textOverlays as Row[]).filter(t => !t.hidden),
+    // Only music stored as a file can be mixed in. A detached original sound ("main-video:…") is
+    // the clip's own audio, which the export already plays; a song picked in the browser but not
+    // uploaded has no file yet. Either would make FFmpeg fail the whole export, so leave them out.
+    audio_tracks: (audioTracks as { storage_path?: string; muted?: boolean }[]).filter(t => !t.muted && !!t.storage_path && t.storage_path.includes('/') && !t.storage_path.startsWith('main-video:')),
+    // Where the clip's own sound is silent: muted sections, and — once the original sound is
+    // detached onto its own bar — wherever that bar isn't (or is muted)
+    mute_ranges: muteRanges(segments as Row[], audioTracks as Row[], clip.end_ms - clip.start_ms, clip.video_id),
+    transitions, overlays: (overlays as Row[]).filter(o => !o.hidden), words,
     output_width: dims.w, output_height: dims.h,
-  }
-}
-
-export async function renderClipWithLocalVideo(
-  clipId: string,
-  videoLocalPath: string,
-  videoStoragePath: string,
-  signal?: AbortSignal,
-): Promise<void> {
-  const renderSpec = await buildRenderSpec(clipId, videoStoragePath, '1080p')
-  const tmp = await mkdtemp(join(tmpdir(), 'render-'))
-  const outputPath = join(tmp, 'output.mp4')
-  const specPath = join(tmp, 'spec.json')
-  try {
-    await writeFile(specPath, JSON.stringify(renderSpec, null, 2))
-    const pythonScript = join(__dirname, '../../src/python/render.py')
-    await runPython(pythonScript, [
-      '--video', videoLocalPath, '--spec', specPath, '--output', outputPath,
-      '--secondary-videos', '{}', '--overlay-images', '{}', '--overlay-videos', '{}',
-    ], signal)
-    const outputStoragePath = `clips/${clipId}/output.mp4`
-    await r2UploadFile(outputStoragePath, outputPath, 'video/mp4')
-    const output_url = await getSignedUrl(r2, new GetObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath }), { expiresIn: 60 * 60 * 24 * 7 })
-    await db`UPDATE clips SET status = 'done', output_url = ${output_url}, output_storage_path = ${outputStoragePath} WHERE id = ${clipId}`
-    console.log(`[render] Clip ${clipId} done`)
-  } catch (err) {
-    await db`UPDATE clips SET status = 'failed' WHERE id = ${clipId}`
-    throw err
-  } finally {
-    await rm(tmp, { recursive: true, force: true })
   }
 }
 
@@ -230,4 +245,249 @@ function runPython(script: string, args: string[], signal?: AbortSignal): Promis
     proc.on('close', code => { if (code === 0) resolve(); else reject(new Error(`Python render failed (exit ${code}): ${stderr.slice(-500)}`)) })
     proc.on('error', reject)
   })
+}
+
+const PRESETS = new Set(['pop', 'highlight', 'bounce', 'word', 'hormozi', 'box', 'glow'])
+
+/**
+ * The 1–2 most important words in each caption line, as { "<word start_ms>": true } (the key
+ * render.py and the editor look words up by). Gemini reads the clip's lines once; null when it
+ * fails, so the clip renders without emphasis.
+ */
+export async function pickEmphasis(words: Array<{ word: string; start_ms: number; end_ms: number }>): Promise<Record<string, true> | null> {
+  if (!words.length || !process.env.GEMINI_API_KEY) return null
+  // Lines as the captions break them: a pause over 300 ms or 5 words
+  const lines: number[][] = []
+  words.forEach((w, i) => {
+    const line = lines[lines.length - 1]
+    if (!line || line.length >= 5 || w.start_ms - words[i - 1].end_ms > 300) lines.push([i])
+    else line.push(i)
+  })
+  const text = lines.map((l, li) => `${li}: ` + l.map(i => `${i}=${words[i].word}`).join(' ')).join('\n')
+  const prompt = `These are caption lines from a short video (any language, often Telugu, Hindi or Tamil mixed with English). Each word is written as index=word.
+For each line pick the 1 or 2 words that carry the meaning or emotion (a key noun, number, strong verb or punchline word) — never filler words. Skip a line if nothing stands out.
+Return ONLY JSON: {"words": [index, ...]}
+
+${text}`
+  try {
+    const model = new GoogleGenerativeAI(process.env.GEMINI_API_KEY).getGenerativeModel({ model: 'gemini-2.5-flash' })
+    const out = (await model.generateContent(prompt)).response.text()
+    const match = out.match(/\{[\s\S]*\}/)
+    const idx: unknown = match ? JSON.parse(match[0]).words : null
+    if (!Array.isArray(idx)) return null
+    const picked: Record<string, true> = {}
+    for (const i of idx) if (Number.isInteger(i) && words[i]) picked[String(words[i].start_ms)] = true
+    return picked
+  } catch (e) {
+    console.warn('[render] caption emphasis failed, rendering without it:', e instanceof Error ? e.message : e)
+    return null
+  }
+}
+
+// ── Remove pauses and filler words ──────────────────────────────────────────────
+
+type Spec = Awaited<ReturnType<typeof buildRenderSpec>>
+type Row = Record<string, any> // eslint-disable-line @typescript-eslint/no-explicit-any
+
+async function probeSource(url: string, signal?: AbortSignal) {
+  const { stdout } = await execFileAsync('ffprobe', [
+    '-v', 'error', '-show_entries', 'stream=codec_type,r_frame_rate', '-of', 'json', url,
+  ], { signal })
+  const streams = (JSON.parse(stdout).streams ?? []) as Array<{ codec_type: string; r_frame_rate?: string }>
+  const [n, d] = (streams.find(st => st.codec_type === 'video')?.r_frame_rate ?? '30/1').split('/').map(Number)
+  return { fps: n && d ? n / d : 30, hasAudio: streams.some(st => st.codec_type === 'audio') }
+}
+
+/**
+ * Cuts the clip's pauses and filler words (src/lib/cuts.ts, from the transcript), saves the
+ * ranges on the clip, and writes a shortened copy of the clip: the kept parts joined, audio
+ * faded over 15 ms at each join so there are no clicks, encoded like render.py encodes. Kept
+ * parts start and end on video frames, so video, audio and captions stay in step to the end.
+ * Returns null (render as normal) when nothing is cut.
+ */
+async function condenseClip(clipId: string, spec: Spec, videoUrl: string, tmp: string, signal?: AbortSignal) {
+  const start = spec.start_ms as number, end = spec.end_ms as number
+  const words = spec.words as Row[] as Parameters<typeof computeCutRanges>[0]
+  // Reaction parts (splits, trios) are never cut, and neither is a "pause" that isn't silent: a
+  // laugh, a gasp, applause between the words is a reaction, not dead air
+  const reactions = reactionRanges((spec.segments ?? []) as unknown as Array<{ start_ms: number; end_ms: number; layout: string }>, start)
+  let cuts = computeCutRanges(words, start, end, reactions)
+  const loud = await loudPauses(cuts, words, videoUrl, start, end, signal)
+  if (loud.length) {
+    console.log(`[render] Keeping ${loud.length} pause(s) with sound in them (laughs/reactions): ${loud.map(([a, b]) => `${((a - start) / 1000).toFixed(1)}-${((b - start) / 1000).toFixed(1)}s`).join(', ')}`)
+    cuts = computeCutRanges(words, start, end, [...reactions, ...loud])
+  }
+  await db`UPDATE clips SET cut_ranges = ${db.json(cuts)} WHERE id = ${clipId}`
+  if (!cuts.length) return null
+
+  const { fps, hasAudio } = await probeSource(videoUrl, signal)
+  const frame = 1000 / fps
+  const snap = (t: number) => start + Math.round((t - start) / frame) * frame
+  const kept = keptRanges(cuts, start, end).map(([a, b]): Range => [snap(a), snap(b)]).filter(([a, b]) => b - a >= frame)
+  const t0 = Date.now()
+
+  const fc: string[] = []
+  kept.forEach(([a, b], i) => {
+    const s = ((a - start) / 1000).toFixed(6), e = ((b - start) / 1000).toFixed(6), d = (b - a) / 1000
+    fc.push(`[0:v]trim=start=${s}:end=${e},setpts=PTS-STARTPTS[v${i}]`)
+    if (hasAudio) {
+      fc.push(`[0:a]atrim=start=${s}:end=${e},asetpts=PTS-STARTPTS,`
+        + `afade=t=in:st=0:d=0.015,afade=t=out:st=${Math.max(0, d - 0.015).toFixed(6)}:d=0.015[a${i}]`)
+    }
+  })
+  const pads = kept.map((_, i) => hasAudio ? `[v${i}][a${i}]` : `[v${i}]`).join('')
+  fc.push(`${pads}concat=n=${kept.length}:v=1:a=${hasAudio ? 1 : 0}${hasAudio ? '[v][a]' : '[v]'}`)
+  const out = join(tmp, 'condensed.mp4')
+  await execFileAsync('ffmpeg', [
+    '-y', '-ss', (start / 1000).toFixed(3), '-t', ((end - start) / 1000).toFixed(3), '-i', videoUrl,
+    '-filter_complex', fc.join(';'),
+    '-map', '[v]', ...(hasAudio ? ['-map', '[a]'] : []),
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuv420p',
+    ...(hasAudio ? ['-c:a', 'aac', '-b:a', '192k'] : []), '-movflags', '+faststart', out,
+  ], { signal, maxBuffer: 32 * 1024 * 1024 })
+  console.log(`[render] Removed ${cuts.length} pause/filler cut(s), ${(removedMs(cuts) / 1000).toFixed(1)}s, in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
+  return { path: out, spec: remapSpec(spec, kept) }
+}
+
+/**
+ * The pause cuts (no word inside them) that are not actually silent — someone laughs or reacts
+ * there — found with FFmpeg's silencedetect over the clip's audio. A pause counts as silent when
+ * at least 80% of it is below -35 dB. On any error nothing is protected (pauses are cut as before).
+ */
+async function loudPauses(cuts: Range[], words: Array<{ start_ms: number; end_ms: number }>, videoUrl: string, start: number, end: number, signal?: AbortSignal): Promise<Range[]> {
+  const pauses = cuts.filter(([a, b]) => b - a >= 300 && !words.some(w => w.end_ms > a && w.start_ms < b))
+  if (!pauses.length) return []
+  let silent: Range[] = []
+  try {
+    const { stderr } = await execFileAsync('ffmpeg', ['-hide_banner', '-nostats', '-ss', (start / 1000).toFixed(3), '-t', ((end - start) / 1000).toFixed(3),
+      '-i', videoUrl, '-vn', '-af', 'silencedetect=noise=-35dB:d=0.2', '-f', 'null', '-'], { signal, maxBuffer: 16 * 1024 * 1024 })
+    let open: number | null = null
+    for (const line of stderr.split(/\r?\n/)) {
+      const s0 = line.match(/silence_start: (-?[\d.]+)/), s1 = line.match(/silence_end: (-?[\d.]+)/)
+      if (s0) open = start + Math.max(0, parseFloat(s0[1])) * 1000
+      if (s1 && open !== null) { silent.push([open, start + parseFloat(s1[1]) * 1000]); open = null }
+    }
+    if (open !== null) silent.push([open, end])
+  } catch (e) {
+    console.warn('[render] could not check pauses for sound:', e instanceof Error ? e.message : e)
+    return []
+  }
+  const quiet = (a: number, b: number) => silent.reduce((t, [x, y]) => t + Math.max(0, Math.min(b, y) - Math.max(a, x)), 0)
+  return pauses.filter(([a, b]) => quiet(a, b) < 0.8 * (b - a))
+}
+
+/**
+ * The spec on the shortened clip's timeline: it starts at 0, and every clip-relative time
+ * (segments, crop keyframes, text, overlays, frame lane items) and word time moves to where
+ * that moment now plays. Cut words are dropped; anything left with no time is dropped.
+ */
+/** The video added over the main video in a section (B-roll), if any: its crop box */
+function addedVideo(s: Row, mainVideoId: string): Row | null {
+  const b = (s.crop_boxes ?? [])[0]
+  return !String(s.layout).startsWith('frame_') && b?.source_video_id && b.source_video_id !== mainVideoId ? b : null
+}
+
+/**
+ * Sections as the export shows them: hidden frame items go. A hidden added video stays in (its
+ * crop box says hidden): its sound follows its own switch, and render.py shows the main video
+ * there instead (default framing).
+ */
+function shownSegments(segments: Row[], _mainVideoId: string): Row[] {
+  return segments.map(s => {
+    if (!String(s.layout).startsWith('frame_')) return s
+    let out = s
+    // Hidden items aren't drawn; a hidden video item whose sound is on is still heard (render.py
+    // skips drawing it, the sound mix keeps it) — the same rule as an added video outside frames
+    if (s.frame?.items?.some((it: Row) => it.hidden)) {
+      out = { ...out, frame: { ...out.frame, items: (out.frame.items as Row[]).filter(it => !it.hidden || (it.kind === 'video' && !it.muted)) } }
+    }
+    // "Mute the main video" in a frame: only its slots go quiet; the frame's own videos keep their sound
+    if (s.muted) {
+      const allMuted = { '0': true, '1': true, '2': true }
+      out = {
+        ...out,
+        frame: { ...(out.frame ?? {}), main_mutes: allMuted, main_muted: true },
+        // Frames saved before lanes keep the main video's sound on its crop boxes
+        crop_boxes: (out.crop_boxes ?? []).map((b: Row) => b.source_video_id || b.image_path ? b : { ...b, muted: true }),
+      }
+    }
+    return out
+  })
+}
+
+/** Clip-relative stretches where the main video is hidden (and no added video shows instead) */
+function blankRanges(segments: Row[], mainVideoId: string): { start_ms: number; end_ms: number }[] {
+  return segments
+    .filter(s => s.hidden && !String(s.layout).startsWith('frame_') && (!addedVideo(s, mainVideoId) || addedVideo(s, mainVideoId)!.hidden))
+    .map(s => ({ start_ms: Math.round(Number(s.start_ms)), end_ms: Math.round(Number(s.end_ms)) }))
+    .filter(r => r.end_ms > r.start_ms)
+}
+
+/**
+ * Clip-relative stretches where the main video's sound is silent in the export: muted sections,
+ * and, when the original sound is detached onto its own bar, everything outside that bar (or the
+ * bar itself when it's muted) — as the editor's preview plays it.
+ */
+function muteRanges(segments: Row[], audioTracks: Row[], lengthMs: number, mainVideoId: string): { start_ms: number; end_ms: number }[] {
+  // An added video playing its own sound (shown or hidden) replaces the main video's there: "mute
+  // the main video" doesn't silence it
+  const ownSound = (s: Row) => {
+    const b = addedVideo(s, mainVideoId)
+    return !!b && b.muted === false
+  }
+  // (A frame mutes just its main-video slots, in shownSegments: its own videos keep their sound)
+  const out: Range[] = segments.filter(s => s.muted && !ownSound(s) && !String(s.layout).startsWith('frame_')).map(s => [Number(s.start_ms), Number(s.end_ms)])
+  const originals = audioTracks.filter(t => typeof t.storage_path === 'string' && t.storage_path.startsWith('main-video:'))
+  if (originals.length) {
+    const heard = originals.filter(t => !t.muted)
+      .map(t => [Math.max(0, Number(t.start_ms)), Math.min(lengthMs, t.end_ms != null ? Number(t.end_ms) : lengthMs)] as Range)
+      .filter(([a, b]) => b > a).sort((p, q) => p[0] - q[0])
+    let cursor = 0
+    for (const [a, b] of heard) {
+      if (a > cursor) out.push([cursor, a])
+      cursor = Math.max(cursor, b)
+    }
+    if (cursor < lengthMs) out.push([cursor, lengthMs])
+  }
+  return out.filter(([a, b]) => b > a).map(([a, b]) => ({ start_ms: Math.round(a), end_ms: Math.round(b) }))
+}
+
+function remapSpec(spec: Spec, kept: Range[]): Spec {
+  const start = spec.start_ms as number
+  const src = makeTimeMap(kept)                           // source time → new time
+  const rel = (t: number) => Math.round(src(start + Number(t)))  // clip-relative → new time
+  const inKept = (t: number) => kept.some(([a, b]) => t >= a && t < b)
+  const total = kept.reduce((s, [a, b]) => s + (b - a), 0)
+
+  const words = (spec.words as Row[])
+    .filter(w => inKept((w.start_ms + w.end_ms) / 2))
+    .map(w => ({ ...w, start_ms: Math.round(src(w.start_ms)), end_ms: Math.round(src(w.end_ms)) }))
+
+  const segments: Row[] = (spec.segments as Row[]).map((seg): Row => ({
+    ...seg,
+    start_ms: rel(seg.start_ms), end_ms: rel(seg.end_ms),
+    video_offset_ms: seg.video_offset_ms == null ? seg.video_offset_ms : rel(seg.video_offset_ms),
+    frame: seg.frame?.items ? { ...seg.frame, items: (seg.frame.items as Row[]).map(it => ({ ...it, start_ms: rel(it.start_ms), end_ms: rel(it.end_ms) })) } : seg.frame,
+    crop_boxes: (seg.crop_boxes as Row[]).map(b => ({
+      ...b,
+      // Main-video boxes point into the clip; other videos keep their own offsets
+      source_offset_ms: b.source_offset_ms != null && !b.source_video_id && !b.image_path ? rel(b.source_offset_ms) : b.source_offset_ms,
+      box_keyframes: (b.box_keyframes as Row[]).map(k => ({ ...k, t_ms: rel(k.t_ms) })),
+    })),
+  })).filter(seg => seg.end_ms > seg.start_ms)
+  const segIds = new Set(segments.map(seg => seg.id))
+  const timed = (rows: Row[]) => rows.map(r => ({ ...r, start_ms: rel(r.start_ms), end_ms: rel(r.end_ms) })).filter(r => r.end_ms > r.start_ms)
+
+  return {
+    ...spec,
+    start_ms: 0,
+    end_ms: Math.round(total),
+    words,
+    segments,
+    text_overlays: timed(spec.text_overlays as Row[]),
+    overlays: timed(spec.overlays as Row[]),
+    mute_ranges: timed((spec.mute_ranges ?? []) as Row[]),
+    blank_ranges: timed((spec.blank_ranges ?? []) as Row[]),
+    transitions: (spec.transitions as Row[]).filter(t => segIds.has(t.after_segment_id)),
+  } as unknown as Spec
 }

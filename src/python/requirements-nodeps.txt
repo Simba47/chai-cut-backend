@@ -1,0 +1,3 @@
+# Installed with pip --no-deps (see requirements.txt for why).
+# 1.0.1 aborts inside FaceDetector.detect() ("graph_service.h: Service is unavailable"); 1.0.0 works.
+mediapipe==1.0.0

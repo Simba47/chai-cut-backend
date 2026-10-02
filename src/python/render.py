@@ -38,12 +38,20 @@ _FONTS_DIR = str(Path(__file__).parent / "fonts")
 _FONT_FILES = {
     "noto-sans-telugu":     "NotoSansTelugu-Regular.ttf",
     "noto-sans-devanagari": "NotoSansDevanagari-Regular.ttf",
+    "noto-sans-tamil":      "NotoSansTamil-Regular.ttf",
+    "noto-sans-kannada":    "NotoSansKannada-Regular.ttf",
+    "noto-sans-malayalam":  "NotoSansMalayalam-Regular.ttf",
+    "noto-sans-bengali":    "NotoSansBengali-Regular.ttf",
     "roboto":               "Roboto-Regular.ttf",
     "montserrat-bold":      "Montserrat-Bold.ttf",
 }
 _FONT_NAMES = {
     "noto-sans-telugu":     "Noto Sans Telugu",
     "noto-sans-devanagari": "Noto Sans Devanagari",
+    "noto-sans-tamil":      "Noto Sans Tamil",
+    "noto-sans-kannada":    "Noto Sans Kannada",
+    "noto-sans-malayalam":  "Noto Sans Malayalam",
+    "noto-sans-bengali":    "Noto Sans Bengali",
     "roboto":               "Roboto",
     "montserrat-bold":      "Montserrat Bold",
 }
@@ -93,7 +101,7 @@ _PHRASE_GAP_MS   = 300  # silence gap longer than this → new subtitle line
 _MAX_PHRASE_WORDS = 5   # also break at this many words even with no gap
 
 
-def _group_sentences(words: list[dict]) -> list[list[dict]]:
+def _group_sentences(words: list[dict], max_words: int = _MAX_PHRASE_WORDS) -> list[list[dict]]:
     """Split words into subtitle phrases using gap + word-count, not punctuation.
 
     Punctuation-only splitting silently merges entire clips into one event when
@@ -119,7 +127,7 @@ def _group_sentences(words: list[dict]) -> list[list[dict]]:
             _is_sentence_end(w.get("word", ""))
             or speaker_change
             or gap > _PHRASE_GAP_MS
-            or len(current) >= _MAX_PHRASE_WORDS
+            or len(current) >= max_words
         ):
             sentences.append(current)
             current = []
@@ -152,7 +160,8 @@ def _write_ass(
     # Rebase word timestamps to clip-relative (0 = first frame of clip)
     clip_words = [
         {**w, "start_ms": w["start_ms"] - clip_start_ms + offset_ms,
-               "end_ms":   w["end_ms"]   - clip_start_ms + offset_ms}
+               "end_ms":   w["end_ms"]   - clip_start_ms + offset_ms,
+               "_src_start": w["start_ms"]}
         for w in words
     ]
 
@@ -173,12 +182,61 @@ def _write_ass(
         " BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
         f"Style: Default,{font_name},{font_size},{primary},&H00FFFFFF,&H00000000,{shadow},"
         "0,0,0,0,100,100,0,0,1,3,2,5,10,10,10,1",
+        *_preset_styles(style, font_name, font_size),
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
 
+    if style.get("animation") in _PRESETS:
+        lines += _preset_events(clip_words, style, out_w, out_h, band_zones or [])
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return
+
+    # Karaoke: the spoken word in the highlight colour, lit until the next word starts (the
+    # editor's drawCaptions does the same)
+    karaoke = (style.get("animation") or "karaoke") == "karaoke"
+    rest_c = _ass_color(color_hex)
+    live_c = _ass_color(_karaoke_live(color_hex, style.get("highlight_color") or "#FFE700"))
+
     sentences = [s for s in _group_sentences(clip_words) if s]
+    for i, (sentence, (start_ms, end_ms)) in enumerate(zip(sentences, _line_times(sentences))):
+        if end_ms <= start_ms:
+            continue
+        shown = [(w, _word_display(w, roman)) for w in sentence]
+        shown = [(w, t) for w, t in shown if t]
+        text     = " ".join(t for _, t in shown)
+        if not text.strip():
+            continue
+        # Alignment=5 (center of screen); \pos pins the anchor to exact coordinates. Where a
+        # frame shows captions in its text band, that part of the line is centred in the band.
+        for a, b, y in _split_by_zones(start_ms, end_ms, band_zones or [], pos_y):
+            tag = f"{{\\pos({pos_x},{y})}}"
+            body = text
+            if karaoke:
+                runs = []
+                for j, (w, t) in enumerate(shown):
+                    on = w["start_ms"] - a
+                    off = (shown[j + 1][0]["start_ms"] if j + 1 < len(shown) else end_ms) - a
+                    tags = f"\\1c{live_c if on <= 0 < off else rest_c}"
+                    if on > 0:
+                        tags += f"\\t({on},{on + 1},\\1c{live_c})"
+                    if 0 < off < b - a:
+                        tags += f"\\t({off},{off + 1},\\1c{rest_c})"
+                    runs.append(f"{{{tags}}}{t}")
+                body = " ".join(runs)
+            lines.append(
+                f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},"
+                f"Default,,0,0,0,,{tag}{body}"
+            )
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _line_times(sentences: list[list[dict]]) -> list[tuple[int, int]]:
+    """When each caption line is on screen: (start, end) per line, clip-relative ms."""
     # max(): transcription occasionally returns a word whose end is before its start
     spans = [[s[0]["start_ms"], max(s[0]["start_ms"], s[-1]["end_ms"])] for s in sentences]
 
@@ -198,7 +256,8 @@ def _write_ass(
                 spans[k] = [round(run_start + (k - i) * slot), round(run_start + (k - i + 1) * slot)]
         i = j + 1
 
-    for i, sentence in enumerate(sentences):
+    out: list[tuple[int, int]] = []
+    for i in range(len(spans)):
         start_ms = max(0, spans[i][0])
         end_ms   = spans[i][1] + 200
         # Only one line on screen at a time (all lines share the same \pos, so any
@@ -209,22 +268,186 @@ def _write_ass(
             if next_start - spans[i][1] < 500:
                 end_ms = next_start
             end_ms = min(end_ms, next_start)
+        out.append((start_ms, end_ms))
+    return out
+
+
+# ── Animated caption presets ──────────────────────────────────────────────────
+#
+# Mirrored by drawPresetCaptions() in the editor (VideoPreview.tsx): same lines, same timing,
+# same colours. The older animations (karaoke / fade / none) keep the plain path above.
+#   pop       — each word appears when spoken, scaling 80% → 110% → 100% in 150 ms
+#   highlight — 3 words a line; a highlight_color box behind the spoken word
+#   bounce    — the line slides up into place and fades in; the spoken word in highlight_color
+#   word      — one big word at a time, centre screen
+#   hormozi   — 3 capitalised words a line, thick outline; the spoken word in highlight_color, 115%
+#   box       — the line on a dark box, no outline; the spoken word in highlight_color
+#   glow      — words glow in highlight_color; the spoken word bright, the others dimmed
+# Emphasised words (caption_styles.emphasis, keyed by the word's start_ms in the video) are drawn
+# in highlight_color and 15% larger.
+
+_PRESETS = {"pop", "highlight", "bounce", "word", "hormozi", "box", "glow"}
+_POP_MS = 150
+_BOUNCE_MS = 180
+_BOX_PAD = 14          # highlight box padding (px at 1080 wide)
+_WORD_SCALE = 150      # 'word' preset: % of the caption size
+_EMPHASIS_SCALE = 115
+_HORMOZI_SCALE = 115   # the spoken word
+_HORMOZI_STROKE = 2    # added to the outline
+_LINE_BOX = "&H60000000"   # box preset: black, ~62% opaque
+_GLOW_BLUR = 6
+_GLOW_DIM = "&H59&"        # the words not being spoken (~65% opaque)
+
+
+def _karaoke_live(color: str, hl: str) -> str:
+    """The karaoke colour of the spoken word: the highlight colour, unless it is the text's own"""
+    if hl.lower() != color.lower():
+        return hl
+    return "#FFE700" if color.lower() == "#ffffff" else "#FFFFFF"
+
+
+def _ass_color(hex_color: str) -> str:
+    """#RRGGBB → inline ASS colour &HBBGGRR&"""
+    return _hex_to_ass(hex_color, 0).replace("&H00", "&H", 1) + "&"
+
+
+def _text_on(hex_color: str) -> str:
+    """Black or white, whichever reads on a box of this colour"""
+    h = hex_color.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return "#000000" if 0.299 * r + 0.587 * g + 0.114 * b > 150 else "#FFFFFF"
+
+
+def _preset_styles(style: dict, font_name: str, font_size: int) -> list[str]:
+    if style.get("animation") not in _PRESETS:
+        return []
+    # The Noto Indic fonts have no Latin letters: Roman-letter captions use Roboto (the editor too)
+    if style.get("language") == "roman":
+        font_name = _FONT_NAMES["roboto"]
+    stroke = int(style.get("stroke_width") if style.get("stroke_width") is not None else 4)
+    hl = _hex_to_ass(style.get("highlight_color") or "#FFE700", 0)
+    primary = _hex_to_ass(style.get("color") or "#ffffff", 0)
+    return [
+        f"Style: Preset,{font_name},{font_size},{primary},&H00FFFFFF,&H00000000,&H80000000,"
+        f"1,0,0,0,100,100,0,0,1,{stroke},2,5,10,10,10,1",
+        # Opaque box (BorderStyle 3) in the highlight colour; its text is never drawn
+        f"Style: PresetBox,{font_name},{font_size},&HFF000000,&H00FFFFFF,{hl},&H00000000,"
+        f"1,0,0,0,100,100,0,0,3,{_BOX_PAD},0,5,10,10,10,1",
+        # box preset: one dark box round the whole line; its text is never drawn
+        f"Style: PresetLine,{font_name},{font_size},&HFF000000,&H00FFFFFF,{_LINE_BOX},&H00000000,"
+        f"1,0,0,0,100,100,0,0,3,{_BOX_PAD},0,5,10,10,10,1",
+    ]
+
+
+def _esc(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("{", "(").replace("}", ")")
+
+
+def _preset_events(words: list[dict], style: dict, out_w: int, out_h: int, zones: list[tuple[int, int, int]]) -> list[str]:
+    anim = style["animation"]
+    roman = style.get("language") == "roman"
+    upper = bool(style.get("uppercase")) or anim == "hormozi"
+    color = style.get("color") or "#ffffff"
+    hl = style.get("highlight_color") or "#FFE700"
+    emphasis = style.get("emphasis") or {}
+    if isinstance(emphasis, str):
+        try:
+            emphasis = json.loads(emphasis)
+        except ValueError:
+            emphasis = {}
+    stroke = int(style.get("stroke_width") if style.get("stroke_width") is not None else 4)
+    if anim == "hormozi":
+        stroke += _HORMOZI_STROKE
+    if anim == "box":
+        stroke = 0
+    per_line = 1 if anim == "word" else int(style.get("words_per_line") or (3 if anim in ("highlight", "hormozi") else _MAX_PHRASE_WORDS))
+    pos_y_frac = style.get("position_y")
+    pos_y = int(float(pos_y_frac if pos_y_frac is not None else (0.5 if anim == "word" else 0.84)) * out_h)
+    pos_x = out_w // 2
+    base_scale = _WORD_SCALE if anim == "word" else 100
+
+    events: list[str] = []
+    sentences = [s for s in _group_sentences(words, max(1, per_line)) if s]
+    for sentence, (start_ms, end_ms) in zip(sentences, _line_times(sentences)):
         if end_ms <= start_ms:
             continue
-        text     = " ".join(_word_display(w, roman) for w in sentence if _word_display(w, roman))
-        if not text.strip():
+        shown = [(w, _word_display(w, roman)) for w in sentence]
+        shown = [(w, (t.upper() if upper else t)) for w, t in shown if t]
+        if not shown:
             continue
-        # Alignment=5 (center of screen); \pos pins the anchor to exact coordinates. Where a
-        # frame shows captions in its text band, that part of the line is centred in the band.
-        for a, b, y in _split_by_zones(start_ms, end_ms, band_zones or [], pos_y):
-            tag = f"{{\\pos({pos_x},{y})}}"
-            lines.append(
-                f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},"
-                f"Default,,0,0,0,,{tag}{text}"
-            )
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+        for a, b, y in _split_by_zones(start_ms, end_ms, zones, pos_y):
+            text_runs, box_runs = [], []
+            for j, (w, t) in enumerate(shown):
+                on = w["start_ms"] - a                      # spoken from (piece-relative)
+                off = (shown[j + 1][0]["start_ms"] if j + 1 < len(shown) else end_ms) - a
+                emph = bool(emphasis.get(str(w.get("_src_start", w["start_ms"]))))
+                sc = round(base_scale * (_EMPHASIS_SCALE if emph else 100) / 100)
+                rest = _ass_color(hl if emph else color)
+                live = _ass_color(_text_on(hl)) if anim == "highlight" else _ass_color(hl)
+                spoken = on <= 0 < off
+                tags = f"\\fscx{sc}\\fscy{sc}"
+                if anim in ("pop", "word"):
+                    if on <= 0:
+                        tags += "\\alpha&H00&"
+                    else:
+                        lo, hi = round(sc * 0.8), round(sc * 1.1)
+                        tags = (f"\\alpha&HFF&\\fscx{lo}\\fscy{lo}\\t({on},{on + 1},\\alpha&H00&)"
+                                f"\\t({on},{on + _POP_MS // 2},\\fscx{hi}\\fscy{hi})"
+                                f"\\t({on + _POP_MS // 2},{on + _POP_MS},\\fscx{sc}\\fscy{sc})")
+                if anim == "hormozi":
+                    big = round(sc * _HORMOZI_SCALE / 100)
+                    if spoken:
+                        tags = f"\\fscx{big}\\fscy{big}"
+                    if on > 0:
+                        tags += f"\\t({on},{on + 1},\\fscx{big}\\fscy{big})"
+                    if 0 < off < b - a:
+                        tags += f"\\t({off},{off + 1},\\fscx{sc}\\fscy{sc})"
+                if anim == "box":
+                    tags += "\\bord0\\shad0"
+                if anim == "glow":
+                    # Text in the caption colour with a soft outline in the highlight colour
+                    dim = "&H00&" if spoken else _GLOW_DIM
+                    tags += f"\\1c{rest}\\3c{_ass_color(hl)}\\bord3\\shad0\\blur{_GLOW_BLUR}\\alpha{dim}"
+                    if on > 0:
+                        tags += f"\\t({on},{on + 1},\\alpha&H00&)"
+                    if 0 < off < b - a:
+                        tags += f"\\t({off},{off + 1},\\alpha{_GLOW_DIM})"
+                elif anim == "word":
+                    tags += f"\\1c{rest}"
+                else:
+                    tags += f"\\1c{live if spoken else rest}"
+                    if on > 0:
+                        tags += f"\\t({on},{on + 1},\\1c{live})"
+                    if 0 < off < b - a:
+                        tags += f"\\t({off},{off + 1},\\1c{rest})"
+                if anim == "highlight":
+                    # No outline inside the box; the box itself is drawn by the PresetBox layer
+                    tags += f"\\bord{0 if spoken else stroke}\\shad{0 if spoken else 2}"
+                    if on > 0:
+                        tags += f"\\t({on},{on + 1},\\bord0\\shad0)"
+                    if 0 < off < b - a:
+                        tags += f"\\t({off},{off + 1},\\bord{stroke}\\shad2)"
+                    box = f"\\fscx{sc}\\fscy{sc}\\3a{'&H00&' if spoken else '&HFF&'}"
+                    if on > 0:
+                        box += f"\\t({on},{on + 1},\\3a&H00&)"
+                    if 0 < off < b - a:
+                        box += f"\\t({off},{off + 1},\\3a&HFF&)"
+                    box_runs.append(f"{{{box}}}{_esc(t)}")
+                text_runs.append(f"{{{tags}}}{_esc(t)}")
+            if anim == "bounce" and a == start_ms:
+                dy = round(out_h * 0.02)
+                head = f"{{\\move({pos_x},{y + dy},{pos_x},{y},0,{_BOUNCE_MS})\\fad(80,0)}}"
+            else:
+                head = f"{{\\pos({pos_x},{y})}}"
+            if anim == "box":
+                plain = " ".join(_esc(t) for _, t in shown)
+                events.append(f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},PresetLine,,0,0,0,,{head}{plain}")
+            if box_runs:
+                events.append(f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},PresetBox,,0,0,0,,{head}{' '.join(box_runs)}")
+            events.append(f"Dialogue: 1,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},Preset,,0,0,0,,{head}{' '.join(text_runs)}")
+    return events
 
 
 def _split_by_zones(start_ms: int, end_ms: int, zones: list[tuple[int, int, int]], default_y: int) -> list[tuple[int, int, int]]:
@@ -303,13 +526,12 @@ def _corner_mask(tmp: str, w: int, h: int, m: int, r: int) -> str:
 
 
 def _frame_text_font(text: str) -> str:
-    """Montserrat Bold for Latin text; Noto for Indian scripts Montserrat can't draw."""
-    if any("\u0c00" <= c <= "\u0c7f" for c in text):
-        path = _find_font_path("noto-sans-telugu")
-    elif any("\u0900" <= c <= "\u097f" for c in text):
-        path = _find_font_path("noto-sans-devanagari")
-    else:
-        path = _find_font_path("montserrat-bold")
+    """Montserrat Bold for Latin text; the Noto font of the Indian script Montserrat can't draw."""
+    scripts = (("\u0c00", "\u0c7f", "noto-sans-telugu"), ("\u0900", "\u097f", "noto-sans-devanagari"),
+               ("\u0b80", "\u0bff", "noto-sans-tamil"), ("\u0c80", "\u0cff", "noto-sans-kannada"),
+               ("\u0d00", "\u0d7f", "noto-sans-malayalam"), ("\u0980", "\u09ff", "noto-sans-bengali"))
+    font_id = next((fid for a, b, fid in scripts if any(a <= c <= b for c in text)), "montserrat-bold")
+    path = _find_font_path(font_id)
     path = path or _find_font_path("roboto")
     # Quoted in the filter; inside the quotes ':' (Windows drive letters) still needs escaping
     return path.replace("\\", "/").replace(":", "\\:") if path else ""
@@ -489,6 +711,13 @@ def _crop_filter(box: dict | None, seg_start_ms: int) -> str:
     return f"sendcmd=c='{';'.join(cmds)}',{crop}"
 
 
+def _is_full_frame(box: dict | None) -> bool:
+    """Every keyframe of the box frames the whole picture"""
+    kfs = (box or {}).get("box_keyframes") or []
+    return bool(kfs) and all(abs(float(k.get("x", 0))) < 0.005 and abs(float(k.get("y", 0))) < 0.005
+                             and float(k.get("w", 0)) > 0.995 and float(k.get("h", 0)) > 0.995 for k in kfs)
+
+
 def _scale_cover(w: int, h: int) -> str:
     """Scale to fill w×h (cover crop — no black bars, excess is cropped center)."""
     return (
@@ -503,6 +732,16 @@ def _scale_fit(w: int, h: int) -> str:
         f"scale=w={w}:h={h}:flags=lanczos:force_original_aspect_ratio=decrease,"
         f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"
     )
+
+
+def _fit_font_size(text: str, font_path: str, size: int, max_w: int) -> int:
+    """The largest size up to `size` at which `text` is at most `max_w` px wide (min 28)."""
+    try:
+        from PIL import ImageFont  # installed with matplotlib
+        width = ImageFont.truetype(font_path, size).getlength(text)
+    except Exception:
+        return size
+    return size if width <= max_w else max(28, int(size * max_w / width))
 
 
 def _escape_drawtext(s: str) -> str:
@@ -538,6 +777,13 @@ def main(
 
     # UTF-8 explicitly: Windows defaults to cp1252 and fails on Telugu/Hindi captions
     spec           = json.load(open(spec_path, encoding="utf-8"))
+    # A crop box showing this id shows the clip's own video at another moment (a "borrowed"
+    # reaction, from source_offset_ms): read through its own input, seeked straight there
+    main_video_id  = spec.get("main_video_id")
+
+    def is_borrowed(box) -> bool:
+        return bool(box and main_video_id and box.get("source_video_id") == main_video_id
+                    and main_video_id in secondary_videos)
     clip_start_ms  = int(spec["start_ms"])
     clip_end_ms    = int(spec["end_ms"])
     clip_dur_ms    = clip_end_ms - clip_start_ms
@@ -629,6 +875,34 @@ def main(
         if ar.returncode != 0:
             raise RuntimeError(f"Audio extraction failed:\n{ar.stderr.decode()[-500:]}")
 
+        # ── Muted parts: muted sections, or outside the detached original sound (clip-relative) ──
+        mute_ranges = [(int(r["start_ms"]), int(r["end_ms"])) for r in spec.get("mute_ranges", [])
+                       if int(r["end_ms"]) > int(r["start_ms"])]
+        if mute_ranges and os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+            expr = "+".join(f"between(t,{a / 1000:.3f},{b / 1000:.3f})" for a, b in mute_ranges)
+            muted_path = os.path.join(tmp, "audio_muted.aac")
+            mr = subprocess.run(
+                ["ffmpeg", "-y", "-hide_banner", "-i", audio_path, "-af", f"volume=0:enable='{expr}'",
+                 "-c:a", "aac", "-b:a", "192k", muted_path],
+                capture_output=True,
+            )
+            if mr.returncode == 0:
+                audio_path = muted_path
+                print(f"[render] muted {len(mute_ranges)} part(s) of the sound", flush=True)
+            else:
+                print(f"[render] could not mute parts of the sound: {mr.stderr.decode()[-300:]}", flush=True)
+
+        # ── Hidden added videos: the main video shows there (default framing). Their sound was
+        #    mixed above by their own switch, so this only changes the picture. ──
+        for _i, _s in enumerate(segments):
+            _b = (_s.get("crop_boxes") or [{}])[0]
+            if _b.get("hidden") and _b.get("source_video_id") and not is_frame(_s.get("layout")):
+                _t = int(_s["start_ms"])
+                segments[_i] = {**_s, "crop_boxes": [{
+                    **_b, "source_video_id": None, "source_offset_ms": _t, "image_path": None, "hidden": False,
+                    "box_keyframes": [{"t_ms": _t, "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}],
+                }]}
+
         # ── ASS captions ───────────────────────────────────────────────────────
         ass_path = None
         # enabled False = the user turned captions off (styles saved before that field count as on)
@@ -653,9 +927,11 @@ def main(
             # For B-roll INSERT segments, remember the primary (slot-0) source so empty
             # extra slots fall back to it instead of the main video.
             primary_vid = (boxes[0].get("source_video_id") if boxes else None)
-            primary_vid = primary_vid if (primary_vid and primary_vid in secondary_videos) else None
+            primary_vid = primary_vid if (primary_vid and primary_vid in secondary_videos and not is_borrowed(boxes[0])) else None
             for i in range(n_slots):
                 box    = boxes[i] if i < len(boxes) else None
+                if is_borrowed(box):
+                    continue  # its own input (below)
                 vid_id = box.get("source_video_id") if box else None
                 if not (vid_id and vid_id in secondary_videos) and i > 0 and primary_vid:
                     vid_id = primary_vid
@@ -676,11 +952,13 @@ def main(
         ]
 
         sec_input_idx: dict[str, int] = {}
-        for i, (vid_id, path) in enumerate(secondary_videos.items()):
+        # The clip's own video is only read by borrowed slots (their own seeked inputs, below)
+        looped = [(vid_id, path) for vid_id, path in secondary_videos.items() if vid_id != main_video_id]
+        for i, (vid_id, path) in enumerate(looped):
             sec_input_idx[vid_id] = i + 2
             inputs += ["-stream_loop", "-1", "-i", path]
 
-        img_base = 2 + len(secondary_videos)
+        img_base = 2 + len(looped)
         valid_img: list[tuple[dict, str]] = []
         for ov in img_overlays:
             lp = ov.get("local_path", "")
@@ -708,6 +986,8 @@ def main(
                 if kind != "slot":
                     continue
                 for it in lane_items(seg, st, slot):
+                    if it.get("hidden"):
+                        continue  # kept only for its sound (the mix reads it on its own)
                     if it.get("kind") == "video" and it.get("source_video_id") in secondary_videos:
                         path = secondary_videos[it["source_video_id"]]
                         off = it["off_ms"] / 1000.0
@@ -724,6 +1004,21 @@ def main(
                         continue
                     frame_item_in[(si, it["id"])] = f"[{next_input}:v]"
                     next_input += 1
+
+        # Borrowed reaction slots: the clip's own video from another moment, one input each, opened
+        # at that moment (the whole video is never decoded up to it)
+        borrowed_in: dict[tuple[int, int], str] = {}
+        for si, seg in enumerate(segments):
+            if is_frame(seg.get("layout")):
+                continue
+            for box in seg.get("crop_boxes", []):
+                if not is_borrowed(box):
+                    continue
+                off = max(0.0, int(box.get("source_offset_ms", 0)) / 1000.0)
+                dur = (int(seg["end_ms"]) - int(seg["start_ms"])) / 1000.0
+                inputs += ["-thread_queue_size", "1024", "-ss", f"{off:.3f}", "-t", f"{dur + 0.5:.3f}", "-i", secondary_videos[main_video_id]]
+                borrowed_in[(si, int(box.get("slot_index", 0)))] = f"[{next_input}:v]"
+                next_input += 1
 
         # ── Build filter_complex ───────────────────────────────────────────────
         fp: list[str] = []
@@ -768,7 +1063,8 @@ def main(
             # For non-pushed main-video segments, fall back to crop_box[0].source_offset_ms,
             # which stores the correct video position (e.g. after Part B, the continuation
             # starts at the video position where Part B left off, not at start_ms).
-            _primary_box = boxes[0] if boxes else None
+            # Borrowed slots show another moment, so the segment's own position comes from a live slot
+            _primary_box = next((b for b in boxes if not is_borrowed(b)), boxes[0] if boxes else None)
             _primary_box_vid_id = _primary_box.get("source_video_id") if _primary_box else None
             _is_main_video = not (_primary_box_vid_id and _primary_box_vid_id in secondary_videos)
             if seg.get("video_offset_ms") is not None:
@@ -811,7 +1107,7 @@ def main(
                     lbl = f"[fr{si}r{ri}]"
                     cur_row = f"[fr{si}r{ri}b]"
                     # Underneath: the band colour, the main video (framed by this slot's crop box), or an empty dark slot
-                    if kind == "band":
+                    if kind in ("band", "caption"):
                         fp.append(f"color=c=0x{band_bg}:s={out_w}x{rh}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{cur_row}")
                     elif slot in main_slots:
                         box = next((b for b in boxes if b.get("slot_index") == slot), None)
@@ -827,7 +1123,9 @@ def main(
                         fp.append(f"color=c=0x111111:s={out_w}x{rh}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{cur_row}")
 
                     # On top: this lane's items, each only during its own time
-                    for ii, it in enumerate(lane_items(seg, st, "band" if kind == "band" else slot)):
+                    for ii, it in enumerate([] if kind == "caption" else lane_items(seg, st, "band" if kind == "band" else slot)):
+                        if it.get("hidden"):
+                            continue  # hidden: what's under it shows (its sound, if on, is still mixed)
                         d, rel = it["dur_s"], it["rel_s"]
                         ik = it.get("kind")
                         if ik == "text":
@@ -876,6 +1174,17 @@ def main(
             def trim_slot(slot_i: int, dst_w: int, dst_h: int, fit: bool, lbl: str) -> None:
                 box    = boxes[slot_i] if slot_i < len(boxes) else None
                 vid_id = box.get("source_video_id") if box else None
+                # A split/trio slot framing the whole picture shows it whole (a related visual):
+                # fitted with bars, not cropped to fill the slot
+                if not fit and layout in ("split", "trio") and _is_full_frame(box):
+                    fit = True
+
+                if (si, slot_i) in borrowed_in:
+                    # Already opened at its moment: only the length and the crop
+                    crop  = _crop_filter(box, smss)
+                    scale = _scale_fit(dst_w, dst_h) if fit else _scale_cover(dst_w, dst_h)
+                    fp.append(f"{borrowed_in[(si, slot_i)]}setpts=PTS-STARTPTS,trim=duration={dur_ms / 1000.0:.3f},{crop},{scale},setsar=1{lbl}")
+                    return
 
                 # If this extra slot has no B-roll source but the primary slot does, inherit
                 # the primary B-roll so the split renders the INSERT video everywhere (matching
@@ -931,6 +1240,14 @@ def main(
             fp.append(f"{''.join(seg_labels)}concat=n={n}:v=1:a=0[vmain]")
             cur = "[vmain]"
 
+        # ── Hidden main video: black there (captions, text and photos still go on top) ──
+        blank_ranges = [(int(r["start_ms"]), int(r["end_ms"])) for r in spec.get("blank_ranges", [])
+                        if int(r["end_ms"]) > int(r["start_ms"])]
+        if blank_ranges:
+            expr = "+".join(f"between(t,{a / 1000:.3f},{b / 1000:.3f})" for a, b in blank_ranges)
+            fp.append(f"{cur}drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:enable='{expr}'[vblank]")
+            cur = "[vblank]"
+
         # ── Colour filters (eq) ────────────────────────────────────────────────
         br = float(filters_cfg.get("brightness", 100))
         co = float(filters_cfg.get("contrast",   100))
@@ -965,15 +1282,23 @@ def main(
             sz   = int(ov.get("size") or 48)
             hx   = (ov.get("color") or "#ffffff").lstrip("#")
             r, g, b2 = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
-            sx   = int((ov.get("x") or 0.1) * out_w)
+            if ov.get("x") is None:
+                # Centred (the AI hook): shrink to fit 90% of the width if it's too long
+                sz = _fit_font_size(ov.get("text") or "", font_path, sz, int(out_w * 0.9))
+                sx = "(w-text_w)/2"
+                # A black outline keeps it readable on any background (e.g. a white wall)
+                outline = f":borderw={max(2, round(out_w * 4 / 1080))}:bordercolor=black"
+            else:
+                sx = int((ov.get("x") or 0.1) * out_w)
+                outline = ""
             sy   = int((ov.get("y") or 0.1) * out_h)
             t0   = ov.get("start_ms", 0) / 1000.0
             t1   = ov.get("end_ms", clip_dur_ms) / 1000.0
             olbl = f"[vdt{oi}]"
             fp.append(
-                f"{cur}drawtext=fontfile={font_path}:text='{text}':fontsize={sz}"
+                f"{cur}drawtext=fontfile={_filter_path(font_path)}:text='{text}':fontsize={sz}"
                 f":fontcolor=0x{r:02X}{g:02X}{b2:02X}:x={sx}:y={sy}"
-                f":shadowx=2:shadowy=2:shadowcolor=black@0.7"
+                f":shadowx=2:shadowy=2:shadowcolor=black@0.7{outline}"
                 f":enable='between(t,{t0:.3f},{t1:.3f})'{olbl}"
             )
             cur = olbl
@@ -1026,7 +1351,7 @@ def main(
             wm_text = _escape_drawtext("Chai Cut")
             if wm_font:
                 fp.append(
-                    f"{cur}drawtext=fontfile={wm_font}:text='{wm_text}'"
+                    f"{cur}drawtext=fontfile={_filter_path(wm_font)}:text='{wm_text}'"
                     f":fontsize={max(24, out_w // 36)}:fontcolor=white@0.55"
                     f":x=w-tw-{max(16, out_w // 60)}:y=h-th-{max(16, out_h // 120)}"
                     f":shadowx=1:shadowy=1:shadowcolor=black@0.5[vwm]"
