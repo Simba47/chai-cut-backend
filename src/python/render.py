@@ -38,12 +38,20 @@ _FONTS_DIR = str(Path(__file__).parent / "fonts")
 _FONT_FILES = {
     "noto-sans-telugu":     "NotoSansTelugu-Regular.ttf",
     "noto-sans-devanagari": "NotoSansDevanagari-Regular.ttf",
+    "noto-sans-tamil":      "NotoSansTamil-Regular.ttf",
+    "noto-sans-kannada":    "NotoSansKannada-Regular.ttf",
+    "noto-sans-malayalam":  "NotoSansMalayalam-Regular.ttf",
+    "noto-sans-bengali":    "NotoSansBengali-Regular.ttf",
     "roboto":               "Roboto-Regular.ttf",
     "montserrat-bold":      "Montserrat-Bold.ttf",
 }
 _FONT_NAMES = {
     "noto-sans-telugu":     "Noto Sans Telugu",
     "noto-sans-devanagari": "Noto Sans Devanagari",
+    "noto-sans-tamil":      "Noto Sans Tamil",
+    "noto-sans-kannada":    "Noto Sans Kannada",
+    "noto-sans-malayalam":  "Noto Sans Malayalam",
+    "noto-sans-bengali":    "Noto Sans Bengali",
     "roboto":               "Roboto",
     "montserrat-bold":      "Montserrat Bold",
 }
@@ -518,13 +526,12 @@ def _corner_mask(tmp: str, w: int, h: int, m: int, r: int) -> str:
 
 
 def _frame_text_font(text: str) -> str:
-    """Montserrat Bold for Latin text; Noto for Indian scripts Montserrat can't draw."""
-    if any("\u0c00" <= c <= "\u0c7f" for c in text):
-        path = _find_font_path("noto-sans-telugu")
-    elif any("\u0900" <= c <= "\u097f" for c in text):
-        path = _find_font_path("noto-sans-devanagari")
-    else:
-        path = _find_font_path("montserrat-bold")
+    """Montserrat Bold for Latin text; the Noto font of the Indian script Montserrat can't draw."""
+    scripts = (("\u0c00", "\u0c7f", "noto-sans-telugu"), ("\u0900", "\u097f", "noto-sans-devanagari"),
+               ("\u0b80", "\u0bff", "noto-sans-tamil"), ("\u0c80", "\u0cff", "noto-sans-kannada"),
+               ("\u0d00", "\u0d7f", "noto-sans-malayalam"), ("\u0980", "\u09ff", "noto-sans-bengali"))
+    font_id = next((fid for a, b, fid in scripts if any(a <= c <= b for c in text)), "montserrat-bold")
+    path = _find_font_path(font_id)
     path = path or _find_font_path("roboto")
     # Quoted in the filter; inside the quotes ':' (Windows drive letters) still needs escaping
     return path.replace("\\", "/").replace(":", "\\:") if path else ""
@@ -704,6 +711,13 @@ def _crop_filter(box: dict | None, seg_start_ms: int) -> str:
     return f"sendcmd=c='{';'.join(cmds)}',{crop}"
 
 
+def _is_full_frame(box: dict | None) -> bool:
+    """Every keyframe of the box frames the whole picture"""
+    kfs = (box or {}).get("box_keyframes") or []
+    return bool(kfs) and all(abs(float(k.get("x", 0))) < 0.005 and abs(float(k.get("y", 0))) < 0.005
+                             and float(k.get("w", 0)) > 0.995 and float(k.get("h", 0)) > 0.995 for k in kfs)
+
+
 def _scale_cover(w: int, h: int) -> str:
     """Scale to fill w×h (cover crop — no black bars, excess is cropped center)."""
     return (
@@ -861,6 +875,34 @@ def main(
         if ar.returncode != 0:
             raise RuntimeError(f"Audio extraction failed:\n{ar.stderr.decode()[-500:]}")
 
+        # ── Muted parts: muted sections, or outside the detached original sound (clip-relative) ──
+        mute_ranges = [(int(r["start_ms"]), int(r["end_ms"])) for r in spec.get("mute_ranges", [])
+                       if int(r["end_ms"]) > int(r["start_ms"])]
+        if mute_ranges and os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+            expr = "+".join(f"between(t,{a / 1000:.3f},{b / 1000:.3f})" for a, b in mute_ranges)
+            muted_path = os.path.join(tmp, "audio_muted.aac")
+            mr = subprocess.run(
+                ["ffmpeg", "-y", "-hide_banner", "-i", audio_path, "-af", f"volume=0:enable='{expr}'",
+                 "-c:a", "aac", "-b:a", "192k", muted_path],
+                capture_output=True,
+            )
+            if mr.returncode == 0:
+                audio_path = muted_path
+                print(f"[render] muted {len(mute_ranges)} part(s) of the sound", flush=True)
+            else:
+                print(f"[render] could not mute parts of the sound: {mr.stderr.decode()[-300:]}", flush=True)
+
+        # ── Hidden added videos: the main video shows there (default framing). Their sound was
+        #    mixed above by their own switch, so this only changes the picture. ──
+        for _i, _s in enumerate(segments):
+            _b = (_s.get("crop_boxes") or [{}])[0]
+            if _b.get("hidden") and _b.get("source_video_id") and not is_frame(_s.get("layout")):
+                _t = int(_s["start_ms"])
+                segments[_i] = {**_s, "crop_boxes": [{
+                    **_b, "source_video_id": None, "source_offset_ms": _t, "image_path": None, "hidden": False,
+                    "box_keyframes": [{"t_ms": _t, "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}],
+                }]}
+
         # ── ASS captions ───────────────────────────────────────────────────────
         ass_path = None
         # enabled False = the user turned captions off (styles saved before that field count as on)
@@ -944,6 +986,8 @@ def main(
                 if kind != "slot":
                     continue
                 for it in lane_items(seg, st, slot):
+                    if it.get("hidden"):
+                        continue  # kept only for its sound (the mix reads it on its own)
                     if it.get("kind") == "video" and it.get("source_video_id") in secondary_videos:
                         path = secondary_videos[it["source_video_id"]]
                         off = it["off_ms"] / 1000.0
@@ -1063,7 +1107,7 @@ def main(
                     lbl = f"[fr{si}r{ri}]"
                     cur_row = f"[fr{si}r{ri}b]"
                     # Underneath: the band colour, the main video (framed by this slot's crop box), or an empty dark slot
-                    if kind == "band":
+                    if kind in ("band", "caption"):
                         fp.append(f"color=c=0x{band_bg}:s={out_w}x{rh}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{cur_row}")
                     elif slot in main_slots:
                         box = next((b for b in boxes if b.get("slot_index") == slot), None)
@@ -1079,7 +1123,9 @@ def main(
                         fp.append(f"color=c=0x111111:s={out_w}x{rh}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{cur_row}")
 
                     # On top: this lane's items, each only during its own time
-                    for ii, it in enumerate(lane_items(seg, st, "band" if kind == "band" else slot)):
+                    for ii, it in enumerate([] if kind == "caption" else lane_items(seg, st, "band" if kind == "band" else slot)):
+                        if it.get("hidden"):
+                            continue  # hidden: what's under it shows (its sound, if on, is still mixed)
                         d, rel = it["dur_s"], it["rel_s"]
                         ik = it.get("kind")
                         if ik == "text":
@@ -1128,6 +1174,10 @@ def main(
             def trim_slot(slot_i: int, dst_w: int, dst_h: int, fit: bool, lbl: str) -> None:
                 box    = boxes[slot_i] if slot_i < len(boxes) else None
                 vid_id = box.get("source_video_id") if box else None
+                # A split/trio slot framing the whole picture shows it whole (a related visual):
+                # fitted with bars, not cropped to fill the slot
+                if not fit and layout in ("split", "trio") and _is_full_frame(box):
+                    fit = True
 
                 if (si, slot_i) in borrowed_in:
                     # Already opened at its moment: only the length and the crop
@@ -1189,6 +1239,14 @@ def main(
             n = len(seg_labels)
             fp.append(f"{''.join(seg_labels)}concat=n={n}:v=1:a=0[vmain]")
             cur = "[vmain]"
+
+        # ── Hidden main video: black there (captions, text and photos still go on top) ──
+        blank_ranges = [(int(r["start_ms"]), int(r["end_ms"])) for r in spec.get("blank_ranges", [])
+                        if int(r["end_ms"]) > int(r["start_ms"])]
+        if blank_ranges:
+            expr = "+".join(f"between(t,{a / 1000:.3f},{b / 1000:.3f})" for a, b in blank_ranges)
+            fp.append(f"{cur}drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:enable='{expr}'[vblank]")
+            cur = "[vblank]"
 
         # ── Colour filters (eq) ────────────────────────────────────────────────
         br = float(filters_cfg.get("brightness", 100))

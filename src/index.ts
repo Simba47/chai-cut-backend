@@ -45,12 +45,29 @@ async function runMigrations() {
   await db`ALTER TABLE segments DROP CONSTRAINT IF EXISTS segments_layout_check`
   await db`ALTER TABLE segments ADD CONSTRAINT segments_layout_check CHECK (layout IN (
     'vertical','split','trio','spotlight','centered','horizontal',
-    'frame_single','frame_video_photo','frame_dual','frame_dual_letterbox','frame_triple'))`
+    'frame_single','frame_video_photo','frame_dual','frame_dual_letterbox','frame_triple',
+    'frame_title_caption','frame_big_small','frame_photo_story'))`
   await db`ALTER TABLE segments ADD COLUMN IF NOT EXISTS frame JSONB`
   await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS image_path TEXT`
   await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS image_motion TEXT`
   await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS volume REAL NOT NULL DEFAULT 1`
   await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS muted BOOLEAN NOT NULL DEFAULT false`
+  // Timeline controls in the editor: hide (not shown, not exported), mute (silent), lock (can't be
+  // moved, trimmed or deleted). Music also keeps its trims (where in the song it starts, where it stops).
+  await db`ALTER TABLE segments ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT false`
+  await db`ALTER TABLE segments ADD COLUMN IF NOT EXISTS muted BOOLEAN NOT NULL DEFAULT false`
+  await db`ALTER TABLE segments ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT false`
+  await db`ALTER TABLE overlays ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT false`
+  await db`ALTER TABLE overlays ADD COLUMN IF NOT EXISTS muted BOOLEAN NOT NULL DEFAULT false`
+  await db`ALTER TABLE overlays ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT false`
+  await db`ALTER TABLE text_overlays ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT false`
+  await db`ALTER TABLE text_overlays ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT false`
+  await db`ALTER TABLE audio_tracks ADD COLUMN IF NOT EXISTS muted BOOLEAN NOT NULL DEFAULT false`
+  await db`ALTER TABLE audio_tracks ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT false`
+  await db`ALTER TABLE audio_tracks ADD COLUMN IF NOT EXISTS offset_ms INTEGER`
+  await db`ALTER TABLE audio_tracks ADD COLUMN IF NOT EXISTS end_ms INTEGER`
+  // An added video (B-roll) hidden on its own; segments.hidden is then the main video's
+  await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT false`
   await db`
     CREATE TABLE IF NOT EXISTS ai_edit_jobs (
       id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

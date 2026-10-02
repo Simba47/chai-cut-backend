@@ -40,9 +40,22 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CASCADE_PATH = os.path.join(SCRIPT_DIR, 'haarcascade_frontalface_default.xml')
 BLAZEFACE_PATH = os.path.join(SCRIPT_DIR, 'blaze_face_short_range.tflite')
 LANDMARKER_PATH = os.path.join(SCRIPT_DIR, 'face_landmarker.task')
+# OpenCV YuNet (MIT licence, opencv_zoo): finds small, distant faces (everyone round a table in a
+# wide shot) that BlazeFace short-range misses, and doesn't take faces in posters for people
+YUNET_PATH = os.path.join(SCRIPT_DIR, 'face_detection_yunet_2023mar.onnx')
+YUNET_SCORE = 0.6
 
 MIN_SCORE = 0.5        # ignore less confident MediaPipe faces
-MIN_FACE_AREA = 0.02   # ignore faces smaller than 2% of the frame (background people)
+# Ignore faces smaller than this share of the frame. Small enough for everyone at a table in a
+# wide group shot; background people next to a close-up are dropped by the prominence filter.
+MIN_FACE_AREA = 0.002
+# A face the detector is unsure of that the landmark model also can't read is a picture (a
+# poster, a photo on the wall), not a person
+UNSURE_FACE = 0.7
+# …judged only on faces of close-up size (small distant faces are naturally hard to read)
+UNREADABLE_MIN_AREA = 0.012
+# A face at least this share of the frame is a close-up (anything smaller is a wide shot)
+CLOSE_UP_AREA = 0.02
 
 
 def _normalize(x, y, w, h, w_px, h_px, score=1.0):
@@ -113,9 +126,47 @@ class _MediaPipe:
                 if w <= 0 or h <= 0:
                     continue
                 boxes.append(_normalize(x, y, w, h, w_px, h_px, score))
-        boxes = [b for b in _nms(boxes) if b["score"] >= MIN_SCORE and b["area"] >= MIN_FACE_AREA]
-        boxes.sort(key=lambda b: -b["area"])
-        return _filter_by_size(boxes)
+        return [b for b in _nms(boxes) if b["score"] >= MIN_SCORE]
+
+
+class _YuNet:
+    """OpenCV's YuNet face detector over the whole frame"""
+    def __init__(self):
+        import cv2
+        self._det = cv2.FaceDetectorYN.create(YUNET_PATH, "", (320, 320), YUNET_SCORE, 0.3, 5000)
+
+    def detect(self, bgr):
+        h_px, w_px = bgr.shape[:2]
+        self._det.setInputSize((w_px, h_px))
+        _, faces = self._det.detect(bgr)
+        out = []
+        for r in ([] if faces is None else faces):
+            x, y, w, h, score = float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[-1])
+            x, y = max(0.0, x), max(0.0, y)
+            w, h = min(w, w_px - x), min(h, h_px - y)
+            if w > 0 and h > 0:
+                out.append(_normalize(x, y, w, h, w_px, h_px, score))
+        return out
+
+
+def _merge_faces(mp_boxes, yn_boxes):
+    """Faces from both detectors: those both found, YuNet's alone (small/distant faces), and
+    MediaPipe's alone only when it is sure (side-on faces YuNet can miss; an unsure MediaPipe-only
+    face is usually a picture on the wall)"""
+    out = []
+    for m in mp_boxes:
+        match = max(yn_boxes, key=lambda y: _iou(m, y), default=None)
+        if match is not None and _iou(m, match) > 0.3:
+            out.append({**m, "score": max(m["score"], match["score"])})
+        elif m["score"] >= UNSURE_FACE:
+            out.append(m)
+    for y in yn_boxes:
+        if all(_iou(y, m) <= 0.3 for m in mp_boxes):
+            out.append(y)
+    out = [b for b in out if b["area"] >= MIN_FACE_AREA]
+    out.sort(key=lambda b: -b["area"])
+    # Round a table, the person nearest the camera can look 2–3× bigger than those across it
+    return _filter_by_size(out, min_rel=0.25)
 
 
 class _Lips:
@@ -288,6 +339,13 @@ def detect_subjects(frames_dir: str, lips: bool = False) -> dict:
     except Exception as e:  # not installed, or the model file is missing: Haar + motion only
         print(f"[detect] MediaPipe unavailable, using Haar: {e}", file=sys.stderr)
 
+    yunet = None
+    if os.path.exists(YUNET_PATH):
+        try:
+            yunet = _YuNet()
+        except Exception as e:
+            print(f"[detect] YuNet unavailable, MediaPipe only: {e}", file=sys.stderr)
+
     lip_reader = None
     if lips and mediapipe is not None:
         try:
@@ -317,14 +375,23 @@ def detect_subjects(frames_dir: str, lips: bool = False) -> dict:
         subjects = []
         method = "none"
 
-        # MediaPipe faces — the main source of truth for person COUNT
+        # MediaPipe + YuNet faces — the main source of truth for person COUNT
+        mp_boxes, yn_boxes = [], []
         if mediapipe is not None:
             try:
-                subjects = mediapipe.detect(img)
-                if subjects:
-                    method = "mediapipe"
+                mp_boxes = mediapipe.detect(img)
             except Exception as e:
                 print(f"[detect] MediaPipe failed on frame {fi}: {e}", file=sys.stderr)
+        if yunet is not None:
+            try:
+                yn_boxes = yunet.detect(img)
+            except Exception as e:
+                print(f"[detect] YuNet failed on frame {fi}: {e}", file=sys.stderr)
+        if mediapipe is not None or yunet is not None:
+            subjects = _merge_faces(mp_boxes, yn_boxes) if yunet is not None \
+                else _filter_by_size(sorted([b for b in mp_boxes if b["area"] >= MIN_FACE_AREA], key=lambda b: -b["area"]))
+            if subjects:
+                method = "mediapipe"
 
         # Haar frontal faces when MediaPipe found nobody
         if not subjects and cascade is not None:
@@ -365,12 +432,32 @@ def detect_subjects(frames_dir: str, lips: bool = False) -> dict:
 
     # ── Pass 3: per-frame people, with the layout filters ────────────────────────────────
     per_frame = []
-    slot_data: list[list[dict]] = [[] for _ in range(4)]
+    slot_data: list[list[dict]] = [[] for _ in range(6)]
     max_person_count = 0
     counts_by_method = {"mediapipe": 0, "haar": 0, "motion": 0, "none": 0}
     lip_frames = 0
+    unreadable = 0
     for fi, (faces, ids) in enumerate(zip(raw, track_ids)):
-        subjects = [f for f, tid in zip(faces, ids) if tid not in static]
+        subjects = [dict(f) for f, tid in zip(faces, ids) if tid not in static]
+
+        # Mouth opening, expression and a colour signature on every real face (who talks and who
+        # reacts, also across one-person camera shots; who is who). Read before the filters below,
+        # so a picture on the wall can't take a person's place in a split.
+        if subjects:
+            img = cv2.imread(paths[fi])
+            for s in subjects:
+                s["sig"] = _signature(img, s)
+                s["lip"], s["ex"] = None, None
+                if lip_reader is not None:
+                    try:
+                        s["lip"], s["ex"] = lip_reader.gap(img, s)
+                    except Exception as e:
+                        print(f"[detect] FaceLandmarker failed on frame {fi}: {e}", file=sys.stderr)
+            if lip_reader is not None:
+                lip_frames += 1
+                before = len(subjects)
+                subjects = [s for s in subjects if not (s["score"] < UNSURE_FACE and s["lip"] is None and s["area"] >= UNREADABLE_MIN_AREA)]
+                unreadable += before - len(subjects)
         method = methods[fi] if subjects else "none"
 
         # Position fallback — no (live) face: follow the motion, counted as 1 person
@@ -383,10 +470,11 @@ def detect_subjects(frames_dir: str, lips: bool = False) -> dict:
         counts_by_method[method] += 1
 
         # Prominence filter: if one subject is 2× larger than all others the
-        # camera is on a close-up of the speaker; others are background.
+        # camera is on a close-up of the speaker; others are background. Only for a close-up-sized
+        # face: in a wide group shot everyone is small, and the nearest person just looks bigger.
         if len(subjects) >= 2:
             by_area = sorted(subjects, key=lambda s: -s["area"])
-            if by_area[0]["area"] >= 2.0 * by_area[1]["area"]:
+            if by_area[0]["area"] >= CLOSE_UP_AREA and by_area[0]["area"] >= 2.0 * by_area[1]["area"]:
                 subjects = [by_area[0]]
 
         # Proximity filter: if the 2 closest detected faces are within 15% of
@@ -400,27 +488,6 @@ def detect_subjects(frames_dir: str, lips: bool = False) -> dict:
         # Sort left → right
         subjects.sort(key=lambda b: b["cx"])
 
-        # Mouth opening, only where there is more than one person to choose between
-        # Mouth opening and expression on every real face (one-person camera shots included: who
-        # talks and who reacts across shots), and a colour signature to tell people apart
-        lip_values = [None] * len(subjects)
-        expr_values = [None] * len(subjects)
-        sig_values = [None] * len(subjects)
-        real = [s for s in subjects if s["score"] > 0]
-        if real:
-            img = cv2.imread(paths[fi])
-            for i, s in enumerate(subjects):
-                if s["score"] <= 0:
-                    continue
-                sig_values[i] = _signature(img, s)
-                if lip_reader is not None:
-                    try:
-                        lip_values[i], expr_values[i] = lip_reader.gap(img, s)
-                    except Exception as e:
-                        print(f"[detect] FaceLandmarker failed on frame {fi}: {e}", file=sys.stderr)
-            if lip_reader is not None:
-                lip_frames += 1
-
         person_count = len(subjects)
         max_person_count = max(max_person_count, person_count)
 
@@ -428,20 +495,20 @@ def detect_subjects(frames_dir: str, lips: bool = False) -> dict:
             "frame_index": fi,
             "person_count": person_count,
             "faces": [{"x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"], "score": round(s["score"], 3),
-                       **({"lip": lip_values[i]} if lip_values[i] is not None else {}),
-                       **({"ex": expr_values[i]} if expr_values[i] is not None else {}),
-                       **({"sig": sig_values[i]} if sig_values[i] is not None else {})}
-                      for i, s in enumerate(subjects[:4])],
+                       **({"lip": s["lip"]} if s.get("lip") is not None else {}),
+                       **({"ex": s["ex"]} if s.get("ex") is not None else {}),
+                       **({"sig": s["sig"]} if s.get("sig") is not None else {})}
+                      for s in subjects[:6]],
         })
 
-        for i, s in enumerate(subjects[:4]):
+        for i, s in enumerate(subjects[:6]):
             slot_data[i].append({"x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"]})
 
     counts = [f["person_count"] for f in per_frame] or [0]
     print(
         f"[detect] {len(per_frame)} frames, faces/frame min={min(counts)} "
         f"avg={sum(counts) / len(counts):.2f} max={max(counts)}, by method {counts_by_method}, "
-        f"static faces dropped: {len(static)}, lips read on {lip_frames} frames",
+        f"static faces dropped: {len(static)}, unreadable unsure faces dropped: {unreadable}, lips read on {lip_frames} frames",
         file=sys.stderr,
     )
 

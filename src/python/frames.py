@@ -4,13 +4,17 @@ band for text. Mirrors chai-cut-frontend/src/modules/editor/frames.ts — keep t
 """
 from __future__ import annotations
 
-# (kind, slot index or None, share of the frame height)
+# (kind, slot index or None, share of the frame height). "caption": a plain strip (no lane) where
+# the clip's captions sit while the frame shows.
 FRAME_TEMPLATES: dict[str, list[tuple[str, int | None, float]]] = {
     "frame_single":         [("band", None, 0.20), ("slot", 0, 0.80)],
     "frame_video_photo":    [("slot", 0, 0.42), ("band", None, 0.16), ("slot", 1, 0.42)],
     "frame_dual":           [("slot", 0, 0.50), ("slot", 1, 0.50)],
     "frame_dual_letterbox": [("slot", 0, 0.42), ("band", None, 0.16), ("slot", 1, 0.42)],
     "frame_triple":         [("slot", 0, 1 / 3), ("slot", 1, 1 / 3), ("slot", 2, 1 / 3)],
+    "frame_title_caption":  [("band", None, 0.16), ("slot", 0, 0.68), ("caption", None, 0.16)],
+    "frame_big_small":      [("slot", 0, 0.70), ("slot", 1, 0.30)],
+    "frame_photo_story":    [("band", None, 0.16), ("slot", 0, 0.42), ("slot", 1, 0.42)],
 }
 
 MOTIONS = {"none", "zoom_in", "zoom_out", "pan_left", "pan_right"}
@@ -163,17 +167,22 @@ def caption_band_zones(segments: list[dict], out_h: int) -> list[tuple[int, int,
             continue
         y = 0
         centre = None
+        strip = None
         for kind, _, h in frame_rows(layout, out_h):
             if kind == "band":
                 centre = y + h // 2
+            elif kind == "caption":
+                strip = y + h // 2
             y += h
-        if centre is None:
-            continue
         s0 = int(seg["start_ms"])
-        for it in lane_items(seg, frame_state(seg), "band"):
-            if it.get("kind") == "text" and it.get("captions"):
-                a = s0 + int(round(it["rel_s"] * 1000))
-                zones.append((a, a + int(round(it["dur_s"] * 1000)), centre))
+        if centre is not None:
+            for it in lane_items(seg, frame_state(seg), "band"):
+                if it.get("kind") == "text" and it.get("captions") and not it.get("hidden"):
+                    a = s0 + int(round(it["rel_s"] * 1000))
+                    zones.append((a, a + int(round(it["dur_s"] * 1000)), centre))
+        # A frame with a caption strip: the captions sit there for the whole frame
+        if strip is not None:
+            zones.append((s0, int(seg["end_ms"]), strip))
     return zones
 
 
@@ -195,6 +204,11 @@ def main_slot_sound(state: dict, slot: int) -> tuple[float, bool]:
 
 def main_audio_volume(state: dict) -> float:
     """How loud the main video plays in a frame: the sum of every audible slot showing it."""
+    # Heard under a frame no slot shows it in (Photo Story)
+    if state.get("main_under") and not (state.get("main_slots") or []):
+        if state.get("main_muted"):
+            return 0.0
+        return float(state.get("main_volume") if state.get("main_volume") is not None else 1.0)
     total = 0.0
     for slot in state.get("main_slots") or []:
         v, m = main_slot_sound(state, int(slot))
