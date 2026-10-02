@@ -393,10 +393,26 @@ function addedVideo(s: Row, mainVideoId: string): Row | null {
  * there instead (default framing).
  */
 function shownSegments(segments: Row[], _mainVideoId: string): Row[] {
-  return segments
-    .map(s => s.frame?.items?.some((it: Row) => it.hidden)
-      ? { ...s, frame: { ...s.frame, items: (s.frame.items as Row[]).filter(it => !it.hidden) } }
-      : s)
+  return segments.map(s => {
+    if (!String(s.layout).startsWith('frame_')) return s
+    let out = s
+    // Hidden items aren't drawn; a hidden video item whose sound is on is still heard (render.py
+    // skips drawing it, the sound mix keeps it) — the same rule as an added video outside frames
+    if (s.frame?.items?.some((it: Row) => it.hidden)) {
+      out = { ...out, frame: { ...out.frame, items: (out.frame.items as Row[]).filter(it => !it.hidden || (it.kind === 'video' && !it.muted)) } }
+    }
+    // "Mute the main video" in a frame: only its slots go quiet; the frame's own videos keep their sound
+    if (s.muted) {
+      const allMuted = { '0': true, '1': true, '2': true }
+      out = {
+        ...out,
+        frame: { ...(out.frame ?? {}), main_mutes: allMuted, main_muted: true },
+        // Frames saved before lanes keep the main video's sound on its crop boxes
+        crop_boxes: (out.crop_boxes ?? []).map((b: Row) => b.source_video_id || b.image_path ? b : { ...b, muted: true }),
+      }
+    }
+    return out
+  })
 }
 
 /** Clip-relative stretches where the main video is hidden (and no added video shows instead) */
@@ -419,7 +435,8 @@ function muteRanges(segments: Row[], audioTracks: Row[], lengthMs: number, mainV
     const b = addedVideo(s, mainVideoId)
     return !!b && b.muted === false
   }
-  const out: Range[] = segments.filter(s => s.muted && !ownSound(s)).map(s => [Number(s.start_ms), Number(s.end_ms)])
+  // (A frame mutes just its main-video slots, in shownSegments: its own videos keep their sound)
+  const out: Range[] = segments.filter(s => s.muted && !ownSound(s) && !String(s.layout).startsWith('frame_')).map(s => [Number(s.start_ms), Number(s.end_ms)])
   const originals = audioTracks.filter(t => typeof t.storage_path === 'string' && t.storage_path.startsWith('main-video:'))
   if (originals.length) {
     const heard = originals.filter(t => !t.muted)

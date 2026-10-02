@@ -45,7 +45,8 @@ async function runMigrations() {
   await db`ALTER TABLE segments DROP CONSTRAINT IF EXISTS segments_layout_check`
   await db`ALTER TABLE segments ADD CONSTRAINT segments_layout_check CHECK (layout IN (
     'vertical','split','trio','spotlight','centered','horizontal',
-    'frame_single','frame_video_photo','frame_dual','frame_dual_letterbox','frame_triple'))`
+    'frame_single','frame_video_photo','frame_dual','frame_dual_letterbox','frame_triple',
+    'frame_title_caption','frame_big_small','frame_photo_story'))`
   await db`ALTER TABLE segments ADD COLUMN IF NOT EXISTS frame JSONB`
   await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS image_path TEXT`
   await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS image_motion TEXT`

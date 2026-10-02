@@ -38,12 +38,20 @@ _FONTS_DIR = str(Path(__file__).parent / "fonts")
 _FONT_FILES = {
     "noto-sans-telugu":     "NotoSansTelugu-Regular.ttf",
     "noto-sans-devanagari": "NotoSansDevanagari-Regular.ttf",
+    "noto-sans-tamil":      "NotoSansTamil-Regular.ttf",
+    "noto-sans-kannada":    "NotoSansKannada-Regular.ttf",
+    "noto-sans-malayalam":  "NotoSansMalayalam-Regular.ttf",
+    "noto-sans-bengali":    "NotoSansBengali-Regular.ttf",
     "roboto":               "Roboto-Regular.ttf",
     "montserrat-bold":      "Montserrat-Bold.ttf",
 }
 _FONT_NAMES = {
     "noto-sans-telugu":     "Noto Sans Telugu",
     "noto-sans-devanagari": "Noto Sans Devanagari",
+    "noto-sans-tamil":      "Noto Sans Tamil",
+    "noto-sans-kannada":    "Noto Sans Kannada",
+    "noto-sans-malayalam":  "Noto Sans Malayalam",
+    "noto-sans-bengali":    "Noto Sans Bengali",
     "roboto":               "Roboto",
     "montserrat-bold":      "Montserrat Bold",
 }
@@ -518,13 +526,12 @@ def _corner_mask(tmp: str, w: int, h: int, m: int, r: int) -> str:
 
 
 def _frame_text_font(text: str) -> str:
-    """Montserrat Bold for Latin text; Noto for Indian scripts Montserrat can't draw."""
-    if any("\u0c00" <= c <= "\u0c7f" for c in text):
-        path = _find_font_path("noto-sans-telugu")
-    elif any("\u0900" <= c <= "\u097f" for c in text):
-        path = _find_font_path("noto-sans-devanagari")
-    else:
-        path = _find_font_path("montserrat-bold")
+    """Montserrat Bold for Latin text; the Noto font of the Indian script Montserrat can't draw."""
+    scripts = (("\u0c00", "\u0c7f", "noto-sans-telugu"), ("\u0900", "\u097f", "noto-sans-devanagari"),
+               ("\u0b80", "\u0bff", "noto-sans-tamil"), ("\u0c80", "\u0cff", "noto-sans-kannada"),
+               ("\u0d00", "\u0d7f", "noto-sans-malayalam"), ("\u0980", "\u09ff", "noto-sans-bengali"))
+    font_id = next((fid for a, b, fid in scripts if any(a <= c <= b for c in text)), "montserrat-bold")
+    path = _find_font_path(font_id)
     path = path or _find_font_path("roboto")
     # Quoted in the filter; inside the quotes ':' (Windows drive letters) still needs escaping
     return path.replace("\\", "/").replace(":", "\\:") if path else ""
@@ -979,6 +986,8 @@ def main(
                 if kind != "slot":
                     continue
                 for it in lane_items(seg, st, slot):
+                    if it.get("hidden"):
+                        continue  # kept only for its sound (the mix reads it on its own)
                     if it.get("kind") == "video" and it.get("source_video_id") in secondary_videos:
                         path = secondary_videos[it["source_video_id"]]
                         off = it["off_ms"] / 1000.0
@@ -1098,7 +1107,7 @@ def main(
                     lbl = f"[fr{si}r{ri}]"
                     cur_row = f"[fr{si}r{ri}b]"
                     # Underneath: the band colour, the main video (framed by this slot's crop box), or an empty dark slot
-                    if kind == "band":
+                    if kind in ("band", "caption"):
                         fp.append(f"color=c=0x{band_bg}:s={out_w}x{rh}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{cur_row}")
                     elif slot in main_slots:
                         box = next((b for b in boxes if b.get("slot_index") == slot), None)
@@ -1114,7 +1123,9 @@ def main(
                         fp.append(f"color=c=0x111111:s={out_w}x{rh}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{cur_row}")
 
                     # On top: this lane's items, each only during its own time
-                    for ii, it in enumerate(lane_items(seg, st, "band" if kind == "band" else slot)):
+                    for ii, it in enumerate([] if kind == "caption" else lane_items(seg, st, "band" if kind == "band" else slot)):
+                        if it.get("hidden"):
+                            continue  # hidden: what's under it shows (its sound, if on, is still mixed)
                         d, rel = it["dur_s"], it["rel_s"]
                         ik = it.get("kind")
                         if ik == "text":
