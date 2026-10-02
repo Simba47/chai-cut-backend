@@ -868,6 +868,34 @@ def main(
         if ar.returncode != 0:
             raise RuntimeError(f"Audio extraction failed:\n{ar.stderr.decode()[-500:]}")
 
+        # ── Muted parts: muted sections, or outside the detached original sound (clip-relative) ──
+        mute_ranges = [(int(r["start_ms"]), int(r["end_ms"])) for r in spec.get("mute_ranges", [])
+                       if int(r["end_ms"]) > int(r["start_ms"])]
+        if mute_ranges and os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+            expr = "+".join(f"between(t,{a / 1000:.3f},{b / 1000:.3f})" for a, b in mute_ranges)
+            muted_path = os.path.join(tmp, "audio_muted.aac")
+            mr = subprocess.run(
+                ["ffmpeg", "-y", "-hide_banner", "-i", audio_path, "-af", f"volume=0:enable='{expr}'",
+                 "-c:a", "aac", "-b:a", "192k", muted_path],
+                capture_output=True,
+            )
+            if mr.returncode == 0:
+                audio_path = muted_path
+                print(f"[render] muted {len(mute_ranges)} part(s) of the sound", flush=True)
+            else:
+                print(f"[render] could not mute parts of the sound: {mr.stderr.decode()[-300:]}", flush=True)
+
+        # ── Hidden added videos: the main video shows there (default framing). Their sound was
+        #    mixed above by their own switch, so this only changes the picture. ──
+        for _i, _s in enumerate(segments):
+            _b = (_s.get("crop_boxes") or [{}])[0]
+            if _b.get("hidden") and _b.get("source_video_id") and not is_frame(_s.get("layout")):
+                _t = int(_s["start_ms"])
+                segments[_i] = {**_s, "crop_boxes": [{
+                    **_b, "source_video_id": None, "source_offset_ms": _t, "image_path": None, "hidden": False,
+                    "box_keyframes": [{"t_ms": _t, "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}],
+                }]}
+
         # ── ASS captions ───────────────────────────────────────────────────────
         ass_path = None
         # enabled False = the user turned captions off (styles saved before that field count as on)
@@ -1200,6 +1228,14 @@ def main(
             n = len(seg_labels)
             fp.append(f"{''.join(seg_labels)}concat=n={n}:v=1:a=0[vmain]")
             cur = "[vmain]"
+
+        # ── Hidden main video: black there (captions, text and photos still go on top) ──
+        blank_ranges = [(int(r["start_ms"]), int(r["end_ms"])) for r in spec.get("blank_ranges", [])
+                        if int(r["end_ms"]) > int(r["start_ms"])]
+        if blank_ranges:
+            expr = "+".join(f"between(t,{a / 1000:.3f},{b / 1000:.3f})" for a, b in blank_ranges)
+            fp.append(f"{cur}drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:enable='{expr}'[vblank]")
+            cur = "[vblank]"
 
         # ── Colour filters (eq) ────────────────────────────────────────────────
         br = float(filters_cfg.get("brightness", 100))

@@ -162,7 +162,7 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
           'id', cb.id, 'segment_id', cb.segment_id, 'slot_index', cb.slot_index,
           'source_video_id', cb.source_video_id, 'source_offset_ms', cb.source_offset_ms,
           'image_path', cb.image_path, 'image_motion', cb.image_motion,
-          'volume', cb.volume, 'muted', cb.muted,
+          'volume', cb.volume, 'muted', cb.muted, 'hidden', cb.hidden,
           'box_keyframes', COALESCE((
             SELECT json_agg(bk.* ORDER BY bk.t_ms) FROM box_keyframes bk WHERE bk.box_id = cb.id
           ), '[]')
@@ -207,8 +207,21 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
     start_ms: clip.start_ms,
     end_ms: clip.end_ms,
     remove_fillers: clip.remove_fillers === true,
-    segments, caption_styles: captionStyles, text_overlays: textOverlays,
-    audio_tracks: audioTracks, transitions, overlays, words,
+    // Hidden in the editor = not in the export (as in the preview): a hidden added video leaves its
+    // time to the main video (default framing); hidden photos, videos and text in a frame are left out
+    segments: shownSegments(segments as Row[], clip.video_id),
+    // Where the main video is hidden: black (captions, text and photos still go on top)
+    blank_ranges: blankRanges(segments as Row[], clip.video_id),
+    caption_styles: captionStyles,
+    text_overlays: (textOverlays as Row[]).filter(t => !t.hidden),
+    // Only music stored as a file can be mixed in. A detached original sound ("main-video:…") is
+    // the clip's own audio, which the export already plays; a song picked in the browser but not
+    // uploaded has no file yet. Either would make FFmpeg fail the whole export, so leave them out.
+    audio_tracks: (audioTracks as { storage_path?: string; muted?: boolean }[]).filter(t => !t.muted && !!t.storage_path && t.storage_path.includes('/') && !t.storage_path.startsWith('main-video:')),
+    // Where the clip's own sound is silent: muted sections, and — once the original sound is
+    // detached onto its own bar — wherever that bar isn't (or is muted)
+    mute_ranges: muteRanges(segments as Row[], audioTracks as Row[], clip.end_ms - clip.start_ms, clip.video_id),
+    transitions, overlays: (overlays as Row[]).filter(o => !o.hidden), words,
     output_width: dims.w, output_height: dims.h,
   }
 }
@@ -368,6 +381,60 @@ async function loudPauses(cuts: Range[], words: Array<{ start_ms: number; end_ms
  * (segments, crop keyframes, text, overlays, frame lane items) and word time moves to where
  * that moment now plays. Cut words are dropped; anything left with no time is dropped.
  */
+/** The video added over the main video in a section (B-roll), if any: its crop box */
+function addedVideo(s: Row, mainVideoId: string): Row | null {
+  const b = (s.crop_boxes ?? [])[0]
+  return !String(s.layout).startsWith('frame_') && b?.source_video_id && b.source_video_id !== mainVideoId ? b : null
+}
+
+/**
+ * Sections as the export shows them: hidden frame items go. A hidden added video stays in (its
+ * crop box says hidden): its sound follows its own switch, and render.py shows the main video
+ * there instead (default framing).
+ */
+function shownSegments(segments: Row[], _mainVideoId: string): Row[] {
+  return segments
+    .map(s => s.frame?.items?.some((it: Row) => it.hidden)
+      ? { ...s, frame: { ...s.frame, items: (s.frame.items as Row[]).filter(it => !it.hidden) } }
+      : s)
+}
+
+/** Clip-relative stretches where the main video is hidden (and no added video shows instead) */
+function blankRanges(segments: Row[], mainVideoId: string): { start_ms: number; end_ms: number }[] {
+  return segments
+    .filter(s => s.hidden && !String(s.layout).startsWith('frame_') && (!addedVideo(s, mainVideoId) || addedVideo(s, mainVideoId)!.hidden))
+    .map(s => ({ start_ms: Math.round(Number(s.start_ms)), end_ms: Math.round(Number(s.end_ms)) }))
+    .filter(r => r.end_ms > r.start_ms)
+}
+
+/**
+ * Clip-relative stretches where the main video's sound is silent in the export: muted sections,
+ * and, when the original sound is detached onto its own bar, everything outside that bar (or the
+ * bar itself when it's muted) — as the editor's preview plays it.
+ */
+function muteRanges(segments: Row[], audioTracks: Row[], lengthMs: number, mainVideoId: string): { start_ms: number; end_ms: number }[] {
+  // An added video playing its own sound (shown or hidden) replaces the main video's there: "mute
+  // the main video" doesn't silence it
+  const ownSound = (s: Row) => {
+    const b = addedVideo(s, mainVideoId)
+    return !!b && b.muted === false
+  }
+  const out: Range[] = segments.filter(s => s.muted && !ownSound(s)).map(s => [Number(s.start_ms), Number(s.end_ms)])
+  const originals = audioTracks.filter(t => typeof t.storage_path === 'string' && t.storage_path.startsWith('main-video:'))
+  if (originals.length) {
+    const heard = originals.filter(t => !t.muted)
+      .map(t => [Math.max(0, Number(t.start_ms)), Math.min(lengthMs, t.end_ms != null ? Number(t.end_ms) : lengthMs)] as Range)
+      .filter(([a, b]) => b > a).sort((p, q) => p[0] - q[0])
+    let cursor = 0
+    for (const [a, b] of heard) {
+      if (a > cursor) out.push([cursor, a])
+      cursor = Math.max(cursor, b)
+    }
+    if (cursor < lengthMs) out.push([cursor, lengthMs])
+  }
+  return out.filter(([a, b]) => b > a).map(([a, b]) => ({ start_ms: Math.round(a), end_ms: Math.round(b) }))
+}
+
 function remapSpec(spec: Spec, kept: Range[]): Spec {
   const start = spec.start_ms as number
   const src = makeTimeMap(kept)                           // source time → new time
@@ -402,6 +469,8 @@ function remapSpec(spec: Spec, kept: Range[]): Spec {
     segments,
     text_overlays: timed(spec.text_overlays as Row[]),
     overlays: timed(spec.overlays as Row[]),
+    mute_ranges: timed((spec.mute_ranges ?? []) as Row[]),
+    blank_ranges: timed((spec.blank_ranges ?? []) as Row[]),
     transitions: (spec.transitions as Row[]).filter(t => segIds.has(t.after_segment_id)),
   } as unknown as Spec
 }
