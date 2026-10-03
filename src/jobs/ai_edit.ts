@@ -89,6 +89,10 @@ const BACK_AND_FORTH_MS = 4000
 // (speaker in the middle). A reaction must show on REACT_MIN_FRAMES of a second's frames, and the
 // layout holds REACT_HOLD_MS after the reaction was last seen, so it never flickers.
 const REACTIONS = process.env.REACTION_FRAMING !== 'off'
+// A shot with ONE person stays vertical on that person. 'on' brings back the older behaviour for
+// interviews filmed one person per camera: a split / trio made by borrowing the other person's
+// reaction from another shot.
+const CROSS_SHOT_REACTIONS = process.env.CROSS_SHOT_REACTIONS === 'on'
 const REACT_STRONG = 0.5
 const REACT_MIN_FRAMES = 2
 const REACT_HOLD_MS = 2500
@@ -896,9 +900,10 @@ export function panelWindows(analysis: ClipAnalysis): ReactionWindow[] {
 //     picture (the renderer pans between keyframes inside a segment). Shots shorter than
 //     MIN_SHOT_MS join the shot before them.
 //   - Already-vertical source → one full-frame segment
-//   - Speaker tracking (2+ people in the picture): a clear speaker → vertical on them; a quick
-//     back-and-forth → split. A change of speaker is a new segment, so the crop cuts to them.
-//     Frames with one person are framed exactly as without speaker tracking.
+//   - The format follows who is in the shot: ONE person → vertical on them; TWO → split, the
+//     listener above and the active speaker below (no clear speaker, or a quick back-and-forth:
+//     left / right as they sit); THREE or more → split or trio. A change of speaker is a new
+//     segment, so the two swap places with a cut.
 //   - Reactions (while a speaker is known): one listener reacting strongly → split with the
 //     reactor on top and the speaker below; two or more → trio, speaker in the middle
 //   - Cutaway shots (faces on under BROLL_FACE_SHARE of the frames: B-roll inside the video,
@@ -971,10 +976,16 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
       const r = reactors[i]
       if (r.length >= 2) { const [a, b] = byX(f, i, r.slice(0, 2)); return [f, `trio:${pick}:${a}:${b}`] }
       if (r.length === 1) return [f, `react:${pick}:${r[0]}`]
-      // A wide shot of three or more: everyone, not one small face cut out of it
+      // A wide shot of three or more: everyone (split or trio), never one small face cut out of it
       if (people >= 3) return [f, 'group']
-      return [f, `speaker:${pick}`]
+      // Two people: always a split — the listener above, the active speaker below (never a
+      // vertical on the speaker alone). The listener's face missed in this frame: the plain
+      // two-person split, filled in from the frames around it.
+      const listener = tracks[i].find(id => id !== pick)
+      return [f, listener !== undefined ? `react:${pick}:${listener}` : 'split']
     }
+    // The format follows who is in the shot: one person → vertical on them; two → split;
+    // three or more → trio
     if (people >= 3) return [f, 'group']
     return [f, people >= 2 ? 'split' : 'vertical']
   }))
@@ -1230,8 +1241,8 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
   // Interviews filmed one person per camera: reactions across shots
   if (!REACTIONS) return built
   const panels = panelWindows(analysis)
-  const windows = [...panels, ...planShotReactions(personShots(analysis, clipDurationMs), analysis.speech)
-    .filter(w => panels.every(p => w.end_ms <= p.start_ms || w.start_ms >= p.end_ms))]
+  const borrowed = CROSS_SHOT_REACTIONS ? planShotReactions(personShots(analysis, clipDurationMs), analysis.speech) : []
+  const windows = [...panels, ...borrowed.filter(w => panels.every(p => w.end_ms <= p.start_ms || w.start_ms >= p.end_ms))]
   if (windows.length) console.log(`[ai_edit] reaction layouts across shots: ${windows.map(w => `${w.layout}/${w.kind} ${(w.start_ms / 1000).toFixed(1)}s`).join(', ')}`)
   return withShotReactions(built, windows, reelW)
 }

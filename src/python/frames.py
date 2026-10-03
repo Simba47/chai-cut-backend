@@ -39,12 +39,29 @@ def is_frame(layout: str | None) -> bool:
     return bool(layout) and layout in FRAME_TEMPLATES
 
 
-def frame_rows(layout: str, out_h: int, show_band: bool = True) -> list[tuple[str, int | None, int]]:
+def row_heights(seg: dict) -> list[float] | None:
+    """A frame's resized row heights (frame.row_h), if they fit its template; else None. Mirrors validRowHeights() in the editor."""
+    custom = (seg.get("frame") or {}).get("row_h")
+    tpl = FRAME_TEMPLATES.get(seg.get("layout") or "")
+    if not tpl or not isinstance(custom, list) or len(custom) != len(tpl):
+        return None
+    try:
+        hs = [float(h) for h in custom]
+    except (TypeError, ValueError):
+        return None
+    return hs if all(h >= 0.03 for h in hs) else None
+
+
+def frame_rows(layout: str, out_h: int, show_band: bool = True, custom: list[float] | None = None) -> list[tuple[str, int | None, int]]:
     """
     Rows with integer, even pixel heights (yuv420p) that add up to exactly out_h. The text band
     only exists once the frame has text on it (show_band); without it the slots share the height.
+    `custom`: the frame's resized row heights (row_heights(seg)), one per template row.
     """
-    rows = [r for r in FRAME_TEMPLATES[layout] if show_band or r[0] != "band"]
+    tpl = FRAME_TEMPLATES[layout]
+    if custom and len(custom) == len(tpl):
+        tpl = [(kind, slot, h) for (kind, slot, _), h in zip(tpl, custom)]
+    rows = [r for r in tpl if show_band or r[0] != "band"]
     total = sum(share for _, _, share in rows) or 1.0
     heights: list[int] = []
     used = 0
@@ -168,7 +185,7 @@ def caption_band_zones(segments: list[dict], out_h: int) -> list[tuple[int, int,
         y = 0
         centre = None
         strip = None
-        for kind, _, h in frame_rows(layout, out_h):
+        for kind, _, h in frame_rows(layout, out_h, True, row_heights(seg)):
             if kind == "band":
                 centre = y + h // 2
             elif kind == "caption":
