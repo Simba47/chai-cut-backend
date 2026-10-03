@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges
-from frames import is_frame, frame_rows, wrap_band_text, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry
+from frames import is_frame, frame_rows, row_heights, wrap_band_text, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry
 
 # ── Quality presets (identical to previous version) ───────────────────────────
 _QUALITY: dict[int, dict] = {
@@ -504,6 +504,44 @@ def _hex6(v: str | None, fallback: str) -> str:
 def _filter_path(p: str) -> str:
     """A file path as a quoted filter option (forward slashes; ':' still escaped inside the quotes)."""
     return "'" + p.replace("\\", "/").replace(":", "\\:").replace("'", "") + "'"
+
+
+def _box_mask(tmp: str, w: int, h: int, x: int, y: int, bw: int, bh: int, r: int) -> str:
+    """
+    A w×h RGBA image that is black except for a transparent rounded box at (x, y) sized bw×bh with
+    corner radius r: laid over media padded with black, it gives the media rounded corners
+    wherever its box sits in the slot. Drawn at twice the size and scaled down; made once per shape.
+    """
+    path = os.path.join(tmp, f"box_{w}x{h}_{x}_{y}_{bw}x{bh}_{r}.png")
+    if os.path.exists(path):
+        return path
+    W, H, X0, Y0, X1, Y1, R = w * 2, h * 2, x * 2, y * 2, (x + bw) * 2, (y + bh) * 2, r * 2
+    dx = f"max(max({X0 + R}-X\\,X-{X1 - 1 - R})\\,0)"
+    dy = f"max(max({Y0 + R}-Y\\,Y-{Y1 - 1 - R})\\,0)"
+    inside = (f"lte({dx}*{dx}+{dy}*{dy}\\,{R * R})*gte(X\\,{X0})*lt(X\\,{X1})*gte(Y\\,{Y0})*lt(Y\\,{Y1})")
+    vf = f"format=rgba,geq=r=0:g=0:b=0:a=255*(1-{inside}),scale={w}:{h}:flags=area"
+    res = subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"color=c=black:s={W}x{H}:d=1",
+                          "-vf", vf, "-frames:v", "1", path], capture_output=True, text=True)
+    if res.returncode != 0 or not os.path.exists(path):
+        raise RuntimeError(f"box mask failed: {res.stderr[-400:]}")
+    return path
+
+
+def _main_box_px(rect, w: int, h: int) -> tuple[int, int, int, int] | None:
+    """The main video's resized box in a w×h slot as even pixels (x, y, bw, bh); None = the whole slot. Mirrors mainRect() in the editor."""
+    if not isinstance(rect, dict):
+        return None
+    try:
+        rw, rh = max(0.15, min(1.0, float(rect["w"]))), max(0.15, min(1.0, float(rect["h"])))
+        rx, ry = max(0.0, min(1.0 - rw, float(rect["x"]))), max(0.0, min(1.0 - rh, float(rect["y"])))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if rw > 0.999 and rh > 0.999:
+        return None
+    ev = lambda v: int(round(v / 2)) * 2
+    bw, bh = max(8, ev(rw * w)), max(8, ev(rh * h))
+    x, y = min(ev(rx * w), w - bw), min(ev(ry * h), h - bh)
+    return x, y, bw, bh
 
 
 def _corner_mask(tmp: str, w: int, h: int, m: int, r: int) -> str:
@@ -992,7 +1030,7 @@ def main(
             if is_frame(seg.get("layout")):
                 # Only slots showing the main video read it; lane items are inputs of their own
                 main_slots = set(frame_state(seg).get("main_slots") or [])
-                for kind, slot, _ in frame_rows(seg["layout"], out_h, frame_band_shown(seg)):
+                for kind, slot, _ in frame_rows(seg["layout"], out_h, frame_band_shown(seg), row_heights(seg)):
                     if kind == "slot" and slot in main_slots:
                         slot_counts[None] = slot_counts.get(None, 0) + 1
                 continue
@@ -1055,7 +1093,7 @@ def main(
             if not is_frame(seg.get("layout")):
                 continue
             st = frame_state(seg)
-            for kind, slot, _ in frame_rows(seg["layout"], out_h, frame_band_shown(seg)):
+            for kind, slot, _ in frame_rows(seg["layout"], out_h, frame_band_shown(seg), row_heights(seg)):
                 if kind != "slot":
                     continue
                 for it in lane_items(seg, st, slot):
@@ -1154,21 +1192,29 @@ def main(
                 dur_s = dur_ms / 1000.0
                 st = frame_state(seg)
 
-                def media_size(corners, rh: int) -> tuple[int, int, int, int]:
-                    """(width, height) the media is scaled to, plus the border m and radius r (0, 0 = edge to edge)."""
+                def media_box(corners, rect, rh: int) -> tuple[int, int, int, int, int, bool]:
+                    """
+                    Where media goes in a slot of height rh: (width, height) it's scaled to, its top-left
+                    (px, py), the corner radius r, and whether it's set on black at all (False = it
+                    fills the slot edge to edge). `rect`: its box when resized / moved; `corners`: its
+                    rounded border.
+                    """
                     g = corner_geometry(corners)
-                    if not g:
-                        return out_w, rh, 0, 0
-                    inset, radius = g
-                    m = max(2, int(round(inset * out_w / 1080 / 2)) * 2)
-                    return out_w - 2 * m, rh - 2 * m, m, max(2, int(round(radius * out_w / 1080)))
+                    m = max(2, int(round(g[0] * out_w / 1080 / 2)) * 2) if g else 0
+                    r = max(2, int(round(g[1] * out_w / 1080))) if g else 0
+                    px_box = _main_box_px(rect, out_w, rh)
+                    bx, by, bw, bh = px_box or (0, 0, out_w, rh)
+                    iw, ih = max(2, bw - 2 * m), max(2, bh - 2 * m)
+                    return iw, ih, bx + m, by + m, min(r, iw // 2, ih // 2), bool(m or px_box)
 
-                def rounded(chain: str, rh: int, m: int, r: int, key: str) -> str:
-                    """Pad media to the full slot on black and lay the rounded-corner mask over it."""
-                    if not m:
+                def placed(chain: str, rh: int, iw: int, ih: int, px: int, py: int, r: int, boxed: bool, key: str) -> str:
+                    """Media (already iw×ih) set at its place in the slot on black, with rounded corners when it has them."""
+                    if not boxed:
                         return chain
-                    mask = _corner_mask(tmp, out_w, rh, m, r)
-                    fp.append(f"{chain},pad={out_w}:{rh}:{m}:{m}:color=black,format=yuv420p[{key}p]")
+                    fp.append(f"{chain},pad={out_w}:{rh}:{px}:{py}:color=black,format=yuv420p[{key}p]")
+                    if not r:
+                        return f"[{key}p]setsar=1"
+                    mask = _box_mask(tmp, out_w, rh, px, py, iw, ih, r)
                     fp.append(f"movie=filename={_filter_path(mask)},format=rgba[{key}k]")
                     return f"[{key}p][{key}k]overlay=0:0,format=yuv420p,setsar=1"
 
@@ -1176,7 +1222,7 @@ def main(
                 band = st.get("band") or {}
                 band_bg = _hex6(band.get("bg"), "000000")
                 row_lbls: list[str] = []
-                for ri, (kind, slot, rh) in enumerate(frame_rows(layout, out_h, frame_band_shown(seg))):
+                for ri, (kind, slot, rh) in enumerate(frame_rows(layout, out_h, frame_band_shown(seg), row_heights(seg))):
                     lbl = f"[fr{si}r{ri}]"
                     cur_row = f"[fr{si}r{ri}b]"
                     # Underneath: the band colour, the main video (framed by this slot's crop box), or an empty dark slot
@@ -1188,10 +1234,11 @@ def main(
                         if off_ms is None:
                             off_ms = box.get("source_offset_ms") if box and box.get("source_offset_ms") is not None else smss
                         ts = int(off_ms) / 1000.0
-                        mw, mh, mm, mr = media_size((st.get("main_corners") or {}).get(str(slot)), rh)
+                        iw, ih, px, py, rr, boxed = media_box((st.get("main_corners") or {}).get(str(slot)),
+                                                              (st.get("main_rects") or {}).get(str(slot)), rh)
                         chain = (f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,"
-                                 f"{_crop_filter(box, smss)},{_scale_cover(mw, mh)},setsar=1,format=yuv420p")
-                        fp.append(f"{rounded(chain, rh, mm, mr, f'fr{si}r{ri}m')}{cur_row}")
+                                 f"{_crop_filter(box, smss)},{_scale_cover(iw, ih)},setsar=1,format=yuv420p")
+                        fp.append(f"{placed(chain, rh, iw, ih, px, py, rr, boxed, f'fr{si}r{ri}m')}{cur_row}")
                     else:
                         fp.append(f"color=c=0x111111:s={out_w}x{rh}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{cur_row}")
 
@@ -1211,19 +1258,19 @@ def main(
                                 float(it["y"]) if it.get("y") is not None else 0.5)
                         elif ik == "photo" and (si, it["id"]) in frame_item_in:
                             src = frame_item_in[(si, it["id"])]
-                            mw, mh, mm, mr = media_size(it.get("corners"), rh)
-                            zp = photo_motion_filter(it.get("motion") or "none", mw, mh, d)
+                            iw, ih, px, py, rr, boxed = media_box(it.get("corners"), it.get("rect"), rh)
+                            zp = photo_motion_filter(it.get("motion") or "none", iw, ih, d)
                             if zp:
-                                chain = (f"{src}scale={mw * 2}:{mh * 2}:force_original_aspect_ratio=increase,crop={mw * 2}:{mh * 2},"
+                                chain = (f"{src}scale={iw * 2}:{ih * 2}:force_original_aspect_ratio=increase,crop={iw * 2}:{ih * 2},"
                                          f"{zp},setsar=1,format=yuv420p,trim=duration={d:.3f},setpts=PTS-STARTPTS")
                             else:
-                                chain = f"{src}{_scale_cover(mw, mh)},setsar=1,format=yuv420p,trim=duration={d:.3f},setpts=PTS-STARTPTS"
-                            chain = rounded(chain, rh, mm, mr, f"fr{si}r{ri}i{ii}c")
+                                chain = f"{src}{_scale_cover(iw, ih)},setsar=1,format=yuv420p,trim=duration={d:.3f},setpts=PTS-STARTPTS"
+                            chain = placed(chain, rh, iw, ih, px, py, rr, boxed, f"fr{si}r{ri}i{ii}c")
                         elif ik == "video" and (si, it["id"]) in frame_item_in:
                             src = frame_item_in[(si, it["id"])]
-                            mw, mh, mm, mr = media_size(it.get("corners"), rh)
-                            chain = f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{_scale_cover(mw, mh)},setsar=1,format=yuv420p"
-                            chain = rounded(chain, rh, mm, mr, f"fr{si}r{ri}i{ii}c")
+                            iw, ih, px, py, rr, boxed = media_box(it.get("corners"), it.get("rect"), rh)
+                            chain = f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{_scale_cover(iw, ih)},setsar=1,format=yuv420p"
+                            chain = placed(chain, rh, iw, ih, px, py, rr, boxed, f"fr{si}r{ri}i{ii}c")
                         else:
                             print(f"[render] frame item skipped (media missing): {ik} {it.get('id')}", flush=True)
                             continue
