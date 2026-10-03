@@ -577,12 +577,19 @@ def _frame_text_font(text: str) -> str:
     return path.replace("\\", "/").replace(":", "\\:") if path else ""
 
 
-def _frame_text_chain(text: str, bg: str, color: str, size_1080: int, w: int, h: int, dur_s: float,
-                      cx: float = 0.5, cy: float = 0.5) -> str:
-    """A solid w×h card with wrapped text centred on (cx, cy) — shares of the card, set by dragging it in the editor."""
-    chain = f"color=c=0x{bg}:s={w}x{h}:d={dur_s:.3f}:r=30,format=yuv420p"
+def _frame_text_chain(fp: list[str], inputs: list[str], next_input: int, key: str,
+                      text: str, bg: str, color: str, size_1080: int, w: int, h: int, dur_s: float,
+                      cx: float = 0.5, cy: float = 0.5) -> tuple[str, int]:
+    """A solid w×h card with wrapped text centred on (cx, cy) — shares of the card, set by dragging
+    it in the editor. Appends its filter statements onto `fp` (and any emoji PNG inputs onto
+    `inputs`, same scheme as the main text_overlays loop) and returns the finished node's label
+    plus the updated next_input counter."""
+    base_lbl = f"[{key}base]"
+    fp.append(f"color=c=0x{bg}:s={w}x{h}:d={dur_s:.3f}:r=30,format=yuv420p{base_lbl}")
+    cur = base_lbl
     text = (text or "").strip()
     font = _frame_text_font(text) if text else ""
+    ridx = 0
     if text and font:
         size = max(8, int(round(size_1080 * w / 1080)))
         # Wrap at 1080-wide scale, like the editor preview, so lines break in the same places
@@ -593,9 +600,44 @@ def _frame_text_chain(text: str, bg: str, color: str, size_1080: int, w: int, h:
             if not ln:
                 continue
             y = int(top + li * lh + (lh - size) / 2)
-            chain += (f",drawtext=fontfile='{font}':text='{_escape_drawtext(ln)}':fontsize={size}"
-                      f":fontcolor=0x{color}:x={cx * w:.1f}-tw/2:y={y}")
-    return f"{chain},setsar=1"
+            runs = _split_emoji_runs(ln)
+            if not any(is_e for is_e, _ in runs):
+                olbl = f"[{key}t{ridx}]"
+                fp.append(f"{cur}drawtext=fontfile='{font}':text='{_escape_drawtext(ln)}':fontsize={size}"
+                          f":fontcolor=0x{color}:x={cx * w:.1f}-tw/2:y={y}{olbl}")
+                cur = olbl
+                ridx += 1
+                continue
+            # Has emoji: same per-run drawtext/overlay composite as the main text_overlays loop,
+            # just centred on this line's own width instead of ffmpeg's (w-text_w)/2 expression
+            from PIL import ImageFont
+            pil_font = ImageFont.truetype(font, size)
+            run_widths = [size if is_e else pil_font.getlength(s) for is_e, s in runs]
+            cursor = cx * w - sum(run_widths) / 2
+            for (is_emoji, s), rw in zip(runs, run_widths):
+                if not s:
+                    continue
+                if is_emoji:
+                    png = _emoji_png(s)
+                    if png:
+                        inputs += ["-i", png]
+                        src_lbl = f"[{next_input}:v]"
+                        next_input += 1
+                        slbl, olbl = f"[{key}e{ridx}s]", f"[{key}e{ridx}]"
+                        fp.append(f"{src_lbl}scale={int(size)}:{int(size)}:flags=lanczos{slbl}")
+                        fp.append(f"{cur}{slbl}overlay=x={int(cursor)}:y={y}{olbl}")
+                        cur = olbl
+                        ridx += 1
+                else:
+                    olbl = f"[{key}t{ridx}]"
+                    fp.append(f"{cur}drawtext=fontfile='{font}':text='{_escape_drawtext(s)}':fontsize={size}"
+                              f":fontcolor=0x{color}:x={int(cursor)}:y={y}{olbl}")
+                    cur = olbl
+                    ridx += 1
+                cursor += rw
+    final_lbl = f"[{key}fin]"
+    fp.append(f"{cur}setsar=1{final_lbl}")
+    return final_lbl, next_input
 
 
 # ── FFmpeg crop expression builder ────────────────────────────────────────────
@@ -1251,11 +1293,13 @@ def main(
                         if ik == "text":
                             if it.get("captions"):
                                 continue  # the captions themselves are moved into the band (see _write_ass)
-                            chain = _frame_text_chain(
+                            text_lbl, next_input = _frame_text_chain(
+                                fp, inputs, next_input, f"fr{si}r{ri}i{ii}txt",
                                 it.get("text") or "", _hex6(it.get("bg"), band_bg if kind == "band" else "000000"),
                                 _hex6(it.get("color"), "ffffff"), int(it.get("size") or 64), out_w, rh, d,
                                 float(it["x"]) if it.get("x") is not None else 0.5,
                                 float(it["y"]) if it.get("y") is not None else 0.5)
+                            chain = f"{text_lbl}null"  # passthrough: the shared epilogue below appends setpts
                         elif ik == "photo" and (si, it["id"]) in frame_item_in:
                             src = frame_item_in[(si, it["id"])]
                             iw, ih, px, py, rr, boxed = media_box(it.get("corners"), it.get("rect"), rh)
