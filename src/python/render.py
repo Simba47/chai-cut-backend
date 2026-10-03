@@ -16,9 +16,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -748,6 +750,77 @@ def _escape_drawtext(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:").replace("%", "\\%")
 
 
+# ── Emoji in text overlays ──────────────────────────────────────────────────────
+# drawtext can't mix fonts in one call, and no bundled font draws colour emoji (Google's
+# current Noto Color Emoji is COLRv1, which Pillow can't rasterise as colour yet — tested
+# directly: valid glyph metrics, zero-height bitmap). Emoji runs are rendered separately as
+# Twemoji PNGs and composited with `overlay`; the rest of the line stays on drawtext as before.
+_EMOJI_RUN_RE = re.compile(
+    "["
+    "\U0001F1E6-\U0001F1FF"  # regional indicators (flag pairs)
+    "\U0001F300-\U0001F5FF"  # misc symbols & pictographs (includes skin tone modifiers)
+    "\U0001F600-\U0001F64F"  # emoticons
+    "\U0001F680-\U0001F6FF"  # transport & map
+    "\U0001F700-\U0001F77F"  # alchemical symbols
+    "\U0001F780-\U0001F7FF"  # geometric shapes extended
+    "\U0001F800-\U0001F8FF"  # supplemental arrows-C
+    "\U0001F900-\U0001F9FF"  # supplemental symbols & pictographs
+    "\U0001FA00-\U0001FA6F"  # chess symbols
+    "\U0001FA70-\U0001FAFF"  # symbols & pictographs extended-A
+    "\u2600-\u26FF"  # misc symbols
+    "\u2700-\u27BF"  # dingbats
+    "\u2300-\u23FF"  # misc technical (watch, alarm clock, …)
+    "\u2B00-\u2BFF"  # misc symbols and arrows (star, etc.)
+    "\uFE0F"          # variation selector-16 (emoji presentation)
+    "\u200D"          # zero-width joiner (binds ZWJ sequences into one run)
+    "]+"
+)
+_EMOJI_CACHE_DIR = os.path.join(tempfile.gettempdir(), "chai-cut-emoji-cache")
+# Pinned so the file layout can't change under us; jdecked/twemoji is the maintained fork
+# (the original twitter/twemoji repo stopped receiving new emoji after the 2023 ownership change).
+_TWEMOJI_BASE = "https://cdn.jsdelivr.net/gh/jdecked/twemoji@v17.0.3/assets/72x72"
+
+
+def _split_emoji_runs(text: str) -> list[tuple[bool, str]]:
+    """Alternating (is_emoji, content) runs. Adjacent emoji codepoints (ZWJ sequences, skin
+    tone modifiers, flag pairs) merge into a single run so they render as one glyph."""
+    runs: list[tuple[bool, str]] = []
+    pos = 0
+    for m in _EMOJI_RUN_RE.finditer(text):
+        if m.start() > pos:
+            runs.append((False, text[pos:m.start()]))
+        runs.append((True, m.group()))
+        pos = m.end()
+    if pos < len(text):
+        runs.append((False, text[pos:]))
+    return runs
+
+
+def _emoji_png(emoji: str) -> str | None:
+    """A cached local path to this emoji's Twemoji PNG, downloading it if needed. None if it
+    can't be fetched (no network, not in the set) — the caller just skips drawing that glyph."""
+    # Twemoji's filenames drop FE0F (the emoji-presentation selector) entirely
+    name = "-".join(f"{ord(c):x}" for c in emoji if c != "\uFE0F")
+    if not name:
+        return None
+    path = os.path.join(_EMOJI_CACHE_DIR, f"{name}.png")
+    if os.path.exists(path):
+        return path
+    try:
+        os.makedirs(_EMOJI_CACHE_DIR, exist_ok=True)
+        with urllib.request.urlopen(f"{_TWEMOJI_BASE}/{name}.png", timeout=5) as resp:
+            data = resp.read()
+        # Atomic: two concurrent renders fetching the same emoji (worker concurrency=2)
+        # must never leave a half-written file for the other to read
+        tmp_path = f"{path}.{os.getpid()}.tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, path)
+        return path
+    except Exception:
+        return None
+
+
 def _esc_expr(s: str) -> str:
     """Escape an expression for FFmpeg filter_complex option values.
 
@@ -1273,8 +1346,8 @@ def main(
 
         # ── Text overlays (drawtext) ───────────────────────────────────────────
         for oi, ov in enumerate(text_overlays):
-            text = _escape_drawtext(ov.get("text") or "")
-            if not text:
+            raw_text = ov.get("text") or ""
+            if not raw_text.strip():
                 continue
             font_path = _find_font_path(ov.get("font") or "roboto")
             if not font_path:
@@ -1282,26 +1355,80 @@ def main(
             sz   = int(ov.get("size") or 48)
             hx   = (ov.get("color") or "#ffffff").lstrip("#")
             r, g, b2 = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
-            if ov.get("x") is None:
-                # Centred (the AI hook): shrink to fit 90% of the width if it's too long
-                sz = _fit_font_size(ov.get("text") or "", font_path, sz, int(out_w * 0.9))
-                sx = "(w-text_w)/2"
-                # A black outline keeps it readable on any background (e.g. a white wall)
-                outline = f":borderw={max(2, round(out_w * 4 / 1080))}:bordercolor=black"
-            else:
-                sx = int((ov.get("x") or 0.1) * out_w)
-                outline = ""
-            sy   = int((ov.get("y") or 0.1) * out_h)
-            t0   = ov.get("start_ms", 0) / 1000.0
-            t1   = ov.get("end_ms", clip_dur_ms) / 1000.0
-            olbl = f"[vdt{oi}]"
-            fp.append(
-                f"{cur}drawtext=fontfile={_filter_path(font_path)}:text='{text}':fontsize={sz}"
-                f":fontcolor=0x{r:02X}{g:02X}{b2:02X}:x={sx}:y={sy}"
-                f":shadowx=2:shadowy=2:shadowcolor=black@0.7{outline}"
-                f":enable='between(t,{t0:.3f},{t1:.3f})'{olbl}"
-            )
-            cur = olbl
+            centered = ov.get("x") is None
+            # A black outline keeps it readable on any background (e.g. a white wall)
+            outline = f":borderw={max(2, round(out_w * 4 / 1080))}:bordercolor=black" if centered else ""
+            sy = int((ov.get("y") or 0.1) * out_h)
+            t0 = ov.get("start_ms", 0) / 1000.0
+            t1 = ov.get("end_ms", clip_dur_ms) / 1000.0
+            enable = f"between(t,{t0:.3f},{t1:.3f})"
+
+            if not _EMOJI_RUN_RE.search(raw_text):
+                # ── No emoji: a single drawtext call, exactly as before ──
+                text = _escape_drawtext(raw_text)
+                sz_fit = _fit_font_size(raw_text, font_path, sz, int(out_w * 0.9)) if centered else sz
+                sx = "(w-text_w)/2" if centered else int((ov.get("x") or 0.1) * out_w)
+                olbl = f"[vdt{oi}]"
+                fp.append(
+                    f"{cur}drawtext=fontfile={_filter_path(font_path)}:text='{text}':fontsize={sz_fit}"
+                    f":fontcolor=0x{r:02X}{g:02X}{b2:02X}:x={sx}:y={sy}"
+                    f":shadowx=2:shadowy=2:shadowcolor=black@0.7{outline}"
+                    f":enable='{enable}'{olbl}"
+                )
+                cur = olbl
+                continue
+
+            # ── Has emoji: measure each line's runs so emoji can be composited as images
+            # alongside separate drawtext calls for the plain-text runs, lined up to read as
+            # one piece of text. Emoji are treated as sz×sz boxes (Twemoji is drawn square). ──
+            from PIL import ImageFont
+            line_runs = [_split_emoji_runs(ln) for ln in raw_text.split("\n")]
+
+            def _measure(size: int) -> tuple[list[list[float]], float]:
+                pil_font = ImageFont.truetype(font_path, size)
+                widths = [[size if is_e else pil_font.getlength(s) for is_e, s in runs] for runs in line_runs]
+                return widths, max((sum(ws) for ws in widths), default=0.0)
+
+            widths, max_w = _measure(sz)
+            if centered and max_w > out_w * 0.9 and max_w > 0:
+                sz = max(28, int(sz * (out_w * 0.9) / max_w))
+                widths, max_w = _measure(sz)
+
+            line_h = int(sz * 1.2)
+            sx0 = int((ov.get("x") or 0.1) * out_w)
+            ridx = 0
+            for li, runs in enumerate(line_runs):
+                line_w = sum(widths[li])
+                cursor = (out_w - line_w) / 2 if centered else sx0
+                line_y = sy + li * line_h
+                for (is_emoji, s), w in zip(runs, widths[li]):
+                    if not s:
+                        continue
+                    if is_emoji:
+                        png = _emoji_png(s)
+                        if png:
+                            inputs += ["-i", png]
+                            src_lbl = f"[{next_input}:v]"
+                            next_input += 1
+                            slbl = f"[vemo{oi}_{ridx}s]"
+                            olbl = f"[vemo{oi}_{ridx}]"
+                            fp.append(f"{src_lbl}scale={int(sz)}:{int(sz)}:flags=lanczos{slbl}")
+                            fp.append(f"{cur}{slbl}overlay=x={int(cursor)}:y={int(line_y)}:enable='{enable}'{olbl}")
+                            cur = olbl
+                            ridx += 1
+                        # Reserve the width either way so trailing text doesn't overlap a
+                        # skipped (unfetchable) emoji
+                    else:
+                        olbl = f"[vdt{oi}_{ridx}]"
+                        fp.append(
+                            f"{cur}drawtext=fontfile={_filter_path(font_path)}:text='{_escape_drawtext(s)}':fontsize={sz}"
+                            f":fontcolor=0x{r:02X}{g:02X}{b2:02X}:x={int(cursor)}:y={int(line_y)}"
+                            f":shadowx=2:shadowy=2:shadowcolor=black@0.7{outline}"
+                            f":enable='{enable}'{olbl}"
+                        )
+                        cur = olbl
+                        ridx += 1
+                    cursor += w
 
         # ── Image overlays ─────────────────────────────────────────────────────
         for oi, (ov, img_lbl) in enumerate(valid_img):
