@@ -827,7 +827,14 @@ def _fit_font_size(text: str, font_path: str, size: int, max_w: int) -> int:
 
 
 def _escape_drawtext(s: str) -> str:
-    return s.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:").replace("%", "\\%")
+    """Every call site wraps this in text='...'. FFmpeg's filtergraph quoting is POSIX-shell-style:
+    backslash has no special meaning inside single quotes, so \\' does NOT escape a literal quote
+    there — it corrupts quote-tracking for the rest of the filter graph (confirmed: a name with an
+    apostrophe crashed every render downstream of it with "No option name near ..."). A literal
+    quote has to break out of the string, escape itself, then reopen, exactly like 'it'\\''s' in a
+    shell. Everything else (colon, percent, backslash) is already literal inside single quotes —
+    escaping those would print a literal backslash in the text instead of protecting anything."""
+    return s.replace("'", "'\\''")
 
 
 # ── Emoji in text overlays ──────────────────────────────────────────────────────
