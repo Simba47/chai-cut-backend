@@ -66,6 +66,8 @@ async function runMigrations() {
   await db`ALTER TABLE audio_tracks ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT false`
   await db`ALTER TABLE audio_tracks ADD COLUMN IF NOT EXISTS offset_ms INTEGER`
   await db`ALTER TABLE audio_tracks ADD COLUMN IF NOT EXISTS end_ms INTEGER`
+  // Clip board: a clip marked as a favourite (the heart on its card)
+  await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS favorite BOOLEAN NOT NULL DEFAULT false`
   // An added video (B-roll) hidden on its own; segments.hidden is then the main video's
   await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT false`
   await db`
