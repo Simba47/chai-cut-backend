@@ -22,7 +22,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges
+from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges, heard_speech_ranges
 from frames import is_frame, frame_rows, row_heights, wrap_band_text, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry
 
 # ── Quality presets (identical to previous version) ───────────────────────────
@@ -902,33 +902,27 @@ def main(
 
         # ── Audio ──────────────────────────────────────────────────────────────
         audio_path    = os.path.join(tmp, "audio.aac")
-        speech_ranges = extract_speech_ranges(clip_words)
+        # Muted sections silence the picture's own sound (not the music) inside the mix (audio.py)
+        mute_ranges = [(int(r["start_ms"]), int(r["end_ms"])) for r in spec.get("mute_ranges", [])
+                       if int(r["end_ms"]) > int(r["start_ms"])]
+        # The music dips only where the voice is actually heard (clip time; words are in video time)
+        speech_ranges = heard_speech_ranges(
+            extract_speech_ranges(clip_words), clip_start_ms, clip_end_ms - clip_start_ms,
+            segments, secondary_videos, mute_ranges, audio_tracks,
+            bool(spec.get("main_detached")), float(spec.get("main_volume", 1.0)),
+        )
         ar = subprocess.run(
             build_segment_audio_args(
                 video_path, clip_start_ms, clip_end_ms,
                 segments, secondary_videos, audio_tracks, speech_ranges, audio_path,
+                mute_ranges=mute_ranges, main_detached=bool(spec.get("main_detached")),
+                main_volume=float(spec.get("main_volume", 1.0)),
             ),
             capture_output=True,
         )
         if ar.returncode != 0:
             raise RuntimeError(f"Audio extraction failed:\n{ar.stderr.decode()[-500:]}")
-
-        # ── Muted parts: muted sections, or outside the detached original sound (clip-relative) ──
-        mute_ranges = [(int(r["start_ms"]), int(r["end_ms"])) for r in spec.get("mute_ranges", [])
-                       if int(r["end_ms"]) > int(r["start_ms"])]
-        if mute_ranges and os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
-            expr = "+".join(f"between(t,{a / 1000:.3f},{b / 1000:.3f})" for a, b in mute_ranges)
-            muted_path = os.path.join(tmp, "audio_muted.aac")
-            mr = subprocess.run(
-                ["ffmpeg", "-y", "-hide_banner", "-i", audio_path, "-af", f"volume=0:enable='{expr}'",
-                 "-c:a", "aac", "-b:a", "192k", muted_path],
-                capture_output=True,
-            )
-            if mr.returncode == 0:
-                audio_path = muted_path
-                print(f"[render] muted {len(mute_ranges)} part(s) of the sound", flush=True)
-            else:
-                print(f"[render] could not mute parts of the sound: {mr.stderr.decode()[-300:]}", flush=True)
+        print(f"[render] sound: {len(audio_tracks)} track(s), {len(mute_ranges)} muted part(s), levelled to -14 LUFS", flush=True)
 
         # ── Hidden added videos: the main video shows there (default framing). Their sound was
         #    mixed above by their own switch, so this only changes the picture. ──

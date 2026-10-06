@@ -66,6 +66,12 @@ async function runMigrations() {
   await db`ALTER TABLE audio_tracks ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT false`
   await db`ALTER TABLE audio_tracks ADD COLUMN IF NOT EXISTS offset_ms INTEGER`
   await db`ALTER TABLE audio_tracks ADD COLUMN IF NOT EXISTS end_ms INTEGER`
+  // Music: the fade-in / fade-out buttons (0.5 s each, in the preview and the export)
+  await db`ALTER TABLE audio_tracks ADD COLUMN IF NOT EXISTS fade_in BOOLEAN NOT NULL DEFAULT false`
+  await db`ALTER TABLE audio_tracks ADD COLUMN IF NOT EXISTS fade_out BOOLEAN NOT NULL DEFAULT false`
+  // The clip's own sound (top of the Music panel): its volume and mute, saved and exported
+  await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS original_volume REAL NOT NULL DEFAULT 1`
+  await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS original_muted BOOLEAN NOT NULL DEFAULT false`
   // Clip board: a clip marked as a favourite (the heart on its card)
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS favorite BOOLEAN NOT NULL DEFAULT false`
   // An added video (B-roll) hidden on its own; segments.hidden is then the main video's
