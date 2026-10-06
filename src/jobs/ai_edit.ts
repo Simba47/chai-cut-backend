@@ -120,6 +120,19 @@ const LINE_END_GAP_MS = 500
 // itself, screens, scenery): framed as a still centre crop instead of chasing motion
 const BROLL_FACE_SHARE = 0.25
 
+// Huge motion: a shot where following everyone would swing the crop around (people walking, a
+// camera chasing them, the framing flipping between people every moment) ignores most of it — a
+// vertical on the shot's main character (who talks most and fills the most screen time), held
+// still and only gliding along when they are about to leave it. CALM_MOTION=off turns it off.
+const CALM_MOTION = process.env.CALM_MOTION !== 'off'
+// The main character's centre moving this much per second (median, fraction of the source width)
+const BUSY_MOVE_PER_S = 0.08
+// …or the framing changing at least BUSY_SWITCHES times, on average sooner than BUSY_SWITCH_MS apart
+const BUSY_SWITCHES = 3
+const BUSY_SWITCH_MS = 2500
+// A calm crop moves only once the face centre is this far from its middle (share of the crop width)
+const CALM_SAFE_ZONE = 0.25
+
 export async function probeSize(videoPath: string): Promise<{ width: number; height: number } | null> {
   try {
     const { stdout } = await execFileAsync('ffprobe', [
@@ -252,6 +265,31 @@ function _deadZone(values: number[], threshold = 0.03): number[] {
   const out = [values[0]]
   for (let i = 1; i < values.length; i++) {
     out.push(Math.abs(values[i] - out[i - 1]) > threshold ? values[i] : out[i - 1])
+  }
+  return out
+}
+
+/**
+ * A lazy camera for a moving subject: the crop stays put while the subject is near its middle and
+ * only glides after them (over about a second) once they are CALM_SAFE_ZONE of the crop width away
+ * from it, settling again when centred. Starts afresh at each index in `resets` (camera cuts).
+ */
+export function lazyFollow(values: number[], cropW: number, resets: number[] = []): number[] {
+  const out: number[] = []
+  const bounds = [0, ...resets.filter(r => r > 0 && r < values.length), values.length]
+  for (let b = 0; b < bounds.length - 1; b++) {
+    const part = values.slice(bounds[b], bounds[b + 1])
+    let x = part[0], moving = false
+    const follow = part.map(v => {
+      if (!moving && Math.abs(v - x) > cropW * CALM_SAFE_ZONE) moving = true
+      if (moving) {
+        x += (v - x) * 0.35
+        if (Math.abs(v - x) < cropW * 0.05) moving = false
+      }
+      return x
+    })
+    // No extra smoothing: the glide already eases, and a slow average would let them walk out of it
+    out.push(...follow)
   }
   return out
 }
@@ -1034,6 +1072,8 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
 
   // Raw subject centre per slot for a frame and layout
   const rawCx = (f: FrameDetection, layout: Layout, slotIdx: number) => {
+    // A huge-motion shot: the main character, wherever they went
+    if (calmPath.has(f)) return calmPath.get(f) ?? null
     const mode = modeOf.get(f)
     if (mode === 'center') return 0.5
     if (mode === 'group') return groupSlots(f)?.[slotIdx]?.cx ?? null
@@ -1102,6 +1142,82 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
       for (const f of shot.frames) modeOf.set(f, 'center')
       cutaways++
     }
+  }
+
+  // Huge motion: in a shot where following everyone would swing the crop around, hold a vertical
+  // on the main character instead. Their centre per frame (also when their track id changes as
+  // they move fast: the face nearest where they were, of a similar size) is kept in calmPath.
+  const calmPath = new Map<FrameDetection, number | null>()
+  if (CALM_MOTION) {
+    const idxOf = new Map(frames.map((f, i) => [f, i]))
+    let calmed = 0
+    for (const shot of merged) {
+      const fs = shot.frames
+      if (fs.length < DETECT_FPS * 2 || modeOf.get(fs[0]) === 'center') continue
+      // Main character: screen time × face size, talking counting double
+      const weight = new Map<number, number>()
+      for (const f of fs) {
+        const i = idxOf.get(f)!
+        f.faces.forEach((face, k) => {
+          if ((face.score ?? 0) <= 0) return
+          const id = tracks[i][k]
+          weight.set(id, (weight.get(id) ?? 0) + face.w * face.h * (speakers[i] === id ? 2 : 1))
+        })
+      }
+      const main = [...weight.entries()].sort((a, b) => b[1] - a[1])[0]?.[0]
+      if (main === undefined) continue
+      const mainW = median(fs.flatMap(f => f.faces.filter((_, k) => tracks[idxOf.get(f)!][k] === main).map(face => face.w)))
+      // Only faces about the main character's size can be them (a passer-by crossing in front can
+      // take over their track id)
+      const likeMain = (face: CropBox) => (face.score ?? 0) > 0 && face.w > mainW * 0.6 && face.w < mainW * 1.6
+      // Fast movers get a new track id every second or so: follow them from where the main id is
+      // first seen, forwards and backwards, by size and nearness
+      const own = (f: FrameDetection) => {
+        const k = tracks[idxOf.get(f)!].indexOf(main)
+        return k >= 0 && likeMain(f.faces[k]) ? f.faces[k].x + f.faces[k].w / 2 : null
+      }
+      const anchor = fs.findIndex(f => own(f) !== null)
+      if (anchor < 0) continue
+      const path: Array<number | null> = fs.map(() => null)
+      const step = (i: number, prev: number | null) => {
+        let cx = own(fs[i])
+        if (cx === null && prev !== null) {
+          const near = fs[i].faces.filter(likeMain)
+            .sort((a, b) => Math.abs(a.x + a.w / 2 - prev) - Math.abs(b.x + b.w / 2 - prev))[0]
+          if (near && Math.abs(near.x + near.w / 2 - prev) < reelW) cx = near.x + near.w / 2
+        }
+        path[i] = cx
+        return cx ?? prev
+      }
+      let prev: number | null = null
+      for (let i = anchor; i < fs.length; i++) prev = step(i, prev)
+      prev = path[anchor]
+      for (let i = anchor - 1; i >= 0; i--) prev = step(i, prev)
+      // How far the main character moves per second (median over the shot)
+      const moves: number[] = []
+      for (let i = DETECT_FPS; i < path.length; i++) {
+        const a = path[i - DETECT_FPS], b = path[i]
+        if (a !== null && b !== null) moves.push(Math.abs(b - a))
+      }
+      // How often the framing would change (only changes lasting a second or more count)
+      const settled: Mode[] = []
+      let run: { m: Mode; n: number } | null = null
+      for (const f of fs) {
+        const m = modeOf.get(f)!
+        if (run && run.m === m) run.n++
+        else { if (run && run.n >= DETECT_FPS) settled.push(run.m); run = { m, n: 1 } }
+      }
+      if (run && run.n >= DETECT_FPS) settled.push(run.m)
+      let switches = 0
+      for (let i = 1; i < settled.length; i++) if (settled[i] !== settled[i - 1]) switches++
+      const shotMs = fs.length * FRAME_INTERVAL_MS
+      const busy = (moves.length >= 2 && median(moves) > BUSY_MOVE_PER_S)
+        || (switches >= BUSY_SWITCHES && shotMs / switches < BUSY_SWITCH_MS)
+      if (!busy) continue
+      fs.forEach((f, i) => { modeOf.set(f, `speaker:${main}`); calmPath.set(f, path[i]) })
+      calmed++
+    }
+    if (calmed) console.log(`[ai_edit] huge motion: ${calmed} shot(s) held on their main character`)
   }
 
   // Step 2: within each shot, runs of the same mode; runs under MIN_SEGMENT_MS (SPEAKER_HOLD_MS
@@ -1206,7 +1322,11 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
       // between two frames: start the smoothing afresh there too, so the crop jumps with the
       // picture instead of sliding across for seconds
       const jumps = raw.map((v, i) => (i > 0 && Math.abs(v - raw[i - 1]) > JUMP_CUT ? i : -1)).filter(i => i > 0)
-      const cx = stabilise(raw, [...new Set([...g.resets, ...jumps])].sort((a, b) => a - b))
+      const resets = [...new Set([...g.resets, ...jumps])].sort((a, b) => a - b)
+      // A huge-motion shot: the crop holds still and only glides when the main character nears its edge
+      const cx = g.layout === 'vertical' && g.frames.every(f => calmPath.has(f))
+        ? lazyFollow(raw, reelW, resets)
+        : stabilise(raw, resets)
       if (g.mode === 'group') {
         // A wide shot holds still: one crop per slot from the frames' medians
         const slots = g.frames.map(groupSlots).filter((v): v is NonNullable<typeof v> => !!v)
