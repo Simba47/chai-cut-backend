@@ -32,5 +32,15 @@ export async function r2DownloadToFile(key: string, filePath: string, signal?: A
 
 /** Stream a local file up to R2 */
 export async function r2UploadFile(key: string, filePath: string, contentType: string): Promise<void> {
+  // A local export (src/scripts/local-export.ts) keeps the file on the PC instead of uploading it
+  if (process.env.LOCAL_EXPORT_DIR) {
+    const { copyFile, mkdir } = await import('node:fs/promises')
+    const { join } = await import('node:path')
+    await mkdir(process.env.LOCAL_EXPORT_DIR, { recursive: true })
+    const dest = join(process.env.LOCAL_EXPORT_DIR, key.replace(/[\\/]+/g, '_'))
+    await copyFile(filePath, dest)
+    console.log(`[local export] saved ${dest} (not uploaded)`)
+    return
+  }
   await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: key, Body: createReadStream(filePath), ContentType: contentType }))
 }
