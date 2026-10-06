@@ -45,6 +45,15 @@ export interface AiEditJobPayload {
   clip_count: number
   /** Add stock B-roll (also needs AUTO_BROLL=on and PEXELS_API_KEY on the worker) */
   add_broll?: boolean
+  // The Make my clips checkboxes; a missing one counts as on (jobs queued before they existed)
+  /** Karaoke captions (off: no caption style is saved, so none show or export) */
+  captions?: boolean
+  /** The AI hook as an on-screen title over the first 3 seconds */
+  title?: boolean
+  /** The crop follows people (off: it holds still within each shot) */
+  motion?: boolean
+  /** Split and trio layouts (off: always vertical, on one person) */
+  layouts?: boolean
 }
 
 export const JOB_POLL_INTERVAL_MS = 2000
