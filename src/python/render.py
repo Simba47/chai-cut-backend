@@ -16,15 +16,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
-import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges
+from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges, heard_speech_ranges
+import emoji as emoji_art   # colour emoji (Twemoji 17), drawn locally
 from frames import is_frame, frame_rows, row_heights, wrap_band_text, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry
 
 # ── Quality presets (identical to previous version) ───────────────────────────
@@ -193,7 +192,7 @@ def _write_ass(
     if style.get("animation") in _PRESETS:
         lines += _preset_events(clip_words, style, out_w, out_h, band_zones or [])
         with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
+            f.write("\n".join(emoji_art.colour_emoji_ass(lines)) + "\n")
         return
 
     # Karaoke: the spoken word in the highlight colour, lit until the next word starts (the
@@ -233,8 +232,9 @@ def _write_ass(
                 f"Default,,0,0,0,,{tag}{body}"
             )
 
+    # Emoji in full colour: stacked colour layers on top of the line (emoji.colour_emoji_ass)
     with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+        f.write("\n".join(emoji_art.colour_emoji_ass(lines)) + "\n")
 
 
 def _line_times(sentences: list[list[dict]]) -> list[tuple[int, int]]:
@@ -577,6 +577,20 @@ def _frame_text_font(text: str) -> str:
     return path.replace("\\", "/").replace(":", "\\:") if path else ""
 
 
+def _line_baseline(pil_font, runs: list[tuple[bool, str]], size: int) -> int:
+    """
+    How far below a line's y its baseline is when the line is drawn in pieces (text runs and emoji
+    pictures). drawtext's y is the top of the tallest glyph it draws, so pieces with different
+    letters would each sit at a different height; every piece is drawn on this one baseline
+    instead (y_align=baseline): the line looks exactly as one drawtext of it would.
+    """
+    plain = "".join(t for is_e, t in runs if not is_e)
+    above = -pil_font.getbbox(plain, anchor="ls")[1] if plain.strip() else 0
+    if any(is_e for is_e, _ in runs):
+        above = max(above, round(size * emoji_art.ABOVE_EM))
+    return above
+
+
 def _frame_text_chain(fp: list[str], inputs: list[str], next_input: int, key: str,
                       text: str, bg: str, color: str, size_1080: int, w: int, h: int, dur_s: float,
                       cx: float = 0.5, cy: float = 0.5) -> tuple[str, int]:
@@ -600,10 +614,10 @@ def _frame_text_chain(fp: list[str], inputs: list[str], next_input: int, key: st
             if not ln:
                 continue
             y = int(top + li * lh + (lh - size) / 2)
-            runs = _split_emoji_runs(ln)
+            runs = emoji_art.split_emoji(ln)
             if not any(is_e for is_e, _ in runs):
                 olbl = f"[{key}t{ridx}]"
-                fp.append(f"{cur}drawtext=fontfile='{font}':text='{_escape_drawtext(ln)}':fontsize={size}"
+                fp.append(f"{cur}drawtext=fontfile='{font}':{_text_opt(ln)}:fontsize={size}"
                           f":fontcolor=0x{color}:x={cx * w:.1f}-tw/2:y={y}{olbl}")
                 cur = olbl
                 ridx += 1
@@ -611,27 +625,32 @@ def _frame_text_chain(fp: list[str], inputs: list[str], next_input: int, key: st
             # Has emoji: same per-run drawtext/overlay composite as the main text_overlays loop,
             # just centred on this line's own width instead of ffmpeg's (w-text_w)/2 expression
             from PIL import ImageFont
-            pil_font = ImageFont.truetype(font, size)
-            run_widths = [size if is_e else pil_font.getlength(s) for is_e, s in runs]
+            # `font` is escaped for the filter (Windows drive letters): Pillow needs the plain path
+            pil_font = ImageFont.truetype(font.replace("\:", ":"), size)
+            # An emoji takes the Chai Emoji font's room (1.1 em, its square 0.05 em in from each side)
+            # and sits on the baseline (0.82 em above, 0.18 em below) — as the editor's preview draws it
+            run_widths = [size * emoji_art.ADVANCE_EM if is_e else pil_font.getlength(s) for is_e, s in runs]
+            base = y + _line_baseline(pil_font, runs, size)
             cursor = cx * w - sum(run_widths) / 2
             for (is_emoji, s), rw in zip(runs, run_widths):
                 if not s:
                     continue
                 if is_emoji:
-                    png = _emoji_png(s)
+                    png = emoji_art.emoji_png(s, int(size))
                     if png:
                         inputs += ["-i", png]
                         src_lbl = f"[{next_input}:v]"
                         next_input += 1
                         slbl, olbl = f"[{key}e{ridx}s]", f"[{key}e{ridx}]"
-                        fp.append(f"{src_lbl}scale={int(size)}:{int(size)}:flags=lanczos{slbl}")
-                        fp.append(f"{cur}{slbl}overlay=x={int(cursor)}:y={y}{olbl}")
+                        fp.append(f"{src_lbl}format=rgba{slbl}")
+                        fp.append(f"{cur}{slbl}overlay=x={int(cursor + size * emoji_art.SIDE_EM)}"
+                                  f":y={int(base - size * emoji_art.ABOVE_EM)}{olbl}")
                         cur = olbl
                         ridx += 1
                 else:
                     olbl = f"[{key}t{ridx}]"
-                    fp.append(f"{cur}drawtext=fontfile='{font}':text='{_escape_drawtext(s)}':fontsize={size}"
-                              f":fontcolor=0x{color}:x={int(cursor)}:y={y}{olbl}")
+                    fp.append(f"{cur}drawtext=fontfile='{font}':{_text_opt(s)}:fontsize={size}"
+                              f":fontcolor=0x{color}:x={int(cursor)}:y_align=baseline:y={base}{olbl}")
                     cur = olbl
                     ridx += 1
                 cursor += rw
@@ -827,7 +846,8 @@ def _fit_font_size(text: str, font_path: str, size: int, max_w: int) -> int:
 
 
 def _escape_drawtext(s: str) -> str:
-    """Every call site wraps this in text='...'. FFmpeg's filtergraph quoting is POSIX-shell-style:
+    """Every call site wraps this in text='...' and sets expansion=none, so % (e.g. "100%") is drawn
+    as typed instead of starting a drawtext %{...} code ("Stray %" failed the whole export). FFmpeg's filtergraph quoting is POSIX-shell-style:
     backslash has no special meaning inside single quotes, so \\' does NOT escape a literal quote
     there — it corrupts quote-tracking for the rest of the filter graph (confirmed: a name with an
     apostrophe crashed every render downstream of it with "No option name near ..."). A literal
@@ -836,76 +856,25 @@ def _escape_drawtext(s: str) -> str:
     escaping those would print a literal backslash in the text instead of protecting anything."""
     return s.replace("'", "'\\''")
 
-
-# ── Emoji in text overlays ──────────────────────────────────────────────────────
-# drawtext can't mix fonts in one call, and no bundled font draws colour emoji (Google's
-# current Noto Color Emoji is COLRv1, which Pillow can't rasterise as colour yet — tested
-# directly: valid glyph metrics, zero-height bitmap). Emoji runs are rendered separately as
-# Twemoji PNGs and composited with `overlay`; the rest of the line stays on drawtext as before.
-_EMOJI_RUN_RE = re.compile(
-    "["
-    "\U0001F1E6-\U0001F1FF"  # regional indicators (flag pairs)
-    "\U0001F300-\U0001F5FF"  # misc symbols & pictographs (includes skin tone modifiers)
-    "\U0001F600-\U0001F64F"  # emoticons
-    "\U0001F680-\U0001F6FF"  # transport & map
-    "\U0001F700-\U0001F77F"  # alchemical symbols
-    "\U0001F780-\U0001F7FF"  # geometric shapes extended
-    "\U0001F800-\U0001F8FF"  # supplemental arrows-C
-    "\U0001F900-\U0001F9FF"  # supplemental symbols & pictographs
-    "\U0001FA00-\U0001FA6F"  # chess symbols
-    "\U0001FA70-\U0001FAFF"  # symbols & pictographs extended-A
-    "\u2600-\u26FF"  # misc symbols
-    "\u2700-\u27BF"  # dingbats
-    "\u2300-\u23FF"  # misc technical (watch, alarm clock, …)
-    "\u2B00-\u2BFF"  # misc symbols and arrows (star, etc.)
-    "\uFE0F"          # variation selector-16 (emoji presentation)
-    "\u200D"          # zero-width joiner (binds ZWJ sequences into one run)
-    "]+"
-)
-_EMOJI_CACHE_DIR = os.path.join(tempfile.gettempdir(), "chai-cut-emoji-cache")
-# Pinned so the file layout can't change under us; jdecked/twemoji is the maintained fork
-# (the original twitter/twemoji repo stopped receiving new emoji after the 2023 ownership change).
-_TWEMOJI_BASE = "https://cdn.jsdelivr.net/gh/jdecked/twemoji@v17.0.3/assets/72x72"
+# User text is handed to drawtext in a file (textfile=), never inline: FFmpeg parses filter text
+# twice, so inline text needs two layers of escaping and a colon, apostrophe or % in it ("It's
+# 100%: true") failed the whole export. From a file every character is drawn as typed
+# (expansion=none: % isn't a drawtext code).
+_TEXT_DIR: str | None = None
 
 
-def _split_emoji_runs(text: str) -> list[tuple[bool, str]]:
-    """Alternating (is_emoji, content) runs. Adjacent emoji codepoints (ZWJ sequences, skin
-    tone modifiers, flag pairs) merge into a single run so they render as one glyph."""
-    runs: list[tuple[bool, str]] = []
-    pos = 0
-    for m in _EMOJI_RUN_RE.finditer(text):
-        if m.start() > pos:
-            runs.append((False, text[pos:m.start()]))
-        runs.append((True, m.group()))
-        pos = m.end()
-    if pos < len(text):
-        runs.append((False, text[pos:]))
-    return runs
+def _text_opt(s: str) -> str:
+    """drawtext options that draw `s` exactly as typed"""
+    global _TEXT_DIR
+    if _TEXT_DIR is None:
+        import atexit, shutil
+        _TEXT_DIR = tempfile.mkdtemp(prefix="chai-text-")
+        atexit.register(shutil.rmtree, _TEXT_DIR, True)
+    fd, path = tempfile.mkstemp(suffix=".txt", dir=_TEXT_DIR)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(s)
+    return f"textfile={_filter_path(path)}:expansion=none"
 
-
-def _emoji_png(emoji: str) -> str | None:
-    """A cached local path to this emoji's Twemoji PNG, downloading it if needed. None if it
-    can't be fetched (no network, not in the set) — the caller just skips drawing that glyph."""
-    # Twemoji's filenames drop FE0F (the emoji-presentation selector) entirely
-    name = "-".join(f"{ord(c):x}" for c in emoji if c != "\uFE0F")
-    if not name:
-        return None
-    path = os.path.join(_EMOJI_CACHE_DIR, f"{name}.png")
-    if os.path.exists(path):
-        return path
-    try:
-        os.makedirs(_EMOJI_CACHE_DIR, exist_ok=True)
-        with urllib.request.urlopen(f"{_TWEMOJI_BASE}/{name}.png", timeout=5) as resp:
-            data = resp.read()
-        # Atomic: two concurrent renders fetching the same emoji (worker concurrency=2)
-        # must never leave a half-written file for the other to read
-        tmp_path = f"{path}.{os.getpid()}.tmp"
-        with open(tmp_path, "wb") as f:
-            f.write(data)
-        os.replace(tmp_path, path)
-        return path
-    except Exception:
-        return None
 
 
 def _esc_expr(s: str) -> str:
@@ -1024,33 +993,27 @@ def main(
 
         # ── Audio ──────────────────────────────────────────────────────────────
         audio_path    = os.path.join(tmp, "audio.aac")
-        speech_ranges = extract_speech_ranges(clip_words)
+        # Muted sections silence the picture's own sound (not the music) inside the mix (audio.py)
+        mute_ranges = [(int(r["start_ms"]), int(r["end_ms"])) for r in spec.get("mute_ranges", [])
+                       if int(r["end_ms"]) > int(r["start_ms"])]
+        # The music dips only where the voice is actually heard (clip time; words are in video time)
+        speech_ranges = heard_speech_ranges(
+            extract_speech_ranges(clip_words), clip_start_ms, clip_end_ms - clip_start_ms,
+            segments, secondary_videos, mute_ranges, audio_tracks,
+            bool(spec.get("main_detached")), float(spec.get("main_volume", 1.0)),
+        )
         ar = subprocess.run(
             build_segment_audio_args(
                 video_path, clip_start_ms, clip_end_ms,
                 segments, secondary_videos, audio_tracks, speech_ranges, audio_path,
+                mute_ranges=mute_ranges, main_detached=bool(spec.get("main_detached")),
+                main_volume=float(spec.get("main_volume", 1.0)),
             ),
             capture_output=True,
         )
         if ar.returncode != 0:
             raise RuntimeError(f"Audio extraction failed:\n{ar.stderr.decode()[-500:]}")
-
-        # ── Muted parts: muted sections, or outside the detached original sound (clip-relative) ──
-        mute_ranges = [(int(r["start_ms"]), int(r["end_ms"])) for r in spec.get("mute_ranges", [])
-                       if int(r["end_ms"]) > int(r["start_ms"])]
-        if mute_ranges and os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
-            expr = "+".join(f"between(t,{a / 1000:.3f},{b / 1000:.3f})" for a, b in mute_ranges)
-            muted_path = os.path.join(tmp, "audio_muted.aac")
-            mr = subprocess.run(
-                ["ffmpeg", "-y", "-hide_banner", "-i", audio_path, "-af", f"volume=0:enable='{expr}'",
-                 "-c:a", "aac", "-b:a", "192k", muted_path],
-                capture_output=True,
-            )
-            if mr.returncode == 0:
-                audio_path = muted_path
-                print(f"[render] muted {len(mute_ranges)} part(s) of the sound", flush=True)
-            else:
-                print(f"[render] could not mute parts of the sound: {mr.stderr.decode()[-300:]}", flush=True)
+        print(f"[render] sound: {len(audio_tracks)} track(s), {len(mute_ranges)} muted part(s), levelled to -14 LUFS", flush=True)
 
         # ── Hidden added videos: the main video shows there (default framing). Their sound was
         #    mixed above by their own switch, so this only changes the picture. ──
@@ -1461,14 +1424,13 @@ def main(
             t1 = ov.get("end_ms", clip_dur_ms) / 1000.0
             enable = f"between(t,{t0:.3f},{t1:.3f})"
 
-            if not _EMOJI_RUN_RE.search(raw_text):
+            if not emoji_art.has_emoji(raw_text):
                 # ── No emoji: a single drawtext call, exactly as before ──
-                text = _escape_drawtext(raw_text)
                 sz_fit = _fit_font_size(raw_text, font_path, sz, int(out_w * 0.9)) if centered else sz
                 sx = "(w-text_w)/2" if centered else int((ov.get("x") or 0.1) * out_w)
                 olbl = f"[vdt{oi}]"
                 fp.append(
-                    f"{cur}drawtext=fontfile={_filter_path(font_path)}:text='{text}':fontsize={sz_fit}"
+                    f"{cur}drawtext=fontfile={_filter_path(font_path)}:{_text_opt(raw_text)}:fontsize={sz_fit}"
                     f":fontcolor=0x{r:02X}{g:02X}{b2:02X}:x={sx}:y={sy}"
                     f":shadowx=2:shadowy=2:shadowcolor=black@0.7{outline}"
                     f":enable='{enable}'{olbl}"
@@ -1480,11 +1442,12 @@ def main(
             # alongside separate drawtext calls for the plain-text runs, lined up to read as
             # one piece of text. Emoji are treated as sz×sz boxes (Twemoji is drawn square). ──
             from PIL import ImageFont
-            line_runs = [_split_emoji_runs(ln) for ln in raw_text.split("\n")]
+            line_runs = [emoji_art.split_emoji(ln) for ln in raw_text.split("\n")]
 
             def _measure(size: int) -> tuple[list[list[float]], float]:
                 pil_font = ImageFont.truetype(font_path, size)
-                widths = [[size if is_e else pil_font.getlength(s) for is_e, s in runs] for runs in line_runs]
+                # An emoji takes the Chai Emoji font's room (as the editor's preview draws it)
+                widths = [[size * emoji_art.ADVANCE_EM if is_e else pil_font.getlength(s) for is_e, s in runs] for runs in line_runs]
                 return widths, max((sum(ws) for ws in widths), default=0.0)
 
             widths, max_w = _measure(sz)
@@ -1493,34 +1456,37 @@ def main(
                 widths, max_w = _measure(sz)
 
             line_h = int(sz * 1.2)
+            pil_font = ImageFont.truetype(font_path, sz)
             sx0 = int((ov.get("x") or 0.1) * out_w)
             ridx = 0
             for li, runs in enumerate(line_runs):
                 line_w = sum(widths[li])
                 cursor = (out_w - line_w) / 2 if centered else sx0
                 line_y = sy + li * line_h
+                base = line_y + _line_baseline(pil_font, runs, sz)
                 for (is_emoji, s), w in zip(runs, widths[li]):
                     if not s:
                         continue
                     if is_emoji:
-                        png = _emoji_png(s)
+                        png = emoji_art.emoji_png(s, int(sz))
                         if png:
                             inputs += ["-i", png]
                             src_lbl = f"[{next_input}:v]"
                             next_input += 1
                             slbl = f"[vemo{oi}_{ridx}s]"
                             olbl = f"[vemo{oi}_{ridx}]"
-                            fp.append(f"{src_lbl}scale={int(sz)}:{int(sz)}:flags=lanczos{slbl}")
-                            fp.append(f"{cur}{slbl}overlay=x={int(cursor)}:y={int(line_y)}:enable='{enable}'{olbl}")
+                            fp.append(f"{src_lbl}format=rgba{slbl}")
+                            fp.append(f"{cur}{slbl}overlay=x={int(cursor + sz * emoji_art.SIDE_EM)}"
+                                      f":y={int(base - sz * emoji_art.ABOVE_EM)}:enable='{enable}'{olbl}")
                             cur = olbl
                             ridx += 1
-                        # Reserve the width either way so trailing text doesn't overlap a
-                        # skipped (unfetchable) emoji
+                        # Reserve the width either way so trailing text doesn't overlap an emoji
+                        # the font has no drawing for
                     else:
                         olbl = f"[vdt{oi}_{ridx}]"
                         fp.append(
-                            f"{cur}drawtext=fontfile={_filter_path(font_path)}:text='{_escape_drawtext(s)}':fontsize={sz}"
-                            f":fontcolor=0x{r:02X}{g:02X}{b2:02X}:x={int(cursor)}:y={int(line_y)}"
+                            f"{cur}drawtext=fontfile={_filter_path(font_path)}:{_text_opt(s)}:fontsize={sz}"
+                            f":fontcolor=0x{r:02X}{g:02X}{b2:02X}:x={int(cursor)}:y_align=baseline:y={int(base)}"
                             f":shadowx=2:shadowy=2:shadowcolor=black@0.7{outline}"
                             f":enable='{enable}'{olbl}"
                         )

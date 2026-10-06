@@ -118,6 +118,20 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
       } catch (e) { console.warn(`[render] Failed to download overlay video:`, e) }
     }
 
+    // Music (uploaded from the editor): downloaded, read locally by audio.py; one that can't be
+    // fetched is left out rather than failing the export
+    const musicTracks = (renderSpec.audio_tracks ?? []) as Row[]
+    for (const tr of musicTracks) {
+      if (tr.kind !== 'music' || !tr.storage_path) continue
+      try {
+        const ext = (String(tr.storage_path).split('.').pop() ?? 'audio').replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'audio'
+        const localPath = join(tmp, `music_${createHash('sha1').update(String(tr.storage_path)).digest('hex').slice(0, 16)}.${ext}`)
+        await r2DownloadToFile(String(tr.storage_path), localPath, signal)
+        tr.local_path = localPath
+      } catch (e) { console.warn(`[render] Failed to download music:`, e) }
+    }
+    renderSpec = { ...renderSpec, audio_tracks: musicTracks.filter(t => t.kind !== 'music' || t.local_path) }
+
     await writeFile(specPath, JSON.stringify(renderSpec, null, 2))
     // __dirname is dist/jobs/ at runtime; Python files live in src/python/ (not copied by tsc)
     const pythonScript = join(__dirname, '../../src/python/render.py')
@@ -214,13 +228,17 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
     blank_ranges: blankRanges(segments as Row[], clip.video_id),
     caption_styles: captionStyles,
     text_overlays: (textOverlays as Row[]).filter(t => !t.hidden),
-    // Only music stored as a file can be mixed in. A detached original sound ("main-video:…") is
-    // the clip's own audio, which the export already plays; a song picked in the browser but not
-    // uploaded has no file yet. Either would make FFmpeg fail the whole export, so leave them out.
-    audio_tracks: (audioTracks as { storage_path?: string; muted?: boolean }[]).filter(t => !t.muted && !!t.storage_path && t.storage_path.includes('/') && !t.storage_path.startsWith('main-video:')),
-    // Where the clip's own sound is silent: muted sections, and — once the original sound is
-    // detached onto its own bar — wherever that bar isn't (or is muted)
-    mute_ranges: muteRanges(segments as Row[], audioTracks as Row[], clip.end_ms - clip.start_ms, clip.video_id),
+    // Music (uploaded from the editor) and detached original-sound bars, each placed where its bar
+    // is (audio.py). Music saved before uploads existed has only a file name: it can't be mixed in
+    // (the editor asks to re-add it)
+    audio_tracks: specAudioTracks(audioTracks as Row[], clip.start_ms),
+    // The original sound detached onto its own bar: the picture's main-video sound goes quiet
+    main_detached: (audioTracks as Row[]).some(isOriginalSound),
+    // The clip's own sound level (top of the Music panel): muted = 0
+    main_volume: clip.original_muted === true ? 0 : clip.original_volume == null ? 1 : Number(clip.original_volume),
+    // Muted sections: the picture's own sound (and the detached original sound) is silent there —
+    // the music keeps playing
+    mute_ranges: muteRanges(segments as Row[], clip.video_id),
     transitions, overlays: (overlays as Row[]).filter(o => !o.hidden), words,
     output_width: dims.w, output_height: dims.h,
   }
@@ -423,12 +441,34 @@ function blankRanges(segments: Row[], mainVideoId: string): { start_ms: number; 
     .filter(r => r.end_ms > r.start_ms)
 }
 
+/** A music-lane bar that is the main video's own sound, detached ("main-video:<id>") */
+const isOriginalSound = (t: Row) => typeof t.storage_path === 'string' && t.storage_path.startsWith('main-video:')
+
 /**
- * Clip-relative stretches where the main video's sound is silent in the export: muted sections,
- * and, when the original sound is detached onto its own bar, everything outside that bar (or the
- * bar itself when it's muted) — as the editor's preview plays it.
+ * The audio tracks audio.py mixes in, clip-relative: music with a stored file ("music": from
+ * offset_ms into the song) and detached original-sound bars ("original": the main video's sound
+ * from offset_ms, its source time — in step with the clip unless the bar was moved). Muted tracks
+ * and old music saved as just a file name (never uploaded) are left out.
  */
-function muteRanges(segments: Row[], audioTracks: Row[], lengthMs: number, mainVideoId: string): { start_ms: number; end_ms: number }[] {
+export function specAudioTracks(audioTracks: Row[], clipStartMs: number): Row[] {
+  return audioTracks.filter(t => !t.muted && typeof t.storage_path === 'string').flatMap(t => {
+    const base = {
+      id: t.id, start_ms: Math.max(0, Number(t.start_ms) || 0), end_ms: t.end_ms == null ? null : Number(t.end_ms),
+      volume: t.volume == null ? null : Number(t.volume), fade_in: t.fade_in === true, fade_out: t.fade_out === true,
+    }
+    if (isOriginalSound(t)) {
+      return [{ ...base, kind: 'original', offset_ms: t.offset_ms != null ? Number(t.offset_ms) : clipStartMs + base.start_ms, duck_under_speech: false }]
+    }
+    if (!String(t.storage_path).includes('/')) return []
+    return [{ ...base, kind: 'music', storage_path: t.storage_path, offset_ms: t.offset_ms != null ? Number(t.offset_ms) : 0, duck_under_speech: t.duck_under_speech !== false }]
+  })
+}
+
+/**
+ * Clip-relative stretches where the picture's own sound is silent in the export: muted sections
+ * (a detached original-sound bar is silent there too, as in the preview; music is not).
+ */
+export function muteRanges(segments: Row[], mainVideoId: string): { start_ms: number; end_ms: number }[] {
   // An added video playing its own sound (shown or hidden) replaces the main video's there: "mute
   // the main video" doesn't silence it
   const ownSound = (s: Row) => {
@@ -437,22 +477,10 @@ function muteRanges(segments: Row[], audioTracks: Row[], lengthMs: number, mainV
   }
   // (A frame mutes just its main-video slots, in shownSegments: its own videos keep their sound)
   const out: Range[] = segments.filter(s => s.muted && !ownSound(s) && !String(s.layout).startsWith('frame_')).map(s => [Number(s.start_ms), Number(s.end_ms)])
-  const originals = audioTracks.filter(t => typeof t.storage_path === 'string' && t.storage_path.startsWith('main-video:'))
-  if (originals.length) {
-    const heard = originals.filter(t => !t.muted)
-      .map(t => [Math.max(0, Number(t.start_ms)), Math.min(lengthMs, t.end_ms != null ? Number(t.end_ms) : lengthMs)] as Range)
-      .filter(([a, b]) => b > a).sort((p, q) => p[0] - q[0])
-    let cursor = 0
-    for (const [a, b] of heard) {
-      if (a > cursor) out.push([cursor, a])
-      cursor = Math.max(cursor, b)
-    }
-    if (cursor < lengthMs) out.push([cursor, lengthMs])
-  }
   return out.filter(([a, b]) => b > a).map(([a, b]) => ({ start_ms: Math.round(a), end_ms: Math.round(b) }))
 }
 
-function remapSpec(spec: Spec, kept: Range[]): Spec {
+export function remapSpec(spec: Spec, kept: Range[]): Spec {
   const start = spec.start_ms as number
   const src = makeTimeMap(kept)                           // source time → new time
   const rel = (t: number) => Math.round(src(start + Number(t)))  // clip-relative → new time
@@ -487,6 +515,11 @@ function remapSpec(spec: Spec, kept: Range[]): Spec {
     text_overlays: timed(spec.text_overlays as Row[]),
     overlays: timed(spec.overlays as Row[]),
     mute_ranges: timed((spec.mute_ranges ?? []) as Row[]),
+    // Bars move with the cuts; an original-sound bar's source time maps into the cut video too
+    audio_tracks: ((spec.audio_tracks ?? []) as Row[]).map(t => ({
+      ...t, start_ms: rel(t.start_ms), end_ms: t.end_ms == null ? null : rel(t.end_ms),
+      ...(t.kind === 'original' ? { offset_ms: Math.round(src(Number(t.offset_ms))) } : {}),
+    })).filter(t => t.end_ms == null || t.end_ms > t.start_ms),
     blank_ranges: timed((spec.blank_ranges ?? []) as Row[]),
     transitions: (spec.transitions as Row[]).filter(t => segIds.has(t.after_segment_id)),
   } as unknown as Spec

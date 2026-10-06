@@ -294,6 +294,18 @@ export function lazyFollow(values: number[], cropW: number, resets: number[] = [
   return out
 }
 
+/** Motion turned off: one still position per shot (the median of where the crop would look) */
+export function holdStill(values: number[], resets: number[] = []): number[] {
+  const out: number[] = []
+  const bounds = [0, ...resets.filter(r => r > 0 && r < values.length), values.length]
+  for (let b = 0; b < bounds.length - 1; b++) {
+    const part = values.slice(bounds[b], bounds[b + 1])
+    const m = median(part)
+    out.push(...part.map(() => m))
+  }
+  return out
+}
+
 // Smooth raw detected center positions before converting to keyframes, starting afresh at
 // each index in `resets` (the first frame after a camera cut).
 function stabilise(rawCx: number[], resets: number[] = []): number[] {
@@ -949,7 +961,15 @@ export function panelWindows(analysis: ClipAnalysis): ReactionWindow[] {
 //
 // Keyframe t_ms values are clip-relative (0 = first frame of the clip).
 // render.py subtracts seg.start_ms per segment to get FFmpeg-relative time.
-export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): ClipSegment[] {
+/** The Make my clips checkboxes that shape the framing (both on unless false) */
+export interface FramingOptions {
+  /** The crop follows people; false: it holds still within each shot */
+  motion?: boolean
+  /** Split and trio layouts; false: always vertical, on one person */
+  layouts?: boolean
+}
+
+export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number, opts: FramingOptions = {}): ClipSegment[] {
   const { info, cuts, reelW, portrait } = analysis
   const center = (1 - reelW) / 2
 
@@ -1220,6 +1240,17 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
     if (calmed) console.log(`[ai_edit] huge motion: ${calmed} shot(s) held on their main character`)
   }
 
+  // Cuts (split / trio) turned off: one person, always vertical — whoever is talking, else the
+  // biggest face (a huge-motion shot is already on its main character)
+  if (opts.layouts === false) {
+    frames.forEach((f, i) => {
+      const m = modeOf.get(f)!
+      if (m === 'center' || calmPath.has(f) || layoutOfMode(m) === 'vertical') return
+      const pick = speakers[i]
+      modeOf.set(f, typeof pick === 'number' && tracks[i].includes(pick) ? `speaker:${pick}` : 'vertical')
+    })
+  }
+
   // Step 2: within each shot, runs of the same mode; runs under MIN_SEGMENT_MS (SPEAKER_HOLD_MS
   // for a speaker or a reaction) merge into their bigger neighbour (in that shot only)
   type Run = { mode: Mode; start_ms: number; frames: FrameDetection[]; cutStart: boolean }
@@ -1324,9 +1355,11 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
       const jumps = raw.map((v, i) => (i > 0 && Math.abs(v - raw[i - 1]) > JUMP_CUT ? i : -1)).filter(i => i > 0)
       const resets = [...new Set([...g.resets, ...jumps])].sort((a, b) => a - b)
       // A huge-motion shot: the crop holds still and only glides when the main character nears its edge
-      const cx = g.layout === 'vertical' && g.frames.every(f => calmPath.has(f))
-        ? lazyFollow(raw, reelW, resets)
-        : stabilise(raw, resets)
+      const cx = opts.motion === false
+        ? holdStill(raw, resets)
+        : g.layout === 'vertical' && g.frames.every(f => calmPath.has(f))
+          ? lazyFollow(raw, reelW, resets)
+          : stabilise(raw, resets)
       if (g.mode === 'group') {
         // A wide shot holds still: one crop per slot from the frames' medians
         const slots = g.frames.map(groupSlots).filter((v): v is NonNullable<typeof v> => !!v)
@@ -1359,7 +1392,7 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number): C
     return { start_ms, end_ms, layout: g.layout, slotKfs }
   })
   // Interviews filmed one person per camera: reactions across shots
-  if (!REACTIONS) return built
+  if (!REACTIONS || opts.layouts === false) return built
   const panels = panelWindows(analysis)
   const borrowed = CROSS_SHOT_REACTIONS ? planShotReactions(personShots(analysis, clipDurationMs), analysis.speech) : []
   const windows = [...panels, ...borrowed.filter(w => panels.every(p => w.end_ms <= p.start_ms || w.start_ms >= p.end_ms))]
@@ -1461,6 +1494,9 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
   const payload = job.payload as unknown as AiEditJobPayload
   const { ai_edit_job_id, video_id, clip_count } = payload
   const addBroll = payload.add_broll === true && brollEnabled()
+  // The Make my clips checkboxes (missing = on)
+  const withCaptions = payload.captions !== false, withTitle = payload.title !== false
+  const framing: FramingOptions = { motion: payload.motion !== false, layouts: payload.layouts !== false }
   if (payload.add_broll && !addBroll) console.log('[ai_edit] B-roll asked for but AUTO_BROLL is off or no stock API key (PEXELS_API_KEY / PIXABAY_API_KEY): skipping it')
   const t0 = Date.now()
 
@@ -1588,9 +1624,9 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         const detectS = ((Date.now() - tDetect) / 1000).toFixed(1)
 
         // Brain: dynamically switch layout within the clip
-        let segments: ClipSegment[] = buildSegments(analysis, clipDurationMs)
-        // Related visuals: the speaker on top, what they're talking about below
-        if (visuals.length) {
+        let segments: ClipSegment[] = buildSegments(analysis, clipDurationMs, framing)
+        // Related visuals: the speaker on top, what they're talking about below (a split: not with cuts off)
+        if (visuals.length && framing.layouts) {
           const moments = await pickVisualMoments(words, highlight.start_ms, highlight.end_ms, visuals, process.env.GEMINI_API_KEY!)
             .catch(e => { console.warn('[ai_edit] related visual picking failed:', e instanceof Error ? e.message : e); return [] })
           const vw = visualWindows(moments, analysis, highlight.start_ms)
@@ -1603,7 +1639,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         const clipWords = words.filter(w => w.start_ms >= highlight.start_ms && w.start_ms < highlight.end_ms)
         const caption = captionFontFor(clipWords)
 
-        const clip_id = await saveClip(video_id, ai_edit_job_id, highlight, segments, caption, texts[hi])
+        const clip_id = await saveClip(video_id, ai_edit_job_id, highlight, segments, withCaptions ? caption : null, texts[hi], withTitle)
 
         const layoutSummary = segments.map(s =>
           `${s.layout}(${s.start_ms / 1000}s–${s.end_ms / 1000}s,${s.slotKfs[0]?.length ?? 0}kf)`
@@ -1691,8 +1727,11 @@ async function stockAsset(userId: string, ref: string, url: string, query: strin
  */
 async function saveClip(
   videoId: string, aiEditJobId: string, highlight: FoundClip, segments: ClipSegment[],
-  caption: { font: string; language: string | null },
+  /** null: captions off (no caption style, so none show or export) */
+  caption: { font: string; language: string | null } | null,
   text: ClipText | null,
+  /** The hook as an on-screen title over the first 3 seconds */
+  withTitle = true,
 ): Promise<string> {
   return db.begin(async tx => {
     const [clipRow] = await tx`
@@ -1706,7 +1745,7 @@ async function saveClip(
     const clipId = clipRow.id as string
 
     // The hook, over the first 3 seconds near the top (x null = centred), like any text overlay
-    if (text?.hook) {
+    if (withTitle && text?.hook) {
       await tx`
         INSERT INTO text_overlays (clip_id, text, start_ms, end_ms, x, y, font, size, color)
         VALUES (${clipId}, ${text.hook}, 0, ${Math.min(3000, highlight.end_ms - highlight.start_ms)}, NULL, 0.15,
@@ -1742,10 +1781,12 @@ async function saveClip(
     // Postgres allows 65,535 parameters per statement: 6 per keyframe
     for (let i = 0; i < kfRows.length; i += 5000) await tx`INSERT INTO box_keyframes ${tx(kfRows.slice(i, i + 5000))}`
 
-    await tx`
-      INSERT INTO caption_styles (clip_id, font, size, color, position, animation, language)
-      VALUES (${clipId}, ${caption.font}, 52, '#FFFFFF', 'bottom-center', 'karaoke', ${caption.language})
-    `
+    if (caption) {
+      await tx`
+        INSERT INTO caption_styles (clip_id, font, size, color, position, animation, language)
+        VALUES (${clipId}, ${caption.font}, 52, '#FFFFFF', 'bottom-center', 'karaoke', ${caption.language})
+      `
+    }
     return clipId
   })
 }
