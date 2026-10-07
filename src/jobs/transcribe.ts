@@ -7,7 +7,7 @@ import { pipeline } from 'node:stream/promises'
 import type { ReadableStream as WebReadableStream } from 'node:stream/web'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3'
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { GoogleAuth } from 'google-auth-library'
 import { r2, R2_BUCKET, r2DownloadToFile, r2UploadFile } from '../r2.js'
@@ -34,6 +34,28 @@ class UserFacingError extends Error {}
 
 async function setProgress(videoId: string, pct: number) {
   await db`UPDATE videos SET download_progress = ${pct} WHERE id = ${videoId}`
+}
+
+/** What a video with no sound track is told (captions, Make my clips, Best moments and Ask AI all need speech) */
+export const NO_SOUND_MESSAGE = 'This video has no sound, so there is nothing to caption or to pick clips from. '
+  + 'Videos saved from YouTube in 1080p often come without their sound: download it again with audio, then upload that one.'
+
+/**
+ * Stops with NO_SOUND_MESSAGE when the file has no audio track at all (FFmpeg would fail with
+ * "Output file does not contain any stream" and pages of its own output). A file ffprobe can't
+ * read is left to FFmpeg, which reports it.
+ */
+export async function requireSound(input: string, signal?: AbortSignal): Promise<void> {
+  let tracks: string
+  try {
+    const { stdout } = await execFileAsync('ffprobe', [
+      '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', input,
+    ], { signal, timeout: 120_000 })
+    tracks = stdout.trim()
+  } catch {
+    return
+  }
+  if (!tracks) throw new UserFacingError(NO_SOUND_MESSAGE)
 }
 
 /** Length of a video file or URL in ms, or null if ffprobe can't tell */
@@ -152,6 +174,7 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal) {
 
       // Extract audio — for clip jobs, seek to clip range only (fast & cheap)
       await setProgress(payload.video_id, 60)
+      await requireSound(videoPath, signal)
       if (isClipJob) {
         const startSec = payload.clip_start_ms! / 1000
         const durSec   = (payload.clip_end_ms! - payload.clip_start_ms!) / 1000
@@ -189,7 +212,16 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal) {
       const lang = known?.language as string | undefined
       if (lang && lang !== 'unknown' && !lang.startsWith('en')) languageCode = lang
     }
-    const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, languageCode, signal)
+    // A whole video is read in 5-minute chunks, and the transcript is saved only when all of them
+    // are in. Each finished chunk is kept in storage next to the video, so a run that failed or
+    // was stopped part-way (Google refusing, the daily limit, "Stop") is continued by the next
+    // one instead of being read, and paid for, from the start again.
+    const readingKey = !isClipJob && storagePath ? storagePath.replace(/\.[^.]+$/, '_reading.json') : null
+    const kept: ReadingStore | undefined = readingKey ? {
+      load: async () => JSON.parse((await r2Download(readingKey)).toString('utf8')) as Reading,
+      save: reading => r2Upload(readingKey, Buffer.from(JSON.stringify(reading)), 'application/json'),
+    } : undefined
+    const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, languageCode, signal, kept)
     signal?.throwIfAborted()
 
     // Clip jobs (first transcription or retranscribe): replace only this clip's time range in the
@@ -201,7 +233,7 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal) {
       ? await db`
           SELECT t.id FROM transcripts t
           WHERE t.video_id = ${payload.video_id}
-            AND EXISTS (SELECT 1 FROM transcript_words w WHERE w.transcript_id = t.id)
+            AND (t.whole_video OR EXISTS (SELECT 1 FROM transcript_words w WHERE w.transcript_id = t.id))
           ORDER BY t.created_at DESC LIMIT 1`
       : []
     let transcript: { id: string }
@@ -213,8 +245,9 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal) {
       if (isRetranscribe) {
         await db`DELETE FROM transcripts WHERE video_id = ${payload.video_id}`
       }
+      // whole_video: the whole video was read, so nothing needs to read it again (see ai_edit)
       const [inserted] = await db`
-        INSERT INTO transcripts (video_id, language) VALUES (${payload.video_id}, ${sarvamResult.language_code}) RETURNING id
+        INSERT INTO transcripts (video_id, language, whole_video) VALUES (${payload.video_id}, ${sarvamResult.language_code}, ${!isClipJob}) RETURNING id
       `
       if (!inserted) throw new Error('Failed to insert transcript row')
       transcript = { id: inserted.id as string }
@@ -241,6 +274,9 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal) {
         await db`INSERT INTO transcript_words ${db(words.slice(i, i + 500))}`
       }
     }
+
+    // The transcript is saved: the kept chunks have done their job
+    if (readingKey) await r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: readingKey })).catch(() => {})
 
     if (!isRetranscribe && !isClipJob) {
       let durationMs: number | null = null
@@ -537,6 +573,8 @@ const GEMINI_CHUNK_SEC  = 300
 /** Seconds of audio read to detect the spoken language (see transcribeAudio) */
 const PROBE_SEC         = 60
 const GEMINI_MAX_TRIES  = 8
+/** Tries for a request Google wrongly refuses (see geminiTranscribeChunk) */
+const GEMINI_REFUSAL_TRIES = 3
 
 // Our language codes (Sarvam style) → BCP-47 codes Gemini accepts
 function toGeminiLang(code: string): string {
@@ -695,7 +733,11 @@ async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promis
       }
 
       const body = await res.text()
-      const retryable = res.status === 429 || res.status >= 500
+      // Google's own fault, on and off for hours on 2026-10-07: a correct request refused with
+      // 400 "Thinking is not enabled for this model", while the same request works moments later.
+      // One refused chunk used to fail a whole video: try it twice more first.
+      const passing400 = res.status === 400 && /thinking is not enabled/i.test(body) && attempt < GEMINI_REFUSAL_TRIES
+      const retryable = res.status === 429 || res.status >= 500 || passing400
       if (!retryable || attempt >= GEMINI_MAX_TRIES) {
         // Shown to the user: say whose side it is on, not Google's raw JSON
         const said = body.match(/"message":\s*"([^"]+)"/)?.[1] ?? body.slice(0, 200)
@@ -718,7 +760,23 @@ async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promis
   }
 }
 
-export async function transcribeAudio(audioPath: string, videoId?: string, languageCode?: string, signal?: AbortSignal): Promise<SarvamResponse> {
+/** A whole-video reading as far as it got: the words of every chunk already read */
+export interface Reading {
+  v: 1
+  totalSec: number
+  chunkSec: number
+  /** The language every chunk is read in; null = left on automatic (English) */
+  lang: string | null
+  /** Words of each finished chunk, by chunk number (times are within the whole audio) */
+  chunks: Record<string, SarvamWord[]>
+}
+/** Where a reading is kept between runs (handleTranscribeJob keeps it in storage) */
+export interface ReadingStore {
+  load(): Promise<Reading | null>
+  save(reading: Reading): Promise<void>
+}
+
+export async function transcribeAudio(audioPath: string, videoId?: string, languageCode?: string, signal?: AbortSignal, kept?: ReadingStore): Promise<SarvamResponse> {
   if (!GEMINI_API_KEY && !VERTEX_PROJECT) throw new Error('Set GOOGLE_CLOUD_PROJECT (Vertex AI) or GEMINI_API_KEY for transcription')
   console.log(`[transcribe] ${VERTEX_PROJECT ? `Vertex AI ${VERTEX_STT_MODEL}` : GEMINI_STT_MODEL} (verbatim, word timestamps)`)
 
@@ -768,12 +826,23 @@ export async function transcribeAudio(audioPath: string, videoId?: string, langu
   // then the middle if the start has no speech or only English) instead of captioning the whole
   // first 5-minute chunk twice. Short audio (a clip): one auto pass is the sample.
   let lang = (languageCode && languageCode !== 'unknown') ? languageCode : undefined
+  // What an earlier run already read of this same audio, in the same language: those chunks
+  // (and the language it found) are used as they are
+  let earlier = kept ? await kept.load().catch(() => null) : null
+  if (earlier && !(earlier.v === 1 && earlier.chunkSec === GEMINI_CHUNK_SEC && Math.abs(earlier.totalSec - totalSec) <= 1
+    && earlier.chunks && typeof earlier.chunks === 'object' && (!lang || earlier.lang === lang))) earlier = null
+  let langKnown = !!lang
+  if (earlier) {
+    lang = earlier.lang ?? undefined
+    langKnown = true
+    console.log(`[transcribe] continuing an earlier reading: ${Object.keys(earlier.chunks).length} of ${numChunks} chunk(s) already read`)
+  }
   const allWords: SarvamWord[] = []
   let probe: SarvamWord[] | null = null   // short audio: the auto pass of chunk 1
   // Long audio: the 1-minute samples read on auto. If the language stays auto (English), their
   // words are kept and those minutes aren't sent again.
   const samples: { from: number; to: number; words: SarvamWord[] }[] = []
-  if (!lang) {
+  if (!langKnown) {
     if (totalSec <= PROBE_SEC * 1.5) {
       probe = await chunkWords(0, undefined)
       lang = detectSarvamLang(probe.map(w => w.word).join(' '))
@@ -789,25 +858,42 @@ export async function transcribeAudio(audioPath: string, videoId?: string, langu
     }
     if (lang) console.log(`[transcribe] detected language: ${lang} — locking for all chunks`)
   }
-  for (let i = 0; i < numChunks; i++) {
-    if (i === 0 && probe && !lang) { allWords.push(...probe); continue }  // English / Latin script: keep auto result
-    if (videoId) await setProgress(videoId, Math.round(63 + (i / numChunks) * 33))
+  const readChunk = async (i: number): Promise<SarvamWord[]> => {
+    if (i === 0 && probe && !lang) return probe  // English / Latin script: keep auto result
     const from = i * GEMINI_CHUNK_SEC, to = Math.min(totalSec, from + GEMINI_CHUNK_SEC)
     const inChunk = lang ? [] : samples.filter(sm => sm.to > from && sm.from < to)
     if (inChunk.length) {
       // Staying on auto: read only the parts of this chunk the samples didn't cover
+      const got: SarvamWord[] = []
       let cursor = from, part = 0
       for (const sm of inChunk.sort((x, y) => x.from - y.from)) {
-        if (sm.from - cursor >= 1) allWords.push(...await rangeWords(cursor, sm.from - cursor, undefined, `${i}-${part++}`))
-        allWords.push(...sm.words.filter(w => w.start >= from && w.start < to))
+        if (sm.from - cursor >= 1) got.push(...await rangeWords(cursor, sm.from - cursor, undefined, `${i}-${part++}`))
+        got.push(...sm.words.filter(w => w.start >= from && w.start < to))
         cursor = Math.max(cursor, sm.to)
       }
-      if (to - cursor >= 1) allWords.push(...await rangeWords(cursor, to - cursor, undefined, `${i}-${part++}`))
-      continue
+      if (to - cursor >= 1) got.push(...await rangeWords(cursor, to - cursor, undefined, `${i}-${part++}`))
+      return got
     }
     const words = await chunkWords(i, lang)
     // Chunk 1 was transcribed twice (auto + locked) — keep whichever caught more speech
-    allWords.push(...(i === 0 && probe && probe.length > words.length ? probe : words))
+    return i === 0 && probe && probe.length > words.length ? probe : words
+  }
+  // Kept once the language is known and after every chunk. A save that fails only means that
+  // chunk is read again next time.
+  const reading: Reading = earlier ?? { v: 1, totalSec, chunkSec: GEMINI_CHUNK_SEC, lang: lang ?? null, chunks: {} }
+  const keep = async () => {
+    if (!kept || numChunks < 2) return
+    await kept.save(reading).catch(e => console.warn('[transcribe] could not keep the reading so far:', e instanceof Error ? e.message : e))
+  }
+  if (!earlier) await keep()
+  for (let i = 0; i < numChunks; i++) {
+    const had = reading.chunks[i]
+    if (had) { allWords.push(...had); continue }
+    if (videoId) await setProgress(videoId, Math.round(63 + (i / numChunks) * 33))
+    const got = await readChunk(i)
+    allWords.push(...got)
+    reading.chunks[i] = got
+    await keep()
   }
   const language = lang ?? (allWords.length ? 'en-IN' : 'unknown')
 

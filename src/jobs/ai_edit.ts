@@ -1460,10 +1460,16 @@ function coversVideo(words: Word[], durationMs: number) {
   return spoken.size / minutes >= 0.6
 }
 
-async function loadWords(videoId: string): Promise<Word[]> {
-  const [row] = await db`SELECT id FROM transcripts WHERE video_id = ${videoId} ORDER BY created_at DESC LIMIT 1`
-  if (!row) return []
-  return db<Word[]>`SELECT word, start_ms, end_ms, speaker_id FROM transcript_words WHERE transcript_id = ${row.id} ORDER BY start_ms`
+/**
+ * The video's saved words. `whole` = they come from a reading of the whole video (recorded since
+ * 2026-10-07), so they are complete however little speech there is; older transcripts are judged
+ * by coversVideo.
+ */
+async function loadWords(videoId: string): Promise<{ words: Word[]; whole: boolean }> {
+  const [row] = await db`SELECT id, whole_video FROM transcripts WHERE video_id = ${videoId} ORDER BY created_at DESC LIMIT 1`
+  if (!row) return { words: [], whole: false }
+  const words = await db<Word[]>`SELECT word, start_ms, end_ms, speaker_id FROM transcript_words WHERE transcript_id = ${row.id} ORDER BY start_ms`
+  return { words, whole: row.whole_video === true }
 }
 
 /** Waits (up to 10 min) for the full-video captions started at upload, instead of paying for a second transcription */
@@ -1537,14 +1543,16 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
     //    Always from storage (R2), never yt-dlp, so this also runs on Railway.
     // A complete transcript is used as it is; only a missing or partial one waits for the
     // upload's full-video captions (if they are running) before transcribing here
-    let words = await loadWords(video_id)
+    let { words, whole } = await loadWords(video_id)
     const durationFor = (w: Word[]) => video.duration_ms ?? (w.length ? w[w.length - 1].end_ms : 0)
-    if (!coversVideo(words, durationFor(words))) {
+    const complete = () => whole || coversVideo(words, durationFor(words))
+    if (!complete()) {
       await waitForFullTranscription(video_id, signal)
-      words = await loadWords(video_id)
+      ;({ words, whole } = await loadWords(video_id))
     }
-    const knownDurationMs = durationFor(words)
-    if (!coversVideo(words, knownDurationMs)) {
+    if (complete()) {
+      console.log(`[ai_edit] Using the saved transcript of ${video_id} (${words.length} words): nothing is sent for captions`)
+    } else {
       console.log(`[ai_edit] Transcript for ${video_id} missing or partial (${words.length} words) — transcribing now`)
       await handleTranscribeJob({
         id: `ai-edit-tx-${ai_edit_job_id}`,
@@ -1555,7 +1563,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       }, signal)
-      words = await loadWords(video_id)
+      ;({ words, whole } = await loadWords(video_id))
     }
     if (!words.length) throw new Error('This video has no speech to make clips from')
     const durationMs = video.duration_ms ?? words[words.length - 1].end_ms
@@ -1665,8 +1673,12 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       console.log(`[ai_edit] Job ${ai_edit_job_id} stopped by the user after ${((Date.now() - t0) / 1000).toFixed(0)}s (clips made so far are kept)`)
       return
     }
-    const msg = err instanceof Error ? err.message : String(err)
-    console.error(`[ai_edit] Job ${ai_edit_job_id} failed:`, msg)
+    const raw = err instanceof Error ? err.message : String(err)
+    console.error(`[ai_edit] Job ${ai_edit_job_id} failed:`, raw)
+    // A failed FFmpeg / ffprobe command carries pages of its own output: keep the line that says why
+    const msg = /^Command failed: ff(mpeg|probe)\b/.test(raw)
+      ? `The video file could not be read (${raw.split('\n').map(l => l.trim()).filter(l => /error|invalid|not found|no such/i.test(l)).pop() ?? 'FFmpeg failed'})`
+      : raw
     await db`UPDATE ai_edit_jobs SET status = 'failed', error = ${msg} WHERE id = ${ai_edit_job_id}`
     throw err
   } finally {

@@ -33,6 +33,9 @@ import { handleAiEditJob } from './jobs/ai_edit.js'
 // Safe schema migrations — idempotent, run on every startup
 async function runMigrations() {
   await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS timing_offset_ms INTEGER DEFAULT 0`
+  // The transcript comes from reading the whole video (not just a clip of it): Make my clips,
+  // Best moments and Ask AI then use it as it is and never send the video for captions again
+  await db`ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS whole_video BOOLEAN NOT NULL DEFAULT false`
   // Captions on/off per clip. Turning captions off used to delete the style, and the editor then
   // switched them back on for any clip whose video has a transcript. Existing styles count as on.
   await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT true`
@@ -110,6 +113,10 @@ async function runMigrations() {
   // Parts of the video the user removed from a clip in the editor ("delete this part"):
   // [[start, end], …] in ms of the source video (lib/trims.ts). The export cuts them out.
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS trim_ranges JSONB`
+  // Where the clip started and ended when it was made, kept the first time its start / end is
+  // dragged in the editor: Reset brings the clip back to it
+  await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS original_start_ms INTEGER`
+  await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS original_end_ms INTEGER`
   // Width of a text box (share of the frame's width) dragged in the editor: the text wraps inside it
   await db`ALTER TABLE text_overlays ADD COLUMN IF NOT EXISTS w REAL`
   // Height of a text box (share of the frame's height): the text sits in its middle
