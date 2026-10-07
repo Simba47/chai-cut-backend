@@ -223,7 +223,7 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal) {
     const entries = sarvamResult.words
     if (entries.length > 0) {
       const offsetMs = isClipJob ? payload.clip_start_ms! : 0
-      const romanized = await transliterateToRoman(entries, sarvamResult.language_code, process.env.SARVAM_API_KEY)
+      const romanized = await transliterateToRoman(entries, sarvamResult.language_code)
       // English spoken inside a regional-language video: store it in that language's script too,
       // so "Auto language" captions are all in one script (word_roman keeps the English spelling)
       const native = await toNativeScript(entries, sarvamResult.language_code)
@@ -513,338 +513,9 @@ async function downloadWithYtDlp(videoId: string, tmp: string, signal?: AbortSig
 }
 
 interface SarvamWord { word: string; start: number; end: number; speaker?: string; confidence?: number }
-interface SarvamRawResponse {
-  language_code: string
-  transcript?: string
-  timestamps?: {
-    words: string[]
-    start_time_seconds: number[]
-    end_time_seconds: number[]
-  }
-}
 interface SarvamResponse { language_code: string; transcript?: string; words: SarvamWord[] }
 
-// const CHUNK_SEC = 25  // Sarvam max is 30s; keep at 25s for safety   // old pipeline (disabled)
-
-// const PARALLEL = 3    // concurrent ffmpeg extractions AND Sarvam API calls (higher → 429 rate limit)   // old pipeline (disabled)
-
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY
-// const GROQ_API_KEY   = process.env.GROQ_API_KEY   // old pipeline (disabled)
-// const SARVAM_API_KEY = process.env.SARVAM_API_KEY   // old pipeline (disabled)
-
-/* ── OLD PIPELINE (disabled): Sarvam saaras:v3 + Groq whisper-large-v3 ──────────
-   Replaced by Gemini 3.5 Transcribe (see transcribeAudio below). Kept for rollback:
-   uncomment this block and delete the Gemini transcribeAudio to switch back.
-// Normalize a word for fuzzy matching: lowercase, strip punctuation.
-// Works across scripts (Telugu Unicode, Hindi Unicode, Latin) since we compare code-points.
-function normalizeWord(w: string): string {
-  return w.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')
-}
-
-// Single-row Levenshtein — O(n) space, fast enough for short words.
-function editDistance(a: string, b: string): number {
-  if (a === b) return 0
-  const la = a.length, lb = b.length
-  if (la === 0) return lb
-  if (lb === 0) return la
-  // Early-exit: if lengths differ by more than 60% they can't be similar
-  if (Math.abs(la - lb) > Math.max(la, lb) * 0.6) return Math.max(la, lb)
-  const row = Array.from({ length: lb + 1 }, (_, j) => j)
-  for (let i = 1; i <= la; i++) {
-    let prev = row[0]++
-    for (let j = 1; j <= lb; j++) {
-      const tmp = row[j]
-      row[j] = a[i - 1] === b[j - 1] ? prev : 1 + Math.min(prev, row[j], row[j - 1])
-      prev = tmp
-    }
-  }
-  return row[lb]
-}
-
-// Two words are "similar" if their normalised edit distance is below threshold.
-// Short words (≤2 chars) require an exact match to avoid false positives.
-function isSimilar(a: string, b: string, threshold = 0.45): boolean {
-  const na = normalizeWord(a), nb = normalizeWord(b)
-  if (na === nb) return true
-  const maxLen = Math.max(na.length, nb.length)
-  if (maxLen === 0) return true
-  if (maxLen <= 2) return false           // exact-only for tiny words
-  return editDistance(na, nb) / maxLen < threshold
-}
-
-// Fuzzy sequence alignment: map M Sarvam words onto N Groq timing anchors.
-//
-// For each Sarvam word we search a window around the expected proportional
-// Groq position for a similar word (by edit-distance).  Matched words receive
-// Groq's exact timestamp; unmatched words are time-interpolated between their
-// nearest matched neighbours — a much shorter span than the old whole-phrase
-// linear interpolation, so drift is far smaller.
-//
-// This correctly handles the main mismatch cases:
-//   • Groq inserts filler words ("uh", "hmm", repeated articles) → skipped
-//   • Groq omits a word → Sarvam word interpolated between adjacent anchors
-//   • Telugu/Hindi: both APIs emit the same Unicode script so edit-distance works
-//   • Hinglish English words: often identical strings → direct match
-function alignToGroqTimings(wordList: string[], groqWords: SarvamWord[]): SarvamWord[] {
-  const M = wordList.length
-  const N = groqWords.length
-  if (M === 0) return []
-  if (N === 0) return wordList.map(word => ({ word, start: 0, end: 0 }))
-
-  // Window size: at least 3, but scales with Groq list size to catch heavier drift.
-  const WINDOW = Math.max(3, Math.round(N / 4))
-
-  // anchors[i] = index into groqWords that sarvam word i matched, or -1
-  const anchors = new Array<number>(M).fill(-1)
-  let minJ = 0  // enforce monotonic (non-decreasing) matching
-
-  for (let i = 0; i < M; i++) {
-    const expected = Math.round(i * (N - 1) / Math.max(M - 1, 1))
-    const jStart   = Math.max(minJ, expected - WINDOW)
-    const jEnd     = Math.min(N - 1, expected + WINDOW)
-
-    let bestJ = -1, bestDist = Infinity
-    for (let j = jStart; j <= jEnd; j++) {
-      if (!isSimilar(wordList[i], groqWords[j].word)) continue
-      const d = Math.abs(j - expected)
-      if (d < bestDist) { bestDist = d; bestJ = j }
-    }
-
-    if (bestJ >= 0) { anchors[i] = bestJ; minJ = bestJ + 1 }
-  }
-
-  const matched = anchors.filter(a => a >= 0).length
-  if (matched > 0) {
-    console.log(`[align] ${matched}/${M} words anchored to Groq timestamps (${M - matched} interpolated)`)
-  }
-
-  return wordList.map((word, i) => {
-    const gIdx = anchors[i]
-
-    // Direct match — use Groq's exact start/end
-    if (gIdx >= 0) return { word, start: groqWords[gIdx].start, end: groqWords[gIdx].end }
-
-    // Unmatched — interpolate between nearest anchor on each side
-    let lo = i - 1; while (lo >= 0 && anchors[lo] < 0) lo--
-    let hi = i + 1; while (hi < M && anchors[hi] < 0) hi++
-
-    const tStart = lo >= 0 ? groqWords[anchors[lo]].end   : groqWords[0].start
-    const tEnd   = hi < M  ? groqWords[anchors[hi]].start : groqWords[N - 1].end
-    const tRange = Math.max(0, tEnd - tStart)
-
-    // Divide the gap evenly among all unmatched words in this run
-    const gapStart = lo + 1
-    const gapSize  = (hi < M ? hi : M) - gapStart
-    const posInGap = i - gapStart
-
-    const slotStart = tStart + (posInGap       / Math.max(gapSize, 1)) * tRange
-    const slotEnd   = tStart + ((posInGap + 1) / Math.max(gapSize, 1)) * tRange
-
-    return { word, start: slotStart, end: slotEnd }
-  })
-}
-
-// Sarvam and Groq run in parallel per chunk.
-// Sarvam: correct Telugu spelling (phrase-level timestamps).
-// Groq:   accurate per-word timestamps (may misspell).
-// We map each Sarvam word onto Groq's timeline by interpolating position
-// (word i of M → Groq position i*(N-1)/(M-1)), giving correct words + real timing.
-async function transcribeAudio(audioPath: string, videoId?: string, languageCode?: string): Promise<SarvamResponse> {
-  const sarvamKey = SARVAM_API_KEY
-  if (!sarvamKey) throw new Error('SARVAM_API_KEY is not set')
-  const groqKey = GROQ_API_KEY  // used for per-word timing
-
-  console.log(`[transcribe] sarvam (spelling) + groq (timing) → aligned pipeline`)
-
-  const { stdout } = await execFileAsync('ffprobe', [
-    '-v', 'error', '-show_entries', 'format=duration',
-    '-of', 'default=noprint_wrappers=1:nokey=1', audioPath,
-  ])
-  const totalSec = parseFloat(stdout.trim())
-  const numChunks = Math.ceil(totalSec / CHUNK_SEC)
-  console.log(`[transcribe] audio ${totalSec.toFixed(1)}s → ${numChunks} chunk(s) (${PARALLEL} parallel)`)
-  if (videoId) await setProgress(videoId, 62)
-
-  interface ChunkResult { startSec: number; result: SarvamResponse }
-  const ordered: ChunkResult[] = []
-
-  async function extractAndTranscribeChunk(i: number, lang: string | undefined): Promise<ChunkResult> {
-    const startSec = i * CHUNK_SEC
-    const chunkPath = audioPath.replace('.wav', `_chunk${i}.wav`)
-    await execFileAsync('ffmpeg', [
-      '-i', audioPath, '-ss', String(startSec), '-t', String(CHUNK_SEC),
-      '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', chunkPath,
-    ])
-    const buf = await readFile(chunkPath)
-    await unlink(chunkPath).catch(() => {})
-
-    const sarvamLang = lang ?? 'unknown'
-    const groqLang = lang ? toWhisperLang(lang) : undefined
-
-    // Run both in parallel — Sarvam for correct words, Groq for word-level timing
-    const [sarvam, groqResult] = await Promise.all([
-      callSarvamChunk(buf, sarvamKey!, sarvamLang),
-      groqKey
-        ? withRetry(() => callWhisperChunk(buf, groqKey, groqLang ?? '', 'https://api.groq.com/openai/v1', 'whisper-large-v3'), 3, 1000)
-            .catch(err => { console.error(`[groq] all 3 retries failed, falling back to Sarvam timing: ${err instanceof Error ? err.message : err}`); return null })
-        : Promise.resolve(null),
-    ])
-
-    const groqWords = groqResult?.words ?? []
-
-    const expandedWords: SarvamWord[] = []
-    for (const phrase of sarvam.words) {
-      const wordList = phrase.word.trim().split(/\s+/).filter(w => w.length > 0)
-      if (wordList.length === 0) continue
-      const phraseDur = phrase.end - phrase.start
-
-      const phraseGroq = groqWords.filter(gw => gw.start < phrase.end && gw.end > phrase.start)
-      if (phraseGroq.length > 0) {
-        expandedWords.push(...alignToGroqTimings(wordList, phraseGroq))
-      } else {
-        wordList.forEach((word, j) => {
-          expandedWords.push({
-            word,
-            start: phrase.start + (j / wordList.length) * phraseDur,
-            end: phrase.start + ((j + 1) / wordList.length) * phraseDur,
-          })
-        })
-      }
-    }
-
-    return { startSec, result: { language_code: sarvam.language_code, words: expandedWords } }
-  }
-
-  // Run first chunk alone to detect language, then lock for remaining chunks.
-  let detectedLang = (languageCode && languageCode !== 'unknown') ? languageCode : undefined
-  if (numChunks > 1 && !detectedLang) {
-    if (videoId) await setProgress(videoId, 63)
-    const first = await extractAndTranscribeChunk(0, undefined)
-    ordered.push(first)
-    if (first.result.language_code && first.result.language_code !== 'unknown') {
-      detectedLang = first.result.language_code
-      console.log(`[transcribe] detected language: ${detectedLang} — locking for remaining chunks`)
-    }
-  }
-
-  const startBatch = ordered.length  // 0 if language was known, 1 if we ran first chunk
-  for (let b = startBatch; b < numChunks; b += PARALLEL) {
-    if (videoId) {
-      const pct = Math.round(63 + (b / numChunks) * 33)
-      await setProgress(videoId, pct)
-    }
-    const batchIndices = Array.from({ length: Math.min(PARALLEL, numChunks - b) }, (_, k) => b + k)
-    const batchResults = await Promise.all(
-      batchIndices.map(i => extractAndTranscribeChunk(i, detectedLang))
-    )
-    ordered.push(...batchResults)
-  }
-
-  ordered.sort((a, b) => a.startSec - b.startSec)
-  const allWords: SarvamWord[] = []
-  let language = 'unknown'
-  for (const { startSec, result } of ordered) {
-    if (result.language_code && result.language_code !== 'unknown') language = result.language_code
-    for (const w of result.words) {
-      allWords.push({ ...w, start: w.start + startSec, end: w.end + startSec })
-    }
-  }
-
-  // Set each word's end to next word's start (removes gaps and overlaps),
-  // but cap at MAX_WORD_HOLD_SEC so captions disappear during long music/silence gaps
-  // rather than holding one word for 8-10 seconds. For dense speech all gaps are <4s
-  // so the cap never fires; for music-heavy audio it prevents stale captions.
-  const MAX_WORD_HOLD_SEC = 4.0
-  for (let i = 0; i < allWords.length - 1; i++) {
-    allWords[i] = {
-      ...allWords[i],
-      end: Math.min(allWords[i + 1].start, allWords[i].start + MAX_WORD_HOLD_SEC),
-    }
-  }
-  if (allWords.length > 0 && allWords[allWords.length - 1].end < totalSec) {
-    allWords[allWords.length - 1] = { ...allWords[allWords.length - 1], end: totalSec }
-  }
-
-  return { language_code: language, words: allWords }
-}
-
-// ── Whisper: true per-word timestamps for every language ─────────────────────
-// Maps various code forms → ISO-639-1 that Whisper's API accepts.
-const LANG_TO_WHISPER: Record<string, string> = {
-  // Sarvam xx-IN codes
-  'en-IN': 'en', 'hi-IN': 'hi', 'te-IN': 'te', 'ta-IN': 'ta',
-  'kn-IN': 'kn', 'ml-IN': 'ml', 'bn-IN': 'bn', 'gu-IN': 'gu',
-  'mr-IN': 'mr', 'pa-IN': 'pa', 'od-IN': 'or',
-  // Whisper full language names (returned in response.language)
-  'telugu': 'te', 'hindi': 'hi', 'tamil': 'ta', 'kannada': 'kn',
-  'malayalam': 'ml', 'bengali': 'bn', 'gujarati': 'gu', 'marathi': 'mr',
-  'punjabi': 'pa', 'odia': 'or', 'english': 'en',
-}
-
-function toWhisperLang(code: string): string {
-  return LANG_TO_WHISPER[code.toLowerCase()] ?? code.split('-')[0].toLowerCase()
-}
-
-async function withRetry<T>(fn: () => Promise<T>, retries = 3, baseDelayMs = 1000): Promise<T> {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      return await fn()
-    } catch (err) {
-      if (attempt === retries) throw err
-      const delay = baseDelayMs * Math.pow(2, attempt - 1)
-      console.warn(`[groq] attempt ${attempt} failed, retrying in ${delay}ms: ${err instanceof Error ? err.message : err}`)
-      await new Promise(resolve => setTimeout(resolve, delay))
-    }
-  }
-  throw new Error('unreachable')
-}
-
-async function callWhisperChunk(
-  buf: Buffer, apiKey: string, languageCode?: string,
-  baseUrl = 'https://api.openai.com/v1', model = 'whisper-1',
-  prompt?: string,  // Sarvam transcript text — seeds Groq's decoder for better spelling
-): Promise<SarvamResponse> {
-  const formData = new FormData()
-  formData.append('file', new Blob([buf], { type: 'audio/wav' }), 'audio.wav')
-  formData.append('model', model)
-  formData.append('response_format', 'verbose_json')
-  formData.append('timestamp_granularities[]', 'word')
-
-  if (languageCode && languageCode !== 'unknown') {
-    formData.append('language', toWhisperLang(languageCode))
-  }
-  if (prompt) {
-    formData.append('prompt', prompt.slice(0, 500))
-  }
-
-  const res = await fetch(`${baseUrl}/audio/transcriptions`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}` },
-    body: formData,
-  })
-
-  if (!res.ok) throw new Error(`Whisper API ${res.status}: ${await res.text()}`)
-
-  const raw = await res.json() as {
-    language?: string
-    words?: { word: string; start: number; end: number }[]
-  }
-
-  const words: SarvamWord[] = (raw.words ?? []).map(w => ({
-    word: w.word.trim(),
-    start: w.start,
-    end: w.end,
-  })).filter(w => w.word.length > 0)
-
-  if (words.length > 0) {
-    const sample = words.slice(0, 3).map(w => `"${w.word}"(${w.start.toFixed(2)}-${w.end.toFixed(2)}s)`).join(', ')
-    console.log(`[whisper] ${words.length} words in ${(words[words.length-1]?.end ?? 0).toFixed(1)}s. Sample: ${sample}`)
-  }
-
-  return { language_code: raw.language ?? languageCode ?? 'unknown', words }
-}
-── end OLD PIPELINE ── */
-// ── fetch with timeout (used by Sarvam transliteration) ──────────────────────
+// ── fetch with timeout ──────────────────────────────────────────────────────
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), timeoutMs)
@@ -854,49 +525,6 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
     clearTimeout(timer)
   }
 }
-
-/* ── OLD PIPELINE (disabled): Sarvam saaras:v3 + Groq whisper-large-v3 ──────────
-   Replaced by Gemini 3.5 Transcribe (see transcribeAudio below). Kept for rollback:
-   uncomment this block and delete the Gemini transcribeAudio to switch back.
-async function callSarvamChunk(buf: Buffer, apiKey: string, languageCode?: string): Promise<SarvamResponse> {
-  const TIMEOUT_MS = 90_000
-
-  return withRetry(async () => {
-    const formData = new FormData()
-    formData.append('file', new Blob([buf], { type: 'audio/wav' }), 'audio.wav')
-    formData.append('model', 'saaras:v3')
-    formData.append('language_code', languageCode ?? 'unknown')
-    formData.append('with_timestamps', 'true')
-
-    const res = await fetchWithTimeout('https://api.sarvam.ai/speech-to-text', {
-      method: 'POST',
-      headers: { 'api-subscription-key': apiKey },
-      body: formData,
-    }, TIMEOUT_MS)
-
-    if (res.status === 429) {
-      await new Promise(r => setTimeout(r, 5000))
-      throw new Error(`Sarvam API 429: rate limit`)
-    }
-    if (!res.ok) throw new Error(`Sarvam API ${res.status}: ${await res.text()}`)
-
-    const raw = await res.json() as SarvamRawResponse
-    const ts = raw.timestamps
-    const words: SarvamWord[] = ts?.words?.map((w, i) => ({
-      word: w,
-      start: ts.start_time_seconds[i] ?? 0,
-      end: ts.end_time_seconds[i] ?? 0,
-    })) ?? []
-
-    if (words.length > 0) {
-      const sample = words.slice(0, 3).map(w => `"${w.word}"(${w.start.toFixed(2)}-${w.end.toFixed(2)}s)`).join(', ')
-      console.log(`[sarvam] ${words.length} tokens in ${(words[words.length-1]?.end ?? 0).toFixed(1)}s. Sample: ${sample}`)
-    }
-
-    return { language_code: raw.language_code, transcript: raw.transcript, words }
-  }, 3, 1000)
-}
-── end OLD PIPELINE (callSarvamChunk) ── */
 
 // ── Gemini 3.5 Transcribe: words + word-level timestamps in one call ─────────
 // Audio is sent in 5-minute chunks: keeps each request under the Tier-1 limit of
@@ -1068,7 +696,11 @@ async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promis
 
       const body = await res.text()
       const retryable = res.status === 429 || res.status >= 500
-      if (!retryable || attempt >= GEMINI_MAX_TRIES) throw new Error(`Gemini transcribe ${res.status}: ${body.slice(0, 300)}`)
+      if (!retryable || attempt >= GEMINI_MAX_TRIES) {
+        // Shown to the user: say whose side it is on, not Google's raw JSON
+        const said = body.match(/"message":\s*"([^"]+)"/)?.[1] ?? body.slice(0, 200)
+        throw new Error(`Google's transcription service is not answering right now (${res.status}: ${said}). Please try again later.`)
+      }
       // Rate limited (10k tokens/min on Tier 1) — wait for the window to reset. A daily limit
       // ("retry in 22h28m") will not reset while the job waits: stop now and say so.
       const hinted = retryHintSec(body)
@@ -1377,7 +1009,7 @@ function transliterateTeluguWord(word: string): string {
 }
 
 // ── Transliteration: Indian script → Roman (Tenglish / Hinglish / etc.) ─────
-// Maps short Whisper codes (te, hi, ta…) to Sarvam's xx-IN format
+// Maps short language codes (te, hi, ta…) to our xx-IN format
 const WHISPER_TO_SARVAM: Record<string, string> = {
   'te': 'te-IN', 'hi': 'hi-IN', 'ta': 'ta-IN', 'kn': 'kn-IN',
   'ml': 'ml-IN', 'bn': 'bn-IN', 'gu': 'gu-IN', 'mr': 'mr-IN',
@@ -1409,73 +1041,10 @@ function detectSarvamLang(text: string): string | undefined {
   return undefined
 }
 
-// Groq LLM batch transliteration — far more natural than per-character mapping.
-// Sends all words in one request so the model has phonetic context.
-async function transliterateWithLLM(
-  entries: SarvamWord[],
-  languageCode: string,
-  apiKey: string,
-): Promise<(string | undefined)[]> {
-  const langName = LANG_NAMES[languageCode] ?? 'Indian'
-  const BATCH = 80
-  const result: (string | undefined)[] = new Array(entries.length).fill(undefined)
-
-  for (let i = 0; i < entries.length; i += BATCH) {
-    const batch = entries.slice(i, i + BATCH)
-    const words = batch.map(e => e.word)
-    try {
-      const res = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model: 'gpt-4o-mini',
-          temperature: 0,
-          max_tokens: 1024,
-          messages: [
-            {
-              role: 'system',
-              content: `You are given ${langName} words auto-transcribed by speech recognition. Some words may have errors (repeated syllables, garbled characters from background music).
-
-Steps:
-1. Mentally correct any obvious error (e.g. repeated consonants like "న్న్న్న్" → simpler word).
-2. Write the corrected word as ENGLISH LETTERS showing how it sounds (phonetic romanization).
-
-IMPORTANT: Output must be in English/Roman letters only — never output the original script.
-Return ONLY a JSON array of English strings, same length and order as input. No markdown, no explanations.
-
-Example: ["నేను", "విలన్", "హీరో"] → ["nenu", "villan", "hero"]`,
-            },
-            { role: 'user', content: JSON.stringify(words) },
-          ],
-        }),
-      })
-      if (!res.ok) throw new Error(`OpenAI chat ${res.status}: ${await res.text()}`)
-      const data = await res.json() as { choices: Array<{ message: { content: string } }> }
-      const raw = data.choices[0]?.message?.content?.trim() ?? '[]'
-      const clean = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim()
-      const parsed: unknown = JSON.parse(clean)
-      const arr: unknown[] = Array.isArray(parsed)
-        ? parsed
-        : Array.isArray((parsed as Record<string, unknown>).words)
-          ? (parsed as Record<string, unknown[]>).words
-          : Object.values(parsed as object)
-      for (let j = 0; j < batch.length; j++) {
-        const v = arr[j]
-        result[i + j] = typeof v === 'string' && v.trim() ? v.trim() : undefined
-      }
-    } catch (err) {
-      console.warn(`[transliterate] OpenAI GPT batch ${i}-${i + batch.length} failed:`, err)
-    }
-  }
-
-  console.log(`[transliterate] ${languageCode} → Roman via OpenAI GPT for ${entries.length} word(s)`)
-  return result
-}
-
 // Gemini batch transliteration → natural Tenglish / Hinglish (how people type it on
 // WhatsApp/YouTube), English loanwords in normal English spelling. One output per
 // input word, same order; any batch that doesn't come back 1:1 is left undefined so
-// the caller falls back to the rule-based / Sarvam transliterator for those words.
+// the caller falls back to the rule-based Telugu transliterator for those words.
 async function transliterateWithGemini(
   entries: SarvamWord[],
   languageCode: string,
@@ -1623,79 +1192,9 @@ function stripDiacritics(s: string): string {
     .replace(/Ḍ/g, 'D').replace(/Ṭ/g, 'T')
 }
 
-// Sarvam transliterate API — sends words as a sentence with numeric markers
-// so Sarvam gets full phonetic context, then splits back on the markers.
-async function transliterateWithSarvam(
-  entries: SarvamWord[],
-  languageCode: string,
-  apiKey: string,
-): Promise<(string | undefined)[]> {
-  const BATCH = 20   // words per sentence call
-  const result: (string | undefined)[] = new Array(entries.length).fill(undefined)
-
-  for (let i = 0; i < entries.length; i += BATCH) {
-    const batch = entries.slice(i, i + BATCH)
-
-    // Separate ASCII words from Indian-script words so ASCII passes through unchanged
-    const isAscii = (w: string) => !/[^\x00-\x7F]/.test(w.replace(/[.,!?।]/g, ''))
-
-    // Build a sentence with [N] markers between words so we can re-split after
-    // transliteration.  Sarvam leaves digit tokens like [0] intact.
-    const input = batch.map((e, j) => `[${j}] ${e.word.trim()}`).join(' ')
-
-    try {
-      const res = await fetchWithTimeout('https://api.sarvam.ai/transliterate', {
-        method: 'POST',
-        headers: { 'api-subscription-key': apiKey, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input, source_language_code: languageCode, target_language_code: 'en-IN' }),
-      }, 20_000)
-      if (!res.ok) throw new Error(`${res.status}`)
-      const data = await res.json() as { transliterated_text?: string }
-      const text = data.transliterated_text ?? ''
-
-      // Split on [N] markers to recover per-word text
-      const segments = text.split(/\[\d+\]/).map(s => s.trim())
-      // segments[0] is before [0] (usually empty), segments[1] is after [0], etc.
-      for (let j = 0; j < batch.length; j++) {
-        const raw = segments[j + 1] ?? ''
-        const word = batch[j].word.trim()
-
-        // If the original was ASCII, keep it lowercased directly
-        const roman = isAscii(word)
-          ? word.toLowerCase().replace(/[.,!?।]/g, '').trim()
-          : stripDiacritics(raw).replace(/[.,!?।\[\]]/g, '').trim()
-
-        if (roman && /[a-zA-Z]/.test(roman)) result[i + j] = roman
-      }
-    } catch (err) {
-      // Fall back to per-word calls on failure
-      console.warn(`[transliterate] Sarvam sentence batch ${i} failed (${err}), falling back to per-word`)
-      await Promise.all(batch.map(async (entry, j) => {
-        const word = entry.word.trim()
-        if (isAscii(word)) { result[i + j] = word.toLowerCase().replace(/[.,!?।]/g, '') || undefined; return }
-        try {
-          const res2 = await fetchWithTimeout('https://api.sarvam.ai/transliterate', {
-            method: 'POST',
-            headers: { 'api-subscription-key': apiKey, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ input: word, source_language_code: languageCode, target_language_code: 'en-IN' }),
-          }, 12_000)
-          if (!res2.ok) return
-          const d2 = await res2.json() as { transliterated_text?: string }
-          const r2 = stripDiacritics((d2.transliterated_text ?? '').trim()).replace(/[.,!?।]/g, '').trim()
-          if (r2 && /[a-zA-Z]/.test(r2)) result[i + j] = r2
-        } catch { /* skip */ }
-      }))
-    }
-  }
-
-  console.log(`[transliterate] ${languageCode} → Roman via Sarvam for ${entries.length} word(s)`)
-  return result
-}
-
 async function transliterateToRoman(
   entries: SarvamWord[],
   languageCode: string,
-  sarvamApiKey?: string,
 ): Promise<(string | undefined)[]> {
   // Resolve to a canonical lang code for lookup/detection
   const resolvedLang =
@@ -1713,10 +1212,8 @@ async function transliterateToRoman(
     })
   }
 
-  // Prefer OpenAI GPT (most natural phrasing)
-  if (OPENAI_API_KEY) return transliterateWithLLM(entries, lang, OPENAI_API_KEY)
-
-  // Deterministic fallbacks: rule-based for Telugu, Sarvam API for other languages
+  // Built-in rules for Telugu. Other languages have no fallback: a word Gemini couldn't
+  // convert gets no Roman spelling.
   const fallback = async (): Promise<(string | undefined)[]> => {
     if (lang === 'te-IN' || lang === 'te') {
       return entries.map(e => {
@@ -1726,7 +1223,6 @@ async function transliterateToRoman(
         return roman || undefined
       })
     }
-    if (sarvamApiKey) return transliterateWithSarvam(entries, lang, sarvamApiKey)
     return entries.map(() => undefined)
   }
 

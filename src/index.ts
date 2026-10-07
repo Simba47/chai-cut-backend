@@ -1,8 +1,7 @@
 import 'dotenv/config' // reload env
 
-// Captions now use Gemini 3.5 Transcribe. GROQ_API_KEY is no longer used; SARVAM_API_KEY is
-// optional (only romanizes Hindi and other non-Telugu Indian languages).
-// const REQUIRED_ENV = ['DATABASE_URL', 'SARVAM_API_KEY', 'GROQ_API_KEY', 'R2_ENDPOINT', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'GEMINI_API_KEY']
+// Gemini is the only AI vendor: GEMINI_API_KEY does captions and everything else.
+// SARVAM_API_KEY, GROQ_API_KEY and OPENAI_API_KEY are no longer read.
 const REQUIRED_ENV = ['DATABASE_URL', 'R2_ENDPOINT', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'GEMINI_API_KEY']
 const missing = REQUIRED_ENV.filter(k => !process.env[k])
 if (missing.length) {
@@ -108,6 +107,13 @@ async function runMigrations() {
   // Remove pauses and filler words: the switch per clip, and the source-time ranges it cut
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS remove_fillers BOOLEAN NOT NULL DEFAULT false`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS cut_ranges JSONB`
+  // Parts of the video the user removed from a clip in the editor ("delete this part"):
+  // [[start, end], …] in ms of the source video (lib/trims.ts). The export cuts them out.
+  await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS trim_ranges JSONB`
+  // Width of a text box (share of the frame's width) dragged in the editor: the text wraps inside it
+  await db`ALTER TABLE text_overlays ADD COLUMN IF NOT EXISTS w REAL`
+  // Height of a text box (share of the frame's height): the text sits in its middle
+  await db`ALTER TABLE text_overlays ADD COLUMN IF NOT EXISTS h REAL`
   // AI post text per clip: hook (also a text overlay), post caption, hashtags
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS hook_text TEXT`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS post_caption TEXT`
