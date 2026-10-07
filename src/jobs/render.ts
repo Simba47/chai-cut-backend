@@ -12,6 +12,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { computeCutRanges, keptRanges, makeTimeMap, reactionRanges, removedMs, type Range } from '../lib/cuts.js'
+import { cleanTrims } from '../lib/trims.js'
 
 const execFileAsync = promisify(execFile)
 import { fileURLToPath } from 'node:url'
@@ -41,11 +42,12 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
 
   try {
     const t0 = Date.now()
-    // Remove pauses and filler words: render from a copy of the clip with those parts cut out,
-    // with every time in the spec moved to match. render.py and audio.py need no changes.
+    // Parts the user removed in the editor, and "Remove pauses and filler words": render from a
+    // copy of the clip with those parts cut out, with every time in the spec moved to match.
+    // render.py and audio.py need no changes.
     let videoInput = videoSignedUrl
     let renderSpec = baseSpec
-    if (baseSpec.remove_fillers) {
+    if (baseSpec.remove_fillers || baseSpec.trim_ranges.length) {
       const cut = await condenseClip(clip_id, baseSpec, videoSignedUrl, tmp, signal)
       if (cut) { videoInput = cut.path; renderSpec = cut.spec }
     }
@@ -221,6 +223,8 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
     start_ms: clip.start_ms,
     end_ms: clip.end_ms,
     remove_fillers: clip.remove_fillers === true,
+    // Parts of the video removed from the clip in the editor, in source ms (lib/trims.ts)
+    trim_ranges: cleanTrims(clip.trim_ranges, Number(clip.start_ms), Number(clip.end_ms)),
     // Hidden in the editor = not in the export (as in the preview): a hidden added video leaves its
     // time to the main video (default framing); hidden photos, videos and text in a frame are left out
     segments: shownSegments(segments as Row[], clip.video_id),
@@ -316,26 +320,46 @@ async function probeSource(url: string, signal?: AbortSignal) {
   return { fps: n && d ? n / d : 30, hasAudio: streams.some(st => st.codec_type === 'audio') }
 }
 
+/** Ranges in order, with overlapping and touching ones joined */
+export function joinRanges(ranges: Range[]): Range[] {
+  const out: Range[] = []
+  for (const [a, b] of [...ranges].sort((x, y) => x[0] - y[0])) {
+    const prev = out[out.length - 1]
+    if (prev && a <= prev[1]) prev[1] = Math.max(prev[1], b)
+    else if (b > a) out.push([a, b])
+  }
+  return out
+}
+
 /**
- * Cuts the clip's pauses and filler words (src/lib/cuts.ts, from the transcript), saves the
- * ranges on the clip, and writes a shortened copy of the clip: the kept parts joined, audio
- * faded over 15 ms at each join so there are no clicks, encoded like render.py encodes. Kept
- * parts start and end on video frames, so video, audio and captions stay in step to the end.
- * Returns null (render as normal) when nothing is cut.
+ * Writes a shortened copy of the clip without:
+ *  • the parts the user removed in the editor (spec.trim_ranges, lib/trims.ts), and
+ *  • with "Remove pauses and filler words" on, the clip's pauses and filler words
+ *    (src/lib/cuts.ts, from the transcript; those ranges are saved on the clip).
+ * The kept parts are joined, audio faded over 15 ms at each join so there are no clicks, encoded
+ * like render.py encodes. Kept parts start and end on video frames, so video, audio and captions
+ * stay in step to the end. Returns null (render as normal) when nothing is cut.
  */
 async function condenseClip(clipId: string, spec: Spec, videoUrl: string, tmp: string, signal?: AbortSignal) {
   const start = spec.start_ms as number, end = spec.end_ms as number
-  const words = spec.words as Row[] as Parameters<typeof computeCutRanges>[0]
-  // Reaction parts (splits, trios) are never cut, and neither is a "pause" that isn't silent: a
-  // laugh, a gasp, applause between the words is a reaction, not dead air
-  const reactions = reactionRanges((spec.segments ?? []) as unknown as Array<{ start_ms: number; end_ms: number; layout: string }>, start)
-  let cuts = computeCutRanges(words, start, end, reactions)
-  const loud = await loudPauses(cuts, words, videoUrl, start, end, signal)
-  if (loud.length) {
-    console.log(`[render] Keeping ${loud.length} pause(s) with sound in them (laughs/reactions): ${loud.map(([a, b]) => `${((a - start) / 1000).toFixed(1)}-${((b - start) / 1000).toFixed(1)}s`).join(', ')}`)
-    cuts = computeCutRanges(words, start, end, [...reactions, ...loud])
+  const trims = (spec.trim_ranges ?? []) as Range[]
+  let pauses: Range[] = []
+  if (spec.remove_fillers) {
+    // Words in a part the user removed are gone already: a pause is measured between the words that stay
+    const words = (spec.words as Row[] as Parameters<typeof computeCutRanges>[0])
+      .filter(w => !trims.some(([a, b]) => (w.start_ms + w.end_ms) / 2 >= a && (w.start_ms + w.end_ms) / 2 < b))
+    // Reaction parts (splits, trios) are never cut, and neither is a "pause" that isn't silent: a
+    // laugh, a gasp, applause between the words is a reaction, not dead air
+    const reactions = reactionRanges((spec.segments ?? []) as unknown as Array<{ start_ms: number; end_ms: number; layout: string }>, start)
+    pauses = computeCutRanges(words, start, end, reactions)
+    const loud = await loudPauses(pauses, words, videoUrl, start, end, signal)
+    if (loud.length) {
+      console.log(`[render] Keeping ${loud.length} pause(s) with sound in them (laughs/reactions): ${loud.map(([a, b]) => `${((a - start) / 1000).toFixed(1)}-${((b - start) / 1000).toFixed(1)}s`).join(', ')}`)
+      pauses = computeCutRanges(words, start, end, [...reactions, ...loud])
+    }
+    await db`UPDATE clips SET cut_ranges = ${db.json(pauses)} WHERE id = ${clipId}`
   }
-  await db`UPDATE clips SET cut_ranges = ${db.json(cuts)} WHERE id = ${clipId}`
+  const cuts = joinRanges([...pauses, ...trims])
   if (!cuts.length) return null
 
   const { fps, hasAudio } = await probeSource(videoUrl, signal)
@@ -363,7 +387,7 @@ async function condenseClip(clipId: string, spec: Spec, videoUrl: string, tmp: s
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuv420p',
     ...(hasAudio ? ['-c:a', 'aac', '-b:a', '192k'] : []), '-movflags', '+faststart', out,
   ], { signal, maxBuffer: 32 * 1024 * 1024 })
-  console.log(`[render] Removed ${cuts.length} pause/filler cut(s), ${(removedMs(cuts) / 1000).toFixed(1)}s, in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
+  console.log(`[render] Removed ${trims.length} part(s) cut in the editor and ${pauses.length} pause/filler cut(s): ${(removedMs(cuts) / 1000).toFixed(1)}s in all, in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
   return { path: out, spec: remapSpec(spec, kept) }
 }
 

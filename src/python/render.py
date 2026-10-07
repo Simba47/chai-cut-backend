@@ -577,6 +577,32 @@ def _frame_text_font(text: str) -> str:
     return path.replace("\\", "/").replace(":", "\\:") if path else ""
 
 
+# Line height of a text overlay, in em of its font size (the editor's TEXT_LINE_EM)
+_TEXT_LINE_EM = 1.15
+
+
+def _wrap_text_lines(text: str, max_w: float, measure) -> list[str]:
+    """The lines a text overlay is drawn in: each line typed, and with a box width (`max_w` > 0)
+    words wrapped onto the next line when the line would be wider than the box. The editor breaks
+    lines by exactly this rule (textStyle.ts wrapTextLines), measuring with the same font file."""
+    lines: list[str] = []
+    for para in text.split("\n"):
+        if not max_w or max_w <= 0:
+            lines.append(para)
+            continue
+        words = para.split(" ")
+        line = ""
+        for i, word in enumerate(words):
+            probe = word if i == 0 else f"{line} {word}"
+            if i > 0 and line and measure(probe) > max_w:
+                lines.append(line)
+                line = word
+            else:
+                line = probe
+        lines.append(line)
+    return lines
+
+
 def _line_baseline(pil_font, runs: list[tuple[bool, str]], size: int) -> int:
     """
     How far below a line's y its baseline is when the line is drawn in pieces (text runs and emoji
@@ -817,6 +843,14 @@ def _is_full_frame(box: dict | None) -> bool:
     kfs = (box or {}).get("box_keyframes") or []
     return bool(kfs) and all(abs(float(k.get("x", 0))) < 0.005 and abs(float(k.get("y", 0))) < 0.005
                              and float(k.get("w", 0)) > 0.995 and float(k.get("h", 0)) > 0.995 for k in kfs)
+
+
+def _even_rows(total: int, n: int) -> list[int]:
+    """Heights of n stacked rows that add up to exactly `total`, each even (yuv420p rounds an odd
+    height down: at 480p two 427 px halves came out 852 px tall, the other sections 854, and
+    FFmpeg refused to join them). The last row takes what's left: 854 → 426 + 428."""
+    base = (total // n) // 2 * 2
+    return [base] * (n - 1) + [total - base * (n - 1)]
 
 
 def _scale_cover(w: int, h: int) -> str:
@@ -1351,15 +1385,15 @@ def main(
             elif layout == "horizontal":
                 trim_slot(0, out_w, out_h, True, out_lbl)
             elif layout == "split":
-                slot_h = out_h // 2
-                trim_slot(0, out_w, slot_h, False, f"[sp{si}a]")
-                trim_slot(1, out_w, slot_h, False, f"[sp{si}b]")
+                rows = _even_rows(out_h, 2)
+                trim_slot(0, out_w, rows[0], False, f"[sp{si}a]")
+                trim_slot(1, out_w, rows[1], False, f"[sp{si}b]")
                 fp.append(f"[sp{si}a][sp{si}b]vstack=inputs=2{out_lbl}")
             elif layout == "trio":
-                slot_h = out_h // 3
-                trim_slot(0, out_w, slot_h, False, f"[tr{si}a]")
-                trim_slot(1, out_w, slot_h, False, f"[tr{si}b]")
-                trim_slot(2, out_w, slot_h, False, f"[tr{si}c]")
+                rows = _even_rows(out_h, 3)
+                trim_slot(0, out_w, rows[0], False, f"[tr{si}a]")
+                trim_slot(1, out_w, rows[1], False, f"[tr{si}b]")
+                trim_slot(2, out_w, rows[2], False, f"[tr{si}c]")
                 fp.append(f"[tr{si}a][tr{si}b][tr{si}c]vstack=inputs=3{out_lbl}")
             else:
                 trim_slot(0, out_w, out_h, False, out_lbl)
@@ -1413,7 +1447,8 @@ def main(
             font_path = _find_font_path(ov.get("font") or "roboto")
             if not font_path:
                 continue
-            sz   = int(ov.get("size") or 48)
+            # Sizes are px at 1080 wide (as the editor draws them): scaled to this export's width
+            sz   = max(8, int(round((ov.get("size") or 48) * out_w / 1080)))
             hx   = (ov.get("color") or "#ffffff").lstrip("#")
             r, g, b2 = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
             centered = ov.get("x") is None
@@ -1424,8 +1459,10 @@ def main(
             t1 = ov.get("end_ms", clip_dur_ms) / 1000.0
             enable = f"between(t,{t0:.3f},{t1:.3f})"
 
-            if not emoji_art.has_emoji(raw_text):
-                # ── No emoji: a single drawtext call, exactly as before ──
+            box_w = float(ov.get("w") or 0) if not centered else 0.0
+            box_h = float(ov.get("h") or 0) if not centered else 0.0
+            if not emoji_art.has_emoji(raw_text) and "\n" not in raw_text and box_w <= 0 and box_h <= 0:
+                # ── One line, no emoji: a single drawtext call, exactly as before ──
                 sz_fit = _fit_font_size(raw_text, font_path, sz, int(out_w * 0.9)) if centered else sz
                 sx = "(w-text_w)/2" if centered else int((ov.get("x") or 0.1) * out_w)
                 olbl = f"[vdt{oi}]"
@@ -1438,11 +1475,20 @@ def main(
                 cur = olbl
                 continue
 
-            # ── Has emoji: measure each line's runs so emoji can be composited as images
-            # alongside separate drawtext calls for the plain-text runs, lined up to read as
-            # one piece of text. Emoji are treated as sz×sz boxes (Twemoji is drawn square). ──
+            # ── Several lines (Enter, or wrapped in its box) or emoji: each line is drawn in
+            # pieces — drawtext for the plain-text runs, emoji composited as images — on one
+            # baseline per line, lines TEXT_LINE_EM apart, as the editor draws them.
+            # Emoji are treated as sz×sz boxes (Twemoji is drawn square). ──
             from PIL import ImageFont
-            line_runs = [emoji_art.split_emoji(ln) for ln in raw_text.split("\n")]
+            if box_w > 0:
+                # Wrapped as the editor wraps it: the same rule, measured with the same font file
+                wrap_font = ImageFont.truetype(font_path, sz)
+                def _w(s: str) -> float:
+                    return sum(sz * emoji_art.ADVANCE_EM if is_e else wrap_font.getlength(t) for is_e, t in emoji_art.split_emoji(s))
+                text_lines = _wrap_text_lines(raw_text, box_w * out_w, _w)
+            else:
+                text_lines = raw_text.split("\n")
+            line_runs = [emoji_art.split_emoji(ln) for ln in text_lines]
 
             def _measure(size: int) -> tuple[list[list[float]], float]:
                 pil_font = ImageFont.truetype(font_path, size)
@@ -1455,15 +1501,18 @@ def main(
                 sz = max(28, int(sz * (out_w * 0.9) / max_w))
                 widths, max_w = _measure(sz)
 
-            line_h = int(sz * 1.2)
+            line_h = sz * _TEXT_LINE_EM
             pil_font = ImageFont.truetype(font_path, sz)
             sx0 = int((ov.get("x") or 0.1) * out_w)
+            # One distance from a line's top to its baseline for every line, so the lines are evenly spaced
+            above = max((_line_baseline(pil_font, runs, sz) for runs in line_runs), default=0)
+            # A box with a height: the lines sit in its middle (as the editor draws them)
+            sy = sy + max(0.0, (box_h * out_h - len(line_runs) * line_h) / 2)
             ridx = 0
             for li, runs in enumerate(line_runs):
                 line_w = sum(widths[li])
                 cursor = (out_w - line_w) / 2 if centered else sx0
-                line_y = sy + li * line_h
-                base = line_y + _line_baseline(pil_font, runs, sz)
+                base = round(sy + li * line_h + above)
                 for (is_emoji, s), w in zip(runs, widths[li]):
                     if not s:
                         continue
