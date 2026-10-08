@@ -83,7 +83,10 @@ async function fillMissingDuration(videoId: string, storagePath: string, signal?
   if (durationMs) await db`UPDATE videos SET duration_ms = ${durationMs} WHERE id = ${videoId} AND duration_ms IS NULL`
 }
 
-export async function handleTranscribeJob(job: Job, signal?: AbortSignal) {
+/** How far a reading has got: `done` of `total` chunks (Make my clips shows it while it reads a video) */
+export type ReadProgress = (done: number, total: number) => void | Promise<void>
+
+export async function handleTranscribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgress) {
   const raw = job.payload
   const payload = (typeof raw === 'string' ? JSON.parse(raw) : raw) as TranscribeJobPayload
   const isLinkJob = !payload.storage_path
@@ -221,7 +224,7 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal) {
       load: async () => JSON.parse((await r2Download(readingKey)).toString('utf8')) as Reading,
       save: reading => r2Upload(readingKey, Buffer.from(JSON.stringify(reading)), 'application/json'),
     } : undefined
-    const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, languageCode, signal, kept)
+    const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, languageCode, signal, kept, onRead)
     signal?.throwIfAborted()
 
     // Clip jobs (first transcription or retranscribe): replace only this clip's time range in the
@@ -776,7 +779,7 @@ export interface ReadingStore {
   save(reading: Reading): Promise<void>
 }
 
-export async function transcribeAudio(audioPath: string, videoId?: string, languageCode?: string, signal?: AbortSignal, kept?: ReadingStore): Promise<SarvamResponse> {
+export async function transcribeAudio(audioPath: string, videoId?: string, languageCode?: string, signal?: AbortSignal, kept?: ReadingStore, onRead?: ReadProgress): Promise<SarvamResponse> {
   if (!GEMINI_API_KEY && !VERTEX_PROJECT) throw new Error('Set GOOGLE_CLOUD_PROJECT (Vertex AI) or GEMINI_API_KEY for transcription')
   console.log(`[transcribe] ${VERTEX_PROJECT ? `Vertex AI ${VERTEX_STT_MODEL}` : GEMINI_STT_MODEL} (verbatim, word timestamps)`)
 
@@ -886,14 +889,17 @@ export async function transcribeAudio(audioPath: string, videoId?: string, langu
     await kept.save(reading).catch(e => console.warn('[transcribe] could not keep the reading so far:', e instanceof Error ? e.message : e))
   }
   if (!earlier) await keep()
+  // (telling how far it has got never stops the reading)
+  const tell = async (done: number) => { try { await onRead?.(done, numChunks) } catch { /* only a progress note */ } }
   for (let i = 0; i < numChunks; i++) {
     const had = reading.chunks[i]
-    if (had) { allWords.push(...had); continue }
+    if (had) { allWords.push(...had); await tell(i + 1); continue }
     if (videoId) await setProgress(videoId, Math.round(63 + (i / numChunks) * 33))
     const got = await readChunk(i)
     allWords.push(...got)
     reading.chunks[i] = got
     await keep()
+    await tell(i + 1)
   }
   const language = lang ?? (allWords.length ? 'en-IN' : 'unknown')
 

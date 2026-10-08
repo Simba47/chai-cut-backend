@@ -9,7 +9,7 @@ import db from '../db.js'
 import type { Job, AiEditJobPayload } from '../types.js'
 import { handleTranscribeJob } from './transcribe.js'
 import { findClips, type FoundClip } from '../lib/clipFinder.js'
-import { generateClipText, fontForText, type ClipText } from '../lib/clipText.js'
+import { generateClipText, fontForText, type ClipText, type ClipTextLanguage } from '../lib/clipText.js'
 import { brollEnabled, pickBrollMoments, searchStock, downloadStock, withBroll } from '../lib/broll.js'
 import { findVisuals, describeVisuals, pickVisualMoments, detectPanels, refinePanels, type Visual, type VisualMoment, type Panel } from '../lib/visuals.js'
 import { r2UploadFile } from '../r2.js'
@@ -1432,18 +1432,46 @@ const SCRIPTS: Array<[string, RegExp]> = [
   ['other_indic', /[\u0980-\u0BFF\u0C80-\u0DFF]/], // Bengali, Gurmukhi, Gujarati, Odia, Tamil, Kannada, Malayalam, Sinhala
 ]
 
-export function captionFontFor(words: Word[]): { font: string; language: string | null } {
+/** The script most of the speech is written in */
+function scriptOf(words: Word[]): string | undefined {
   const counts: Record<string, number> = {}
   for (const w of words) {
     for (const ch of w.word) {
       for (const [name, re] of SCRIPTS) if (re.test(ch)) { counts[name] = (counts[name] ?? 0) + 1; break }
     }
   }
-  const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0]
+  return Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0]
+}
+
+/**
+ * The caption font and language of a clip. `want` is the Make my clips choice: 'roman' = English
+ * letters (Tenglish, Hinglish…) for speech in an Indian script; otherwise the speaker's own script
+ * where a font for it is bundled (Telugu, Hindi), and English letters for the other scripts.
+ */
+export function captionFontFor(words: Word[], want?: 'native' | 'roman'): { font: string; language: string | null } {
+  const top = scriptOf(words)
+  const indic = top === 'telugu' || top === 'devanagari' || top === 'other_indic'
+  if (indic && (want === 'roman' || top === 'other_indic')) return { font: 'roboto', language: 'roman' }
   if (top === 'telugu') return { font: 'noto-sans-telugu', language: null }
   if (top === 'devanagari') return { font: 'noto-sans-devanagari', language: null }
-  if (top === 'other_indic') return { font: 'roboto', language: 'roman' }
   return { font: 'roboto', language: null }
+}
+
+/**
+ * What a clip's hook, title and post caption are written in. The speaker's own script only where
+ * a font for it is bundled (the hook is drawn on the video): otherwise English letters.
+ */
+export function titleLanguageFor(want: ClipTextLanguage | undefined, words: Word[]): ClipTextLanguage {
+  if (want === 'english') return 'english'
+  if (want === 'native') { const top = scriptOf(words); return top === 'telugu' || top === 'devanagari' ? 'native' : 'roman' }
+  return 'roman'
+}
+
+/** The moments a run found before it stopped to ask about making fewer clips (ai_edit_jobs.found) */
+async function foundMoments(aiEditJobId: string): Promise<FoundClip[]> {
+  const [row] = await db`SELECT to_jsonb(j)->'found' AS found FROM ai_edit_jobs j WHERE id = ${aiEditJobId}`.catch(() => [])
+  const found = Array.isArray(row?.found) ? row.found as FoundClip[] : []
+  return found.filter(h => Number.isFinite(h?.start_ms) && Number.isFinite(h?.end_ms) && h.end_ms > h.start_ms)
 }
 
 // ── Transcript ────────────────────────────────────────────────────────────────
@@ -1562,7 +1590,9 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         error: null,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
-      }, signal)
+        // Reading a long video takes many minutes: the bar moves from 5% to 19% as its 5-minute
+        // chunks come in (it used to sit at 5% the whole time, which looked stuck)
+      }, signal, (done, total) => setProgress(ai_edit_job_id, 5 + (14 * done) / Math.max(1, total)))
       ;({ words, whole } = await loadWords(video_id))
     }
     if (!words.length) throw new Error('This video has no speech to make clips from')
@@ -1574,21 +1604,38 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       SELECT start_ms, end_ms FROM clips WHERE video_id = ${video_id} AND ai_edit_job_id IS NOT NULL AND ai_edit_job_id <> ${ai_edit_job_id}
     `
     const exclude = earlier.map(c => [c.start_ms as number, c.end_ms as number] as [number, number])
-    const highlights = await selectHighlights(words, clip_count, durationMs, exclude)
+    // The user said yes to fewer clips: the moments found before asking are used as they are
+    // (finding them again would be paid for twice, and could find different ones)
+    const kept = payload.confirmed ? await foundMoments(ai_edit_job_id) : []
+    const highlights = kept.length ? kept : await selectHighlights(words, clip_count, durationMs, exclude)
     signal.throwIfAborted()
     if (highlights.length === 0) {
       throw new Error(exclude.length
         ? `AI could not find new moments beyond the ${exclude.length} clips already made from this video`
         : 'AI could not find any good clips in this video')
     }
-    console.log(`[ai_edit] ${highlights.length}/${clip_count} clips picked for job ${ai_edit_job_id} (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
+    console.log(`[ai_edit] ${highlights.length}/${clip_count} clips ${kept.length ? 'kept from before asking' : 'picked'} for job ${ai_edit_job_id} (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
+    // Fewer good moments than clips asked for: stop here and ask, before any clip is made. The
+    // app shows "only N can be made — make these N?"; a yes queues the run again with `confirmed`.
+    // (If the note can't be saved — a database from before the 'confirm' status — carry on as before.)
+    if (!payload.confirmed && highlights.length < clip_count) {
+      const asked = await db`
+        UPDATE ai_edit_jobs SET status = 'confirm', found = ${db.json(highlights as never)}, progress = 30
+        WHERE id = ${ai_edit_job_id} AND status = 'running' RETURNING id
+      `.catch(e => { console.warn('[ai_edit] could not ask about fewer clips, making them:', e instanceof Error ? e.message : e); return null })
+      if (asked) {
+        if (asked.length) console.log(`[ai_edit] Job ${ai_edit_job_id}: only ${highlights.length} of ${clip_count} clips can be made — waiting for the user's yes`)
+        return
+      }
+    }
     await setProgress(ai_edit_job_id, 30)
 
     // Hook, title, post caption and hashtags per clip (a clip whose call fails just has none)
     const texts: Array<ClipText | null> = await Promise.all(highlights.map(async (h, i) => {
       await new Promise(r => setTimeout(r, (i % 4) * 250)) // spread the calls a little
       try {
-        return await generateClipText(words.filter(w => w.start_ms >= h.start_ms && w.start_ms < h.end_ms), video.title ?? null, process.env.GEMINI_API_KEY!)
+        const said = words.filter(w => w.start_ms >= h.start_ms && w.start_ms < h.end_ms)
+        return await generateClipText(said, video.title ?? null, process.env.GEMINI_API_KEY!, titleLanguageFor(payload.title_language, said))
       } catch (e) {
         console.warn(`[ai_edit] clip text failed for ${h.start_ms}-${h.end_ms}:`, e instanceof Error ? e.message : e)
         return null
@@ -1645,7 +1692,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         }
         if (addBroll) segments = await addStockBroll(segments, words, highlight, video.user_id, tmp)
         const clipWords = words.filter(w => w.start_ms >= highlight.start_ms && w.start_ms < highlight.end_ms)
-        const caption = captionFontFor(clipWords)
+        const caption = captionFontFor(clipWords, payload.caption_language)
 
         const clip_id = await saveClip(video_id, ai_edit_job_id, highlight, segments, withCaptions ? caption : null, texts[hi], withTitle)
 

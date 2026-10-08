@@ -54,6 +54,12 @@ export interface AiEditJobPayload {
   motion?: boolean
   /** Split and trio layouts (off: always vertical, on one person) */
   layouts?: boolean
+  /** Captions in the speaker's own script ('native': Telugu, Hindi letters) or in English letters ('roman': Tenglish, Hinglish…). Missing = native where a font is bundled */
+  caption_language?: 'native' | 'roman'
+  /** The title, hook and post caption: English letters in the speaker's language ('roman', the default), English, or the speaker's own script */
+  title_language?: 'roman' | 'english' | 'native'
+  /** The user said yes to making fewer clips than asked for: the moments already found (ai_edit_jobs.found) are used */
+  confirmed?: boolean
 }
 
 export const JOB_POLL_INTERVAL_MS = 2000

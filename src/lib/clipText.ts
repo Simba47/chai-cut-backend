@@ -11,6 +11,13 @@ import { GoogleGenerativeAI } from '@google/generative-ai'
 // The same rule as clipFinder.ts ROMAN_RULE: text in Roman letters (Tenglish, Hinglish…)
 const ROMAN_RULE = `Write the text in Roman (English) letters, in the speaker's own language the way people type it in chats: Telugu as Tenglish (e.g. "Ee cinema ki audience pichi ekkaru!"), Hindi as Hinglish (e.g. "Yeh scene dekh ke sab hil gaye!"), Tamil as Tanglish, and so on; keep English words as they are, and if the speaker talks in English write English. Never use Telugu, Devanagari, Tamil or any other non-Latin script.`
 
+// The other choices for the hook, title and post caption (Make my clips: "Title in")
+const ENGLISH_RULE = `Write the text in English: say what the speaker means in natural, simple English, the way an Indian creator would write it. Keep the names of people, films and places as they are.`
+const NATIVE_RULE = `Write the text in the speaker's own language and in that language's own script (Telugu in Telugu letters, Hindi in Devanagari, and so on), the way a native speaker would write it. English words the speaker used can stay in English letters.`
+
+/** What the hook, title and post caption are written in: English letters (Tenglish, Hinglish…), English, or the speaker's own script */
+export type ClipTextLanguage = 'roman' | 'english' | 'native'
+
 export interface ClipText { hook: string; title: string; post_caption: string; hashtags: string[] }
 type TextWord = { word: string; word_roman?: string | null; start_ms: number; end_ms: number }
 
@@ -43,7 +50,7 @@ function clipLines(words: TextWord[]): string {
 const clean = (v: unknown, max: number) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, max) : '')
 
 /** Hook, title, post caption and hashtags for a clip; throws if Gemini fails or answers badly */
-export async function generateClipText(words: TextWord[], videoTitle: string | null, apiKey: string): Promise<ClipText> {
+export async function generateClipText(words: TextWord[], videoTitle: string | null, apiKey: string, language: ClipTextLanguage = 'roman'): Promise<ClipText> {
   if (!words.length) throw new Error('This clip has no transcript yet')
 
   const prompt = `You write the text that goes with a short vertical video clip (Reels / Shorts) for an Indian creator. The speech can be Telugu, Hindi, Tamil or another Indian language, often mixed with English. Judge meaning in the original language.
@@ -53,7 +60,7 @@ ${clipLines(words)}
 
 Return ONLY JSON, keys in English:
 {"hook": "...", "title": "...", "post_caption": "...", "hashtags": ["...", ...]}
-${ROMAN_RULE} This applies to the hook, title and post caption.
+${language === 'english' ? ENGLISH_RULE : language === 'native' ? NATIVE_RULE : ROMAN_RULE} This applies to the hook, title and post caption.
 - hook: 3-7 words shown over the first 3 seconds that make someone stop scrolling. No clickbait lies: it must match what is actually said. No emoji, no hashtags.
 - title: at most 60 characters, about this clip's moment (never just the video's title).
 - post_caption: 1-2 sentences for the post.

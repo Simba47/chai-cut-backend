@@ -94,6 +94,11 @@ async function runMigrations() {
   await db`ALTER TABLE jobs ADD CONSTRAINT jobs_type_check CHECK (type IN ('transcribe','render','ai_edit'))`
   // "Make my clips": how far the job has got (0–100), and why the AI picked each clip
   await db`ALTER TABLE ai_edit_jobs ADD COLUMN IF NOT EXISTS progress INTEGER NOT NULL DEFAULT 0`
+  // Make my clips asks before making fewer clips than asked for: the run stops in 'confirm' with
+  // the moments it found, and a yes from the user queues it again to make exactly those
+  await db`ALTER TABLE ai_edit_jobs DROP CONSTRAINT IF EXISTS ai_edit_jobs_status_check`
+  await db`ALTER TABLE ai_edit_jobs ADD CONSTRAINT ai_edit_jobs_status_check CHECK (status IN ('queued', 'running', 'done', 'failed', 'confirm'))`
+  await db`ALTER TABLE ai_edit_jobs ADD COLUMN IF NOT EXISTS found JSONB`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_score INTEGER`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_reason TEXT`
   // Animated caption presets (render.py _preset_events, editor drawPresetCaptions)
@@ -115,6 +120,10 @@ async function runMigrations() {
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS trim_ranges JSONB`
   // Where the clip started and ended when it was made, kept the first time its start / end is
   // dragged in the editor: Reset brings the clip back to it
+  // Videos on top (B-roll) are layers in the editor but saved as one row of sections that never
+  // overlap (what this worker renders). This is the editor's own note of the sections it cut to
+  // do that, so it can show them whole again; nothing here reads it.
+  await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS layers JSONB`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS original_start_ms INTEGER`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS original_end_ms INTEGER`
   // Width of a text box (share of the frame's width) dragged in the editor: the text wraps inside it
