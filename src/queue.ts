@@ -8,6 +8,9 @@ const handlers = new Map<JobType, JobHandler>()
 
 const CONCURRENCY = parseInt(process.env.QUEUE_CONCURRENCY ?? '2', 10)
 const JOB_TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS ?? String(15 * 60 * 1000), 10)
+// An editing copy (jobs/proxy.ts) of a long video takes longer than other jobs: its own limit
+const PROXY_TIMEOUT_MS = parseInt(process.env.PROXY_TIMEOUT_MS ?? String(90 * 60 * 1000), 10)
+const timeoutFor = (type: string) => (type === 'proxy' ? PROXY_TIMEOUT_MS : JOB_TIMEOUT_MS)
 
 export function registerHandler(type: JobType, handler: JobHandler) {
   handlers.set(type, handler)
@@ -18,12 +21,14 @@ export function registerHandler(type: JobType, handler: JobHandler) {
 // stuck once it has been "processing" longer than the job timeout (plus a minute): its worker
 // died or was restarted mid-job. updated_at is set by the jobs_updated_at trigger on claim.
 const STUCK_AFTER_MS = JOB_TIMEOUT_MS + 60_000
+const PROXY_STUCK_AFTER_MS = PROXY_TIMEOUT_MS + 60_000
 const STUCK_SWEEP_MS = 5 * 60 * 1000
 
 async function requeueStuck() {
   const stuck = await db`
     UPDATE jobs SET status = 'queued'
-    WHERE status = 'processing' AND updated_at < now() - (${STUCK_AFTER_MS}::int * interval '1 millisecond')
+    WHERE status = 'processing' AND updated_at < now()
+      - ((CASE WHEN type = 'proxy' THEN ${PROXY_STUCK_AFTER_MS}::int ELSE ${STUCK_AFTER_MS}::int END) * interval '1 millisecond')
     RETURNING id
   `
   if (stuck.length) console.log(`[queue] Re-queued ${stuck.length} stuck job(s) (processing for over ${Math.round(STUCK_AFTER_MS / 60000)} min)`)
@@ -51,11 +56,16 @@ async function runLoop(id: number) {
 const isRailway = !!process.env.RAILWAY_ENVIRONMENT
 
 async function tick() {
+  // Only jobs this worker can run (a worker from before a new kind of job leaves those to others).
+  // Editing copies (proxy) wait for everything else, and only one is made at a time: renders and
+  // captions always have a slot.
+  const types = [...handlers.keys()]
   const [job] = await db<Job[]>`
     SELECT * FROM jobs
-    WHERE status = 'queued'
+    WHERE status = 'queued' AND type = ANY(${types})
     ${isRailway ? db`AND NOT (type = 'transcribe' AND payload @> '{"requires_ytdlp":true}'::jsonb)` : db``}
-    ORDER BY created_at ASC LIMIT 1
+    AND NOT (type = 'proxy' AND EXISTS (SELECT 1 FROM jobs p WHERE p.type = 'proxy' AND p.status = 'processing'))
+    ORDER BY (type = 'proxy') ASC, created_at ASC LIMIT 1
   `
   if (!job) return
 
@@ -74,13 +84,14 @@ async function tick() {
   // worker ran more jobs than CONCURRENCY and a render's clip stayed "rendering".
   const ctrl = new AbortController()
   let timedOut = false
+  const timeoutMs = timeoutFor(job.type)
   const timer = setTimeout(() => {
     timedOut = true
-    const msg = `job timed out after ${JOB_TIMEOUT_MS / 1000}s`
+    const msg = `job timed out after ${timeoutMs / 1000}s`
     console.error(`[queue] Job ${job.id} ${msg}, stopping it`)
     ctrl.abort(new Error(msg))
     fail(job.id, msg).catch(err => console.error(`[queue] Could not mark job ${job.id} failed:`, err))
-  }, JOB_TIMEOUT_MS)
+  }, timeoutMs)
 
   try {
     await handler(job, ctrl.signal)
