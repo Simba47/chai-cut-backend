@@ -133,6 +133,9 @@ async function runMigrations() {
   await db`ALTER TABLE text_overlays ADD COLUMN IF NOT EXISTS w REAL`
   // Height of a text box (share of the frame's height): the text sits in its middle
   await db`ALTER TABLE text_overlays ADD COLUMN IF NOT EXISTS h REAL`
+  // How far a text or a photo is turned (degrees, clockwise) with its rotate handle on the preview
+  await db`ALTER TABLE text_overlays ADD COLUMN IF NOT EXISTS rotation REAL`
+  await db`ALTER TABLE overlays ADD COLUMN IF NOT EXISTS rotation REAL`
   // AI post text per clip: hook (also a text overlay), post caption, hashtags
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS hook_text TEXT`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS post_caption TEXT`

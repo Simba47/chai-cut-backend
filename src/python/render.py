@@ -583,8 +583,9 @@ _TEXT_LINE_EM = 1.15
 
 def _wrap_text_lines(text: str, max_w: float, measure) -> list[str]:
     """The lines a text overlay is drawn in: each line typed, and with a box width (`max_w` > 0)
-    words wrapped onto the next line when the line would be wider than the box. The editor breaks
-    lines by exactly this rule (textStyle.ts wrapTextLines), measuring with the same font file."""
+    words wrapped onto the next line when the line would be wider than the box; a word wider than
+    the box broken across lines. The editor breaks lines by exactly this rule (textStyle.ts
+    wrapTextLines), measuring with the same font file."""
     lines: list[str] = []
     for para in text.split("\n"):
         if not max_w or max_w <= 0:
@@ -599,8 +600,56 @@ def _wrap_text_lines(text: str, max_w: float, measure) -> list[str]:
                 line = word
             else:
                 line = probe
+            # A word wider than the box on its own line: broken across lines, as many letters as
+            # fit on each (the editor does the same: textStyle.ts wrapTextLines)
+            if line == word and measure(word) > max_w:
+                piece = ""
+                for ch in word:
+                    if piece and measure(piece + ch) > max_w:
+                        lines.append(piece)
+                        piece = ch
+                    else:
+                        piece += ch
+                line = piece
         lines.append(line)
     return lines
+
+
+def _rotated_text_png(line_runs: list[list[tuple[bool, str]]], widths: list[list[float]], font_path: str, size: int,
+                      color: tuple[int, int, int], rotation: float, block_w: float, block_h: float,
+                      shift_y: float, line_h: float, above: int) -> tuple[str, int]:
+    """
+    A text overlay turned by `rotation` degrees (clockwise, as the editor turns it), as a PNG: its
+    lines drawn as the drawtext path draws them (left-aligned, one baseline per line, the same 2 px
+    shadow), in a block block_w × block_h px, then turned round the block's middle. Returns the
+    PNG and the margin added round the block (the picture's middle is the block's middle).
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    pad = int(size * 0.5) + 4
+    img = Image.new("RGBA", (int(block_w + 2 * pad + 0.5), int(block_h + 2 * pad + 0.5)), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.truetype(font_path, size)
+    fill = (*color, 255)
+    for li, runs in enumerate(line_runs):
+        cursor = float(pad)
+        base = pad + shift_y + li * line_h + above
+        for (is_emoji, piece), w in zip(runs, widths[li]):
+            if piece:
+                if is_emoji:
+                    png = emoji_art.emoji_png(piece, int(size))
+                    if png:
+                        em = Image.open(png).convert("RGBA")
+                        img.alpha_composite(em, (int(cursor + size * emoji_art.SIDE_EM), int(base - size * emoji_art.ABOVE_EM)))
+                else:
+                    draw.text((cursor + 2, base + 2), piece, font=font, fill=(0, 0, 0, 178), anchor="ls")
+                    draw.text((cursor, base), piece, font=font, fill=fill, anchor="ls")
+            cursor += w
+    # PIL turns anticlockwise for a positive angle; the editor (CSS / canvas) turns clockwise
+    img = img.rotate(-rotation, resample=Image.BICUBIC, expand=True)
+    fd, path = tempfile.mkstemp(suffix=".png", prefix="rtext_")
+    os.close(fd)
+    img.save(path)
+    return path, pad
 
 
 def _line_baseline(pil_font, runs: list[tuple[bool, str]], size: int) -> int:
@@ -1461,7 +1510,9 @@ def main(
 
             box_w = float(ov.get("w") or 0) if not centered else 0.0
             box_h = float(ov.get("h") or 0) if not centered else 0.0
-            if not emoji_art.has_emoji(raw_text) and "\n" not in raw_text and box_w <= 0 and box_h <= 0:
+            # Turned on the preview (its rotate handle): drawn as a picture below, turned round its middle
+            rotation = float(ov.get("rotation") or 0) % 360 if not centered else 0.0
+            if not emoji_art.has_emoji(raw_text) and "\n" not in raw_text and box_w <= 0 and box_h <= 0 and not rotation:
                 # ── One line, no emoji: a single drawtext call, exactly as before ──
                 sz_fit = _fit_font_size(raw_text, font_path, sz, int(out_w * 0.9)) if centered else sz
                 sx = "(w-text_w)/2" if centered else int((ov.get("x") or 0.1) * out_w)
@@ -1506,6 +1557,23 @@ def main(
             sx0 = int((ov.get("x") or 0.1) * out_w)
             # One distance from a line's top to its baseline for every line, so the lines are evenly spaced
             above = max((_line_baseline(pil_font, runs, sz) for runs in line_runs), default=0)
+            if rotation:
+                # The block the editor turns: as wide as its box (or its widest line), as tall as its
+                # box (or its lines); the lines sit in its middle, up and down
+                block_w = max(max_w, box_w * out_w)
+                block_h = max(len(line_runs) * line_h, box_h * out_h)
+                shift_y = max(0.0, (box_h * out_h - len(line_runs) * line_h) / 2)
+                png, _pad = _rotated_text_png(line_runs, widths, font_path, sz, (r, g, b2), rotation,
+                                              block_w, block_h, shift_y, line_h, above)
+                inputs += ["-i", png]
+                src_lbl = f"[{next_input}:v]"
+                next_input += 1
+                cx, cy = sx0 + block_w / 2, sy + block_h / 2
+                olbl = f"[vrt{oi}]"
+                fp.append(f"{src_lbl}format=rgba[vrt{oi}s]")
+                fp.append(f"{cur}[vrt{oi}s]overlay=x={cx:.1f}-overlay_w/2:y={cy:.1f}-overlay_h/2:enable='{enable}'{olbl}")
+                cur = olbl
+                continue
             # A box with a height: the lines sit in its middle (as the editor draws them)
             sy = sy + max(0.0, (box_h * out_h - len(line_runs) * line_h) / 2)
             ridx = 0
@@ -1553,9 +1621,16 @@ def main(
             t1   = ov.get("end_ms", clip_dur_ms) / 1000.0
             slbl = f"[img{oi}s]"
             olbl = f"[vov{oi}]"
-            fp.append(f"{img_lbl}scale={iw}:{ih}:flags=lanczos{slbl}")
+            # The whole photo inside its box, in its own shape (the preview shows it so: object-fit
+            # contain), in the box's middle; turned round that middle when it was rotated
+            rot = float(ov.get("rotation") or 0) % 360
+            turn = ""
+            if rot:
+                rad = f"{rot * 3.141592653589793 / 180:.6f}"
+                turn = f",format=rgba,rotate={rad}:c=none:ow=rotw({rad}):oh=roth({rad})"
+            fp.append(f"{img_lbl}scale={iw}:{ih}:force_original_aspect_ratio=decrease:flags=lanczos{turn}{slbl}")
             fp.append(
-                f"{cur}{slbl}overlay=x={ix}:y={iy}"
+                f"{cur}{slbl}overlay=x={ix + iw / 2:.1f}-overlay_w/2:y={iy + ih / 2:.1f}-overlay_h/2"
                 f":enable='between(t,{t0:.3f},{t1:.3f})'{olbl}"
             )
             cur = olbl
