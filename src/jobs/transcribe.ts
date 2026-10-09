@@ -13,6 +13,7 @@ import { GoogleAuth } from 'google-auth-library'
 import { r2, R2_BUCKET, r2DownloadToFile, r2UploadFile } from '../r2.js'
 import db from '../db.js'
 import type { Job, TranscribeJobPayload } from '../types.js'
+import { queueProxy } from './proxy.js'
 
 async function r2Download(key: string): Promise<Buffer> {
   const res = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }))
@@ -104,6 +105,8 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal, onRead
     videoReady = true
     await fillMissingDuration(payload.video_id, payload.storage_path, signal)
       .catch(e => console.warn('[transcribe] could not read video length:', e))
+    // Its editing copy, made when the worker has nothing else to do (jobs/proxy.ts)
+    await queueProxy(payload.video_id).catch(e => console.warn('[transcribe] could not queue the editing copy:', e))
     if (!isFullJob) {
       console.log(`[transcribe] upload video ${payload.video_id} ready — transcription deferred to clip creation`)
       return
@@ -160,6 +163,7 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal, onRead
           const durationMs = await probeDurationMs(videoPath, signal)
           await db`UPDATE videos SET status = 'ready', storage_path = ${storagePath}, download_progress = 100, duration_ms = ${durationMs} WHERE id = ${payload.video_id}`
           videoReady = true
+          await queueProxy(payload.video_id).catch(e => console.warn('[transcribe] could not queue the editing copy:', e))
           if (!isFullJob) {
             console.log(`[transcribe] link video ${payload.video_id} ready — no captions on this plan`)
             return

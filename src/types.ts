@@ -1,6 +1,6 @@
 export type VideoStatus = 'uploaded' | 'transcribing' | 'ready' | 'failed'
 export type ClipStatus = 'draft' | 'rendering' | 'done' | 'failed'
-export type JobType = 'transcribe' | 'render' | 'ai_edit'
+export type JobType = 'transcribe' | 'render' | 'ai_edit' | 'proxy'
 export type JobStatus = 'queued' | 'processing' | 'done' | 'failed'
 export type RenderQuality = '480p' | '720p' | '1080p' | '2160p'
 
@@ -30,6 +30,11 @@ export interface TranscribeJobPayload {
   link_source?: 'gdrive' | 'dropbox'
   // Largest file the user's plan allows (link imports stop past this)
   max_bytes?: number
+}
+
+/** The editing copy of a video (jobs/proxy.ts) */
+export interface ProxyJobPayload {
+  video_id: string
 }
 
 export interface RenderJobPayload {
