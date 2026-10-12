@@ -1,4 +1,5 @@
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3'
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { createReadStream, createWriteStream } from 'node:fs'
 import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
@@ -28,6 +29,14 @@ export const R2_BUCKET = process.env.R2_BUCKET ?? 'chai-cut-videos'
 export async function r2DownloadToFile(key: string, filePath: string, signal?: AbortSignal): Promise<void> {
   const res = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }), { abortSignal: signal })
   await pipeline(Readable.from(res.Body as AsyncIterable<Uint8Array>), createWriteStream(filePath), { signal })
+}
+
+/**
+ * A temporary link to an R2 object (for `seconds`). FFmpeg reads a video through it with range
+ * requests, fetching only the part it seeks to — not the whole file.
+ */
+export async function r2SignedUrl(key: string, seconds = 2 * 60 * 60): Promise<string> {
+  return getSignedUrl(r2, new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }), { expiresIn: seconds })
 }
 
 /** Stream a local file up to R2 */

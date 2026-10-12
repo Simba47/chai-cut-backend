@@ -10,28 +10,45 @@ const CONCURRENCY = parseInt(process.env.QUEUE_CONCURRENCY ?? '2', 10)
 const JOB_TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS ?? String(15 * 60 * 1000), 10)
 // An editing copy (jobs/proxy.ts) of a long video takes longer than other jobs: its own limit
 const PROXY_TIMEOUT_MS = parseInt(process.env.PROXY_TIMEOUT_MS ?? String(90 * 60 * 1000), 10)
-const timeoutFor = (type: string) => (type === 'proxy' ? PROXY_TIMEOUT_MS : JOB_TIMEOUT_MS)
+// Following people (Subjects, Sub-edit) takes well under a minute for a clip (it reads only the
+// clip's part of the video): one that runs this long has hung, and is stopped instead of holding
+// a worker slot for an hour
+const TRACK_TIMEOUT_MS = parseInt(process.env.TRACK_TIMEOUT_MS ?? String(8 * 60 * 1000), 10)
+const timeoutFor = (type: string) => (type === 'proxy' ? PROXY_TIMEOUT_MS : type === 'track_subjects' ? TRACK_TIMEOUT_MS : JOB_TIMEOUT_MS)
 
 export function registerHandler(type: JobType, handler: JobHandler) {
   handlers.set(type, handler)
 }
 
-// Several workers share this queue (Railway, and a local one during development), so a worker
-// that starts must not take back jobs another worker is still running. A job only counts as
-// stuck once it has been "processing" longer than the job timeout (plus a minute): its worker
-// died or was restarted mid-job. updated_at is set by the jobs_updated_at trigger on claim.
-const STUCK_AFTER_MS = JOB_TIMEOUT_MS + 60_000
-const PROXY_STUCK_AFTER_MS = PROXY_TIMEOUT_MS + 60_000
-const STUCK_SWEEP_MS = 5 * 60 * 1000
+// Several workers share this queue (Railway — two at once during a deploy — and a local one in
+// development), so a worker must never take back a job another worker is still running. Each
+// worker stamps its running jobs' heartbeat (job_heartbeats) every HEARTBEAT_MS; a "processing" job
+// whose heartbeat stopped for STUCK_AFTER_MS lost its worker (it died, or a deploy restarted it
+// mid-job) and goes back to the queue — in a few minutes, not an hour. A job claimed by a worker
+// from before heartbeats (none) keeps the old rule: stuck once it has been "processing" longer than
+// its timeout plus a minute (updated_at is set by the jobs_updated_at trigger on claim).
+const HEARTBEAT_MS = 30_000
+const STUCK_AFTER_MS = 3 * 60 * 1000
+const STUCK_SWEEP_MS = 60 * 1000
+const NO_HEARTBEAT_STUCK_MS = JOB_TIMEOUT_MS + 60_000
+const NO_HEARTBEAT_PROXY_STUCK_MS = PROXY_TIMEOUT_MS + 60_000
 
 async function requeueStuck() {
   const stuck = await db`
-    UPDATE jobs SET status = 'queued'
-    WHERE status = 'processing' AND updated_at < now()
-      - ((CASE WHEN type = 'proxy' THEN ${PROXY_STUCK_AFTER_MS}::int ELSE ${STUCK_AFTER_MS}::int END) * interval '1 millisecond')
-    RETURNING id
+    WITH back AS (
+      UPDATE jobs j SET status = 'queued'
+      FROM jobs o LEFT JOIN job_heartbeats h ON h.job_id = o.id
+      WHERE j.id = o.id AND o.status = 'processing' AND (
+        h.at < now() - (${STUCK_AFTER_MS}::int * interval '1 millisecond')
+        OR (h.job_id IS NULL AND o.updated_at < now()
+          - ((CASE WHEN o.type = 'proxy' THEN ${NO_HEARTBEAT_PROXY_STUCK_MS}::int ELSE ${NO_HEARTBEAT_STUCK_MS}::int END) * interval '1 millisecond'))
+      )
+      RETURNING j.id
+    )
+    DELETE FROM job_heartbeats WHERE job_id IN (SELECT id FROM back)
+    RETURNING job_id
   `
-  if (stuck.length) console.log(`[queue] Re-queued ${stuck.length} stuck job(s) (processing for over ${Math.round(STUCK_AFTER_MS / 60000)} min)`)
+  if (stuck.length) console.log(`[queue] Re-queued ${stuck.length} job(s) whose worker stopped`)
 }
 
 export async function startQueue() {
@@ -70,13 +87,21 @@ async function tick() {
   if (!job) return
 
   const claimed = await db`
-    UPDATE jobs SET status = 'processing' WHERE id = ${job.id} AND status = 'queued' RETURNING id
+    WITH c AS (UPDATE jobs SET status = 'processing' WHERE id = ${job.id} AND status = 'queued' RETURNING id)
+    INSERT INTO job_heartbeats (job_id) SELECT id FROM c
+    ON CONFLICT (job_id) DO UPDATE SET at = now()
+    RETURNING job_id
   `
   if (!claimed.length) return
 
   console.log(`[queue] Processing job ${job.id} (${job.type})`)
   const handler = handlers.get(job.type as JobType)
   if (!handler) { await fail(job.id, `No handler for type: ${job.type}`); return }
+  // The heartbeat: this job's worker is alive (see requeueStuck)
+  const beat = setInterval(() => {
+    db`UPDATE job_heartbeats SET at = now() WHERE job_id = ${job.id}`
+      .catch(err => console.error(`[queue] Heartbeat for job ${job.id} failed:`, err instanceof Error ? err.message : err))
+  }, HEARTBEAT_MS)
 
   // On timeout the job is marked failed straight away (so the stuck-job sweep never runs it a
   // second time) and told to stop. This loop still waits for the handler to actually finish:
@@ -105,6 +130,8 @@ async function tick() {
     await fail(job.id, msg)
   } finally {
     clearTimeout(timer)
+    clearInterval(beat)
+    await db`DELETE FROM job_heartbeats WHERE job_id = ${job.id}`.catch(() => {})
   }
 }
 
