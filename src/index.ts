@@ -30,6 +30,7 @@ import { handleTranscribeJob } from './jobs/transcribe.js'
 import { handleRenderJob } from './jobs/render.js'
 import { handleAiEditJob } from './jobs/ai_edit.js'
 import { handleProxyJob } from './jobs/proxy.js'
+import { handleTrackSubjectsJob } from './jobs/track_subjects.js'
 
 // Safe schema migrations — idempotent, run on every startup
 async function runMigrations() {
@@ -96,7 +97,29 @@ async function runMigrations() {
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_edit_job_id uuid REFERENCES ai_edit_jobs(id) ON DELETE SET NULL`
   // The original schema only allowed 'transcribe' and 'render' jobs, so an 'ai_edit' job could not be queued
   await db`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_type_check`
-  await db`ALTER TABLE jobs ADD CONSTRAINT jobs_type_check CHECK (type IN ('transcribe','render','ai_edit','proxy'))`
+  await db`ALTER TABLE jobs ADD CONSTRAINT jobs_type_check CHECK (type IN ('transcribe','render','ai_edit','proxy','track_subjects'))`
+  // Subjects: people the user marked in a clip (editor Subjects tool), followed through it by
+  // jobs/track_subjects.ts. path: [[source ms, x, y, w, h], …] — their face 4× a second,
+  // fractions of the frame, only where they were seen.
+  await db`
+    CREATE TABLE IF NOT EXISTS clip_subjects (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      clip_id uuid NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+      label text NOT NULL,
+      color text NOT NULL,
+      mark_ms integer NOT NULL,
+      mark_x real NOT NULL,
+      mark_y real NOT NULL,
+      status text NOT NULL DEFAULT 'new' CHECK (status IN ('new', 'queued', 'running', 'done', 'failed')),
+      error text,
+      progress integer NOT NULL DEFAULT 0,
+      scan_start_ms integer,
+      scan_end_ms integer,
+      path jsonb,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )
+  `
+  await db`CREATE INDEX IF NOT EXISTS clip_subjects_clip ON clip_subjects (clip_id)`
   // The editing copy of a video (jobs/proxy.ts): what the editor plays, quick to drag through
   await db`ALTER TABLE videos ADD COLUMN IF NOT EXISTS proxy_path TEXT`
   // "Make my clips": how far the job has got (0–100), and why the AI picked each clip
@@ -167,6 +190,7 @@ registerHandler('transcribe', handleTranscribeJob)
 registerHandler('render', handleRenderJob)
 registerHandler('ai_edit', handleAiEditJob)
 registerHandler('proxy', handleProxyJob)
+registerHandler('track_subjects', handleTrackSubjectsJob)
 
 runMigrations()
   .then(() => startQueue())

@@ -1,6 +1,6 @@
 export type VideoStatus = 'uploaded' | 'transcribing' | 'ready' | 'failed'
 export type ClipStatus = 'draft' | 'rendering' | 'done' | 'failed'
-export type JobType = 'transcribe' | 'render' | 'ai_edit' | 'proxy'
+export type JobType = 'transcribe' | 'render' | 'ai_edit' | 'proxy' | 'track_subjects'
 export type JobStatus = 'queued' | 'processing' | 'done' | 'failed'
 export type RenderQuality = '480p' | '720p' | '1080p' | '2160p'
 
@@ -30,6 +30,14 @@ export interface TranscribeJobPayload {
   link_source?: 'gdrive' | 'dropbox'
   // Largest file the user's plan allows (link imports stop past this)
   max_bytes?: number
+}
+
+/** Follow the people marked in a clip (jobs/track_subjects.ts): its clip_subjects rows that are 'queued' */
+export interface TrackSubjectsJobPayload {
+  clip_id: string
+  /** The stretch of the source video to follow them through (ms) */
+  start_ms: number
+  end_ms: number
 }
 
 /** The editing copy of a video (jobs/proxy.ts) */
