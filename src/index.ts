@@ -44,12 +44,16 @@ async function runMigrations() {
   await db`ALTER TABLE videos ADD COLUMN IF NOT EXISTS title TEXT`
   // Why a video failed, in words the user can act on (e.g. a link that isn't shared publicly)
   await db`ALTER TABLE videos ADD COLUMN IF NOT EXISTS error TEXT`
-  // Frames: five frame layouts, letterbox band settings per format, and per-slot photo / motion / audio mix
+  // Frames: the frame layouts, letterbox band settings per format, and per-slot photo / motion / audio mix
+  // (15 more frames added 2026-10: blur fill, gameplay split, picture in picture, … — frames.py)
   await db`ALTER TABLE segments DROP CONSTRAINT IF EXISTS segments_layout_check`
   await db`ALTER TABLE segments ADD CONSTRAINT segments_layout_check CHECK (layout IN (
     'vertical','split','trio','spotlight','centered','horizontal',
     'frame_single','frame_video_photo','frame_dual','frame_dual_letterbox','frame_triple',
-    'frame_title_caption','frame_big_small','frame_photo_story'))`
+    'frame_title_caption','frame_big_small','frame_photo_story',
+    'frame_blur_fill','frame_gameplay','frame_pip','frame_screenshot','frame_comment','frame_letterbox_wide',
+    'frame_two_crops','frame_side_by_side','frame_name_tags','frame_brand_card','frame_top_list',
+    'frame_screen_face','frame_audiogram','frame_grid','frame_news'))`
   await db`ALTER TABLE segments ADD COLUMN IF NOT EXISTS frame JSONB`
   await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS image_path TEXT`
   await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS image_motion TEXT`
