@@ -38,6 +38,11 @@ export interface TrackSubjectsJobPayload {
   /** The stretch of the source video to follow them through (ms) */
   start_ms: number
   end_ms: number
+  /**
+   * Sub-edit (the clip board's button): find the people by itself (no marks), mark and track them,
+   * and frame the clip on whoever is talking — written into the clip
+   */
+  auto?: boolean
 }
 
 /** The editing copy of a video (jobs/proxy.ts) */
