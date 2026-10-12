@@ -120,6 +120,11 @@ async function runMigrations() {
     )
   `
   await db`CREATE INDEX IF NOT EXISTS clip_subjects_clip ON clip_subjects (clip_id)`
+  // The camera cuts found while tracking (source ms): the editor never carries a face across one,
+  // and switches the view between people exactly on them
+  await db`ALTER TABLE clip_subjects ADD COLUMN IF NOT EXISTS cuts jsonb`
+  // When the subject is talking ([start, end] source ms, to the word): the view cuts to them on their first word
+  await db`ALTER TABLE clip_subjects ADD COLUMN IF NOT EXISTS speaking jsonb`
   // The editing copy of a video (jobs/proxy.ts): what the editor plays, quick to drag through
   await db`ALTER TABLE videos ADD COLUMN IF NOT EXISTS proxy_path TEXT`
   // "Make my clips": how far the job has got (0–100), and why the AI picked each clip

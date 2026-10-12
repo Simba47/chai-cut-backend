@@ -3,8 +3,10 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { r2DownloadToFile } from '../r2.js'
 import db from '../db.js'
+import type { TransactionSql } from 'postgres'
 import type { Job, TrackSubjectsJobPayload } from '../types.js'
-import { detectFaces, detectCuts, trackFaces, planSpeakers, FRAME_INTERVAL_MS, type FrameDetection, type CropBox, type SpokenWord } from './ai_edit.js'
+import { detectFaces, detectCuts, trackFaces, probeSize, FRAME_INTERVAL_MS, type FrameDetection, type CropBox, type SpokenWord } from './ai_edit.js'
+import { autoDirectChanges, followChanges, buildKeyframes, type SubjectPoint } from './subject_framing.js'
 
 // ── Subjects: people the user marked in a clip, followed through it ────────────
 // In the editor the user pauses on a person and clicks them (a "subject"). This job looks at the
@@ -20,6 +22,8 @@ import { detectFaces, detectCuts, trackFaces, planSpeakers, FRAME_INTERVAL_MS, t
 const SAME_PERSON = 0.5
 /** A track this much closer to one subject than to another goes to it; nearer than that is unclear */
 const CLEAR_MARGIN = 0.05
+/** Marked from the view: a face whose middle is at most this far across from the view's middle (fraction of the width) */
+const VIEW_MARK_REACH = 0.25
 /** The face under a click is looked for this many frames either side of the moment (half a second) */
 const MARK_SEARCH_FRAMES = 2
 /**
@@ -36,7 +40,96 @@ export interface SubjectMark { id: string; t: number; x: number; y: number }
  * frame); talking: 1 while they are the one talking, else 0
  */
 export type PathPoint = [number, number, number, number, number, number]
-export interface SubjectResult { id: string; path: PathPoint[]; error?: string }
+/** [start, end] ms (from the start of the scan) while the subject is talking */
+export type Turn = [number, number]
+export interface SubjectResult { id: string; path: PathPoint[]; speaking: Turn[]; error?: string }
+
+// Who talks when. The transcript's words carry a speaker label: each label is matched to the person
+// whose mouth moves with that label's words (the most words where their lips clearly lead), so the
+// talking turns start and end on the words themselves — the view can cut on the first word.
+/** A person's lips "lead" on a word when they move at least this much (std of lip gap / face height over ±0.5 s) */
+const MIN_LIP_MOVE = 0.0015
+/** …and this much more than anyone else's */
+const LIP_LEAD = 1.3
+/** A label belongs to a person who led on at least this many of its words (and this share of them) */
+const LABEL_MIN_WORDS = 2
+const LABEL_MIN_SHARE = 0.25
+/** A pause shorter than this inside one person's talking doesn't end their turn */
+const TURN_GAP_MS = 700
+
+const pstdev = (v: number[]) => {
+  const m = v.reduce((a, b) => a + b, 0) / v.length
+  return Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / v.length)
+}
+
+/**
+ * Each subject's talking turns. `faceOf(s, fi)`: the subject's face in frame fi (if seen there);
+ * `timeOf(fi)`: that frame's time. A word goes to its label's person; a word without one (or whose
+ * label matched nobody) to the person whose lips clearly lead on it; failing that, when only one of
+ * them is in the picture, to them.
+ */
+export function speakingTurns(
+  frameCount: number, timeOf: (fi: number) => number, subjects: string[],
+  faceOf: (s: string, fi: number) => CropBox | undefined, speech: SpokenWord[],
+): Map<string, Turn[]> {
+  const out = new Map<string, Turn[]>(subjects.map(s => [s, []]))
+  if (!speech.length || !subjects.length || !frameCount) return out
+  // How much each subject's mouth moves around a frame
+  const motion = (s: string, fi: number): number | null => {
+    const v: number[] = []
+    for (let k = fi - 2; k <= fi + 2; k++) {
+      if (k < 0 || k >= frameCount) continue
+      const lip = faceOf(s, k)?.lip
+      if (typeof lip === 'number') v.push(lip)
+    }
+    return v.length >= 3 ? pstdev(v) : null
+  }
+  // The frames over each word (a quarter second either side: frames are 4 a second)
+  const framesOf = (w: SpokenWord) => {
+    const out: number[] = []
+    for (let fi = 0; fi < frameCount; fi++) { const t = timeOf(fi); if (t >= w.start_ms - 125 && t <= w.end_ms + 125) out.push(fi) }
+    return out
+  }
+  const words = speech.map(w => {
+    const fis = framesOf(w)
+    const seen = subjects.filter(s => fis.some(fi => faceOf(s, fi)))
+    const moves = seen.map(s => ({ s, m: Math.max(0, ...fis.map(fi => motion(s, fi) ?? 0)) })).sort((a, b) => b.m - a.m)
+    const lead = moves[0] && moves[0].m >= MIN_LIP_MOVE && (!moves[1] || moves[0].m >= LIP_LEAD * moves[1].m) ? moves[0].s : null
+    return { w, seen, lead }
+  })
+  // Each label: the person who leads on most of its words
+  const labelTo = new Map<string, string>()
+  const byLabel = new Map<string, typeof words>()
+  for (const x of words) if (x.w.speaker_id) byLabel.set(x.w.speaker_id, [...(byLabel.get(x.w.speaker_id) ?? []), x])
+  for (const [label, list] of byLabel) {
+    const votes = new Map<string, number>()
+    for (const x of list) if (x.lead) votes.set(x.lead, (votes.get(x.lead) ?? 0) + 1)
+    const best = [...votes].sort((a, b) => b[1] - a[1])[0]
+    if (best && best[1] >= LABEL_MIN_WORDS && best[1] >= LABEL_MIN_SHARE * list.length) labelTo.set(label, best[0])
+  }
+  const whos = words.map(x => (x.w.speaker_id ? labelTo.get(x.w.speaker_id) : undefined) ?? x.lead ?? (x.seen.length === 1 ? x.seen[0] : null))
+  // A word with no clear talker right before someone's words is theirs: at a hand-over both mouths
+  // move within the lip readings' half second, so a turn's first word is often unclear by lips alone
+  for (let i = whos.length - 2; i >= 0; i--) {
+    if (!whos[i] && whos[i + 1] && words[i + 1].w.start_ms - words[i].w.end_ms < TURN_GAP_MS) whos[i] = whos[i + 1]
+  }
+  for (const [i, x] of words.entries()) {
+    const who = whos[i]
+    if (!who) continue
+    const turns = out.get(who)!
+    const last = turns[turns.length - 1]
+    if (last && x.w.start_ms - last[1] < TURN_GAP_MS) last[1] = Math.max(last[1], x.w.end_ms)
+    else turns.push([x.w.start_ms, x.w.end_ms])
+  }
+  // Two people never talk at once in the turns: where they overlap, the one who started later has the floor
+  const all = [...out].flatMap(([s, ts]) => ts.map(t => ({ s, t })))
+  for (const a of all) for (const b of all) {
+    if (a === b || a.s === b.s) continue
+    if (b.t[0] > a.t[0] && b.t[0] < a.t[1]) a.t[1] = b.t[0]
+  }
+  for (const [s, ts] of out) out.set(s, ts.filter(t => t[1] - t[0] > 0))
+  return out
+}
 
 const l1 = (a: number[], b: number[]) => a.reduce((t, v, i) => t + Math.abs(v - (b[i] ?? 0)), 0)
 const meanOf = (sigs: number[][]) => sigs[0].map((_, k) => sigs.reduce((t, v) => t + v[k], 0) / sigs.length)
@@ -104,7 +197,22 @@ export function followSubjects(frames: FrameDetection[], cuts: number[], marks: 
       }
       if (best) break
     }
-    if (!best) { errors.set(mk.id, 'No face where you clicked. Pause where their face can be seen and mark them on it.'); continue }
+    // Marked from the view (its middle, not a click on the face): the face nearest that middle
+    // across the picture, at the moment (or just around it)
+    if (!best) {
+      for (let off = 0; off <= MARK_SEARCH_FRAMES && !best; off++) {
+        for (const fi of off ? [near - off, near + off] : [near]) {
+          if (fi < 0 || fi >= fr.length || acrossCut(mk.t, timeOf(fi))) continue
+          fr[fi].faces.forEach((face, k) => {
+            const d = Math.abs(face.x + face.w / 2 - mk.x)
+            if (d > VIEW_MARK_REACH) return
+            const score = d + off * 0.1
+            if (!best || score < best.score) best = { id: ids[fi][k], score, off }
+          })
+        }
+      }
+    }
+    if (!best) { errors.set(mk.id, 'No face in the view here. Put the view on their face (where it can be seen) and mark them again.'); continue }
     const id = (best as { id: number }).id
     const other = [...marked].find(([, t]) => t === id)
     if (other) { errors.set(mk.id, 'This is the same person as another subject.'); continue }
@@ -139,22 +247,25 @@ export function followSubjects(frames: FrameDetection[], cuts: number[], marks: 
     owned.get(o.s)!.add(o.id)
   }
 
-  // Who is talking, frame by frame (a track id; 'split': two people trading lines quickly)
-  const talking = speech.length && durationMs > 0 ? planSpeakers(fr, ids, speech, durationMs) : fr.map(() => null)
+  // Each subject's face, frame by frame
+  const faces = new Map<string, Map<number, CropBox>>()
+  for (const s of subjects) {
+    const byFrame = new Map<number, CropBox>()
+    for (const id of owned.get(s)!) for (const [fi, face] of tracks.get(id)!) byFrame.set(fi, face)
+    faces.set(s, byFrame)
+  }
+  // Who is talking when, to the word (durationMs: kept for the callers; the words carry the times)
+  void durationMs
+  const turns = speakingTurns(fr.length, timeOf, subjects, (s, fi) => faces.get(s)?.get(fi), speech)
+  const talksAt = (s: string, t: number) => (turns.get(s) ?? []).some(([a, b]) => t >= a && t <= b)
 
   return marks.map(mk => {
     const err = errors.get(mk.id)
-    if (err) return { id: mk.id, path: [], error: err }
-    const mine = owned.get(mk.id)!
-    const byFrame = new Map<number, CropBox>()
-    for (const id of mine) for (const [fi, face] of tracks.get(id)!) byFrame.set(fi, face)
+    if (err) return { id: mk.id, path: [], speaking: [], error: err }
+    const byFrame = faces.get(mk.id)!
     const path = [...byFrame.entries()].sort((a, b) => a[0] - b[0])
-      .map(([fi, f]): PathPoint => {
-        const who = talking[fi]
-        const talks = who === 'split' || (typeof who === 'number' && mine.has(who)) ? 1 : 0
-        return [timeOf(fi), round4(f.x), round4(f.y), round4(f.w), round4(f.h), talks]
-      })
-    return { id: mk.id, path }
+      .map(([fi, f]): PathPoint => [timeOf(fi), round4(f.x), round4(f.y), round4(f.w), round4(f.h), talksAt(mk.id, timeOf(fi)) ? 1 : 0])
+    return { id: mk.id, path, speaking: turns.get(mk.id) ?? [] }
   })
 }
 
@@ -186,7 +297,8 @@ async function setSubjects(ids: string[], patch: { status?: string; progress?: n
 }
 
 export async function handleTrackSubjectsJob(job: Job, signal?: AbortSignal) {
-  const { clip_id, start_ms, end_ms } = job.payload as unknown as TrackSubjectsJobPayload
+  const { clip_id, start_ms, end_ms, auto } = job.payload as unknown as TrackSubjectsJobPayload
+  if (auto) return subEditClip(clip_id, signal)
   // The subjects waiting when this job starts (ones marked later get a job of their own)
   const subjects = await db<{ id: string; mark_ms: number; mark_x: number; mark_y: number }[]>`
     UPDATE clip_subjects SET status = 'running', progress = 5, error = NULL
@@ -227,6 +339,8 @@ export async function handleTrackSubjectsJob(job: Job, signal?: AbortSignal) {
     await setSubjects(ids, { progress: 90 })
 
     const results = followSubjects(info.frames, cuts, subjects.map(s => ({ id: s.id, t: s.mark_ms - from, x: s.mark_x, y: s.mark_y })), speech, to - from)
+    // The camera cuts, in the source video's time (exact to the frame: the editor switches on them)
+    const sourceCuts = cuts.map(c => Math.round(c + from))
     for (const r of results) {
       if (r.error) {
         await db`UPDATE clip_subjects SET status = 'failed', error = ${r.error}, progress = 100, path = NULL WHERE id = ${r.id}`
@@ -236,11 +350,13 @@ export async function handleTrackSubjectsJob(job: Job, signal?: AbortSignal) {
       const path = r.path.map(([t, x, y, w, h, talks]) => [Math.round(t + from), x, y, w, h, talks])
       await db`
         UPDATE clip_subjects SET status = 'done', error = NULL, progress = 100,
-          path = ${db.json(path as never)}, scan_start_ms = ${from}, scan_end_ms = ${to}
+          path = ${db.json(path as never)}, cuts = ${db.json(sourceCuts as never)},
+          speaking = ${db.json(r.speaking.map(([a, b]) => [Math.round(a + from), Math.round(b + from)]) as never)},
+          scan_start_ms = ${from}, scan_end_ms = ${to}
         WHERE id = ${r.id}
       `
     }
-    const seen = results.map(r => `${r.error ? 'failed' : `${r.path.length} frames, talking in ${r.path.filter(p => p[5]).length}`}`).join(', ')
+    const seen = results.map(r => `${r.error ? 'failed' : `${r.path.length} frames, ${r.speaking.length} turn(s)`}`).join(', ')
     console.log(`[track_subjects] clip ${clip_id}: ${info.frames.length} frames, ${cuts.length} cut(s), subjects: ${seen} (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
@@ -249,4 +365,193 @@ export async function handleTrackSubjectsJob(job: Job, signal?: AbortSignal) {
   } finally {
     await rm(tmp, { recursive: true, force: true })
   }
+}
+
+// ── Sub-edit: the clip board's one-button framing ──────────────────────────────
+// Everything the Subjects tool does, without the user marking anyone: the worker finds the people
+// in the clip, marks each (a frame where their face is clearest), tracks them with who is talking,
+// and frames the clip on them — every section's view switches to whoever is talking — written into
+// the clip itself, so the clip board's Download exports it and the editor opens with it.
+
+const SUBJECT_COLORS = ['#f472b6', '#38bdf8', '#facc15', '#a78bfa', '#fb923c', '#34d399']
+/** At most this many people are marked (the editor allows 6) */
+const MAX_PEOPLE = 6
+/** Everyone seen at least this long is registered (4 frames a second: 1 s), so a passing face isn't */
+const MIN_PERSON_FRAMES = 4
+/** Frame slots that show the main video whole (not cropped): their view isn't moved (frames.ts "contain") */
+const CONTAIN_SLOTS: Record<string, number[]> = { frame_blur_fill: [0], frame_screenshot: [0], frame_screen_face: [0] }
+
+/**
+ * The people in the clip, as marks: the face tracks, grouped into people by the colours of face and
+ * clothes (a track clearly matching a person already found is that person again), the ones seen long
+ * enough, most seen first. Each mark is the frame where that person's face is biggest.
+ */
+export function findPeople(frames: FrameDetection[], cuts: number[]): Array<{ t: number; x: number; y: number }> {
+  const fr: FrameDetection[] = [...frames]
+    .sort((a, b) => a.frame_index - b.frame_index)
+    .map(f => ({ ...f, faces: f.faces.filter(face => (face.score ?? 0) > 0) }))
+  if (!fr.length) return []
+  const ids = trackFaces(fr, cuts.map(c => c - FRAME_SHOWS_MS))
+  const tracks = new Map<number, Array<{ fi: number; face: CropBox }>>()
+  fr.forEach((f, fi) => ids[fi].forEach((id, k) => {
+    const list = tracks.get(id) ?? []
+    list.push({ fi, face: f.faces[k] })
+    tracks.set(id, list)
+  }))
+  const people: Array<{ sig: number[] | null; frames: number; best: { fi: number; face: CropBox } }> = []
+  for (const list of [...tracks.values()].sort((a, b) => b.length - a.length)) {
+    const sigs = list.map(x => x.face.sig).filter((v): v is number[] => !!v && v.length > 0)
+    const sig = sigs.length ? meanOf(sigs) : null
+    const same = sig ? people.find(p => p.sig && l1(sig, p.sig) < SAME_PERSON) : undefined
+    const biggest = list.reduce((a, b) => (b.face.w * b.face.h > a.face.w * a.face.h ? b : a))
+    if (same) {
+      same.frames += list.length
+      if (biggest.face.w * biggest.face.h > same.best.face.w * same.best.face.h) same.best = biggest
+      continue
+    }
+    people.push({ sig, frames: list.length, best: biggest })
+  }
+  return people
+    .filter(p => p.frames >= MIN_PERSON_FRAMES)
+    .sort((a, b) => b.frames - a.frames)
+    .slice(0, MAX_PEOPLE)
+    .map(p => ({
+      t: fr[p.best.fi].frame_index * FRAME_INTERVAL_MS + FRAME_SHOWS_MS,
+      x: round4(p.best.face.x + p.best.face.w / 2),
+      y: round4(p.best.face.y + p.best.face.h / 2),
+    }))
+}
+
+async function subEditClip(clipId: string, signal?: AbortSignal) {
+  const t0 = Date.now()
+  const [clip] = await db<{ start_ms: number; end_ms: number; storage_path: string | null; proxy_path: string | null; video_id: string }[]>`
+    SELECT c.start_ms, c.end_ms, v.storage_path, v.proxy_path, v.id AS video_id FROM clips c JOIN videos v ON v.id = c.video_id WHERE c.id = ${clipId}
+  `
+  if (!clip?.storage_path) throw new Error('The video of this clip could not be found')
+  const from = Number(clip.start_ms), to = Number(clip.end_ms)
+  const tmp = await mkdtemp(join(tmpdir(), 'subedit-'))
+  try {
+    const videoPath = join(tmp, 'source.mp4')
+    try {
+      if (!clip.proxy_path) throw new Error('no editing copy')
+      await r2DownloadToFile(clip.proxy_path, videoPath, signal)
+    } catch {
+      await r2DownloadToFile(clip.storage_path, videoPath, signal)
+    }
+    const [info, cuts, speech, size] = await Promise.all([
+      detectFaces(tmp, videoPath, from, to, signal, true),
+      detectCuts(videoPath, from, to, signal),
+      spokenWords(clip.video_id, from, to),
+      probeSize(videoPath),
+    ])
+    signal?.throwIfAborted()
+    const found = findPeople(info.frames, cuts)
+    if (!found.length) throw new Error('No people could be found in this clip')
+
+    // They become the clip's subjects (the Subjects tool shows them), replacing any marked before
+    const marks = await db.begin(async tx => {
+      await tx`DELETE FROM clip_subjects WHERE clip_id = ${clipId}`
+      const rows = await tx<{ id: string }[]>`
+        INSERT INTO clip_subjects ${tx(found.map((m, i) => ({
+          clip_id: clipId, label: String.fromCharCode(65 + i), color: SUBJECT_COLORS[i % SUBJECT_COLORS.length],
+          mark_ms: Math.round(m.t + from), mark_x: m.x, mark_y: m.y, status: 'running', progress: 60,
+        })))}
+        RETURNING id
+      `
+      return rows.map((r, i) => ({ id: r.id, t: found[i].t, x: found[i].x, y: found[i].y }))
+    })
+    const results = followSubjects(info.frames, cuts, marks, speech, to - from)
+    const sourceCuts = cuts.map(c => Math.round(c + from))
+    const tracked: Array<{ id: string; path: SubjectPoint[]; speaking: Array<[number, number]> }> = []
+    for (const r of results) {
+      if (r.error) {
+        await db`UPDATE clip_subjects SET status = 'failed', error = ${r.error}, progress = 100, path = NULL WHERE id = ${r.id}`
+        continue
+      }
+      const path = r.path.map(([t, x, y, w, h, talks]) => [Math.round(t + from), x, y, w, h, talks] as SubjectPoint)
+      const speaking = r.speaking.map(([a, b]) => [Math.round(a + from), Math.round(b + from)] as [number, number])
+      tracked.push({ id: r.id, path, speaking })
+      await db`
+        UPDATE clip_subjects SET status = 'done', error = NULL, progress = 100,
+          path = ${db.json(path as never)}, cuts = ${db.json(sourceCuts as never)}, speaking = ${db.json(speaking as never)},
+          scan_start_ms = ${from}, scan_end_ms = ${to}
+        WHERE id = ${r.id}
+      `
+    }
+    if (!tracked.length) throw new Error('No one could be followed through this clip')
+    const framed = await frameClip(clipId, from, to, tracked, sourceCuts, size)
+    console.log(`[track_subjects] sub-edit clip ${clipId}: ${found.length} people, ${framed} view(s) framed (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
+  } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
+}
+
+/**
+ * Frame the clip on the tracked people (the editor's frameClipOnSubjects): in every section, a view
+ * showing the main video switches to whoever is talking; a section with two or three such views
+ * (split, trio, a frame) puts one person in each. Views keep their size. Locked and Horizontal
+ * sections, photos, other videos and slots showing the video whole are left alone. A clip never
+ * opened (no sections yet) gets one Vertical section. The clip's old export no longer matches.
+ */
+async function frameClip(
+  clipId: string, clipStart: number, clipEnd: number, people: Array<{ id: string; path: SubjectPoint[]; speaking: Array<[number, number]> }>,
+  cuts: number[], size: { width: number; height: number } | null,
+): Promise<number> {
+  // Sections and keyframes are kept in clip time (ms from the clip's start)
+  const toSource = (t: number) => clipStart + t
+  const toTimeline = (s: number) => s - clipStart
+  const length = clipEnd - clipStart
+  // A 9:16 view at full height, as a share of the source's width
+  const reelW = size ? Math.min(1, (9 / 16) * (size.height / size.width)) : 81 / 256
+  return db.begin(async tx => {
+    const segs = await tx<{ id: string; start_ms: number; end_ms: number; layout: string; frame: { main_slots?: number[] } | null; locked?: boolean | null }[]>`
+      SELECT * FROM segments WHERE clip_id = ${clipId} ORDER BY start_ms
+    `
+    if (!segs.length) {
+      // Never opened: one Vertical section over the whole clip (as the editor would open it)
+      const changes = autoDirectChanges(people, 0, length, toSource, { w: reelW, h: 1 }, cuts, toTimeline)
+      if (!changes) return 0
+      const [seg] = await tx`INSERT INTO segments (clip_id, start_ms, end_ms, layout, sort_order) VALUES (${clipId}, 0, ${length}, 'vertical', 0) RETURNING id`
+      const [box] = await tx`INSERT INTO crop_boxes (segment_id, slot_index, source_video_id, source_offset_ms, muted) VALUES (${seg.id}, 0, NULL, 0, false) RETURNING id`
+      await insertKeyframes(tx, box.id as string, changes, 0)
+      await tx`UPDATE clips SET status = 'draft', output_url = NULL WHERE id = ${clipId}`
+      return 1
+    }
+    const boxes = await tx<{ id: string; segment_id: string; slot_index: number; source_video_id: string | null; image_path: string | null }[]>`
+      SELECT id, segment_id, slot_index, source_video_id, image_path FROM crop_boxes WHERE segment_id = ANY(${segs.map(s => s.id)}) ORDER BY slot_index
+    `
+    const kfs = await tx<{ box_id: string; t_ms: number; w: number; h: number }[]>`
+      SELECT box_id, t_ms, w, h FROM box_keyframes WHERE box_id = ANY(${boxes.map(b => b.id)}) ORDER BY t_ms
+    `
+    let framed = 0
+    for (const seg of segs) {
+      const start = Number(seg.start_ms), end = Number(seg.end_ms)
+      if (seg.locked || seg.layout === 'horizontal' || end - start <= 250) continue
+      const frame = seg.layout.startsWith('frame_')
+      const mainSlots = frame ? seg.frame?.main_slots ?? [0] : null
+      const views = boxes.filter(b => b.segment_id === seg.id && !b.image_path && !b.source_video_id
+        && (!mainSlots || (mainSlots.includes(b.slot_index) && !(CONTAIN_SLOTS[seg.layout] ?? []).includes(b.slot_index))))
+      for (const [i, box] of views.entries()) {
+        // The view keeps its size (its first keyframe); never framed: a full-height 9:16 in a Vertical section
+        const first = kfs.find(k => k.box_id === box.id)
+        const view = first ? { w: Number(first.w), h: Number(first.h) } : seg.layout === 'vertical' ? { w: reelW, h: 1 } : null
+        if (!view) continue
+        const changes = views.length === 1
+          ? autoDirectChanges(people, start, end, toSource, view, cuts, toTimeline)
+          : followChanges(people[i % people.length].path, start, end, toSource, view, 'smooth', cuts)
+        if (!changes?.length) continue
+        await tx`DELETE FROM box_keyframes WHERE box_id = ${box.id}`
+        await insertKeyframes(tx, box.id, changes, start)
+        framed++
+      }
+    }
+    if (framed) await tx`UPDATE clips SET status = 'draft', output_url = NULL WHERE id = ${clipId}`
+    return framed
+  })
+}
+
+async function insertKeyframes(tx: TransactionSql, boxId: string, changes: ReturnType<typeof followChanges> & object, start: number) {
+  const kfs = buildKeyframes(changes.map((c, k) => (k === 0 ? { ...c, t_ms: start } : c)))
+    .map(k => ({ box_id: boxId, t_ms: Math.round(k.t_ms), x: round4(k.x), y: round4(k.y), w: round4(k.w), h: round4(k.h) }))
+  for (let i = 0; i < kfs.length; i += 5000) await tx`INSERT INTO box_keyframes ${tx(kfs.slice(i, i + 5000))}`
 }
