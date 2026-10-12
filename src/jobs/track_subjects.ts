@@ -298,7 +298,7 @@ async function setSubjects(ids: string[], patch: { status?: string; progress?: n
 
 export async function handleTrackSubjectsJob(job: Job, signal?: AbortSignal) {
   const { clip_id, start_ms, end_ms, auto } = job.payload as unknown as TrackSubjectsJobPayload
-  if (auto) return subEditClip(clip_id, signal)
+  if (auto) return subEditClip(job.id, clip_id, signal)
   // The subjects waiting when this job starts (ones marked later get a job of their own)
   const subjects = await db<{ id: string; mark_ms: number; mark_x: number; mark_y: number }[]>`
     UPDATE clip_subjects SET status = 'running', progress = 5, error = NULL
@@ -422,8 +422,38 @@ export function findPeople(frames: FrameDetection[], cuts: number[]): Array<{ t:
     }))
 }
 
-async function subEditClip(clipId: string, signal?: AbortSignal) {
+/** What the clip board's Stop writes on the job (the frontend's stopSubEdit) */
+export const STOPPED = 'Stopped by the user'
+
+async function subEditClip(jobId: string, clipId: string, queueSignal?: AbortSignal) {
   const t0 = Date.now()
+  // Stopped from the clip board: the job row says so. Checked every 2 s; everything running (the
+  // download, FFmpeg, the face reading) is stopped through the signal
+  const stop = new AbortController()
+  const signal = queueSignal ? AbortSignal.any([queueSignal, stop.signal]) : stop.signal
+  const watch = setInterval(async () => {
+    try {
+      const [row] = await db<{ status: string; error: string | null }[]>`SELECT status, error FROM jobs WHERE id = ${jobId}`
+      if (row && row.status === 'failed' && row.error === STOPPED) stop.abort(new Error(STOPPED))
+    } catch { /* the next check */ }
+  }, 2000)
+  let created: string[] = []
+  try {
+    await subEditSteps(clipId, signal, ids => { created = ids }, t0)
+  } catch (e) {
+    // Stopped: nothing half-done stays (the people it had just registered go; the clip's framing was never touched)
+    if (stop.signal.aborted) {
+      if (created.length) await db`DELETE FROM clip_subjects WHERE id = ANY(${created})`.catch(() => {})
+      console.log(`[track_subjects] sub-edit clip ${clipId}: stopped by the user (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
+      throw new Error(STOPPED)
+    }
+    throw e
+  } finally {
+    clearInterval(watch)
+  }
+}
+
+async function subEditSteps(clipId: string, signal: AbortSignal, onCreated: (ids: string[]) => void, t0: number) {
   const [clip] = await db<{ start_ms: number; end_ms: number; storage_path: string | null; proxy_path: string | null; video_id: string }[]>`
     SELECT c.start_ms, c.end_ms, v.storage_path, v.proxy_path, v.id AS video_id FROM clips c JOIN videos v ON v.id = c.video_id WHERE c.id = ${clipId}
   `
@@ -460,6 +490,8 @@ async function subEditClip(clipId: string, signal?: AbortSignal) {
       `
       return rows.map((r, i) => ({ id: r.id, t: found[i].t, x: found[i].x, y: found[i].y }))
     })
+    onCreated(marks.map(m => m.id))
+    signal.throwIfAborted()
     const results = followSubjects(info.frames, cuts, marks, speech, to - from)
     const sourceCuts = cuts.map(c => Math.round(c + from))
     const tracked: Array<{ id: string; path: SubjectPoint[]; speaking: Array<[number, number]> }> = []
@@ -479,6 +511,8 @@ async function subEditClip(clipId: string, signal?: AbortSignal) {
       `
     }
     if (!tracked.length) throw new Error('No one could be followed through this clip')
+    // Last chance to stop before the clip itself changes
+    signal.throwIfAborted()
     const framed = await frameClip(clipId, from, to, tracked, sourceCuts, size)
     console.log(`[track_subjects] sub-edit clip ${clipId}: ${found.length} people, ${framed} view(s) framed (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
   } finally {
