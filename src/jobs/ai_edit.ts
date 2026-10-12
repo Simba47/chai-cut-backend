@@ -23,9 +23,9 @@ const execFileAsync = promisify(execFile)
 
 /** Expression, 0–1 each (MediaPipe blendshapes): smile, jaw open, brows up, brows down, eyes wide, frown */
 export interface Expression { sm: number; jo: number; bu: number; bd: number; ew: number; fr: number }
-interface CropBox { x: number; y: number; w: number; h: number; score?: number; lip?: number; ex?: Expression; sig?: number[] }
+export interface CropBox { x: number; y: number; w: number; h: number; score?: number; lip?: number; ex?: Expression; sig?: number[] }
 export interface FrameDetection { frame_index: number; person_count: number; faces: CropBox[] }
-interface FaceInfo { face_count: number; face_boxes: CropBox[]; frames: FrameDetection[] }
+export interface FaceInfo { face_count: number; face_boxes: CropBox[]; frames: FrameDetection[] }
 interface SlotKf { t_ms: number; x: number; y: number; w: number; h: number }
 interface ClipSegment {
   start_ms: number; end_ms: number; layout: 'vertical' | 'split' | 'trio'; slotKfs: SlotKf[][]; broll?: string
@@ -56,7 +56,7 @@ const SPEAKER_TRACKING = process.env.SPEAKER_TRACKING !== 'off'
 // Frames analysed per second, and the time between them. 4 fps catches quick head turns and
 // lets the crop follow within a quarter second.
 const DETECT_FPS = 4
-const FRAME_INTERVAL_MS = 1000 / DETECT_FPS
+export const FRAME_INTERVAL_MS = 1000 / DETECT_FPS
 
 // Minimum segment duration before we'll commit to a layout switch.
 // Avoids rapid flickering when a person briefly walks on/off screen.
@@ -179,7 +179,7 @@ export async function detectCuts(videoPath: string, startMs: number, endMs: numb
   }
 }
 
-async function detectFaces(tmp: string, videoPath: string, startMs: number, endMs: number, signal?: AbortSignal, lips = false): Promise<FaceInfo> {
+export async function detectFaces(tmp: string, videoPath: string, startMs: number, endMs: number, signal?: AbortSignal, lips = false): Promise<FaceInfo> {
   const framesDir = join(tmp, `frames-${startMs}`)
   await mkdir(framesDir, { recursive: true })
   try {
