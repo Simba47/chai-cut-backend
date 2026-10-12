@@ -11,6 +11,7 @@ import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from '@aws-sd
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { GoogleAuth } from 'google-auth-library'
 import { r2, R2_BUCKET, r2DownloadToFile, r2UploadFile } from '../r2.js'
+import { aiProvider, askGemini } from '../lib/gemini.js'
 import db from '../db.js'
 import type { Job, TranscribeJobPayload } from '../types.js'
 import { queueProxy } from './proxy.js'
@@ -1137,6 +1138,9 @@ function detectSarvamLang(text: string): string | undefined {
   return undefined
 }
 
+/** Gemini's answer for the script conversions: one string per input word */
+const STRING_LIST = { type: 'ARRAY', items: { type: 'STRING' } }
+
 // Gemini batch transliteration → natural Tenglish / Hinglish (how people type it on
 // WhatsApp/YouTube), English loanwords in normal English spelling. One output per
 // input word, same order; any batch that doesn't come back 1:1 is left undefined so
@@ -1157,37 +1161,19 @@ async function transliterateWithGemini(
     // instructions — one retry before falling back recovers most of these for free.
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        // gemini-2.5-flash writes the most natural Tenglish in tests; Google has started retiring
-        // 2.5 models for new accounts, so fall back to the always-current Flash alias on 404
-        let res: Response | undefined
-        for (const model of ['gemini-2.5-flash', 'gemini-flash-latest']) {
-          res = await fetchWithTimeout(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-            method: 'POST',
-            headers: { 'x-goog-api-key': GEMINI_API_KEY!, 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              systemInstruction: { parts: [{ text:
+        // gemini-2.5-flash writes the most natural Tenglish in tests
+        const out = await askGemini(JSON.stringify(words), {
+          system:
 `You convert ${langName} caption words into ${style}: the way ${langName} speakers write their language in English letters on WhatsApp or YouTube comments.
 Rules:
 - Exactly one output string per input word, same order. Never merge, split, drop or add words.
 - Use common, natural spellings (e.g. నుంచి → "nunchi", నేను → "nenu", ఏమైంది → "emaindi", మనదే → "manade"), not academic transliteration and no diacritics.
 - English words written in ${langName} script get their normal English spelling (ఇట్స్ → "it's", ట్రూ → "true", కాటన్ → "cotton", యాక్టర్స్ → "actors", యాడ్ → "ad").
 - Numbers and words already in English letters stay as they are. Drop trailing punctuation.
-- Lowercase, except names and the pronoun "I".` }] },
-              contents: [{ role: 'user', parts: [{ text: JSON.stringify(words) }] }],
-              generationConfig: {
-                temperature: 0,
-                responseMimeType: 'application/json',
-                responseSchema: { type: 'ARRAY', items: { type: 'STRING' } },
-                thinkingConfig: { thinkingBudget: 0 },
-              },
-            }),
-          }, 60_000)
-          if (res.status !== 404) break
-        }
-        if (!res!.ok) throw new Error(`Gemini ${res!.status}: ${(await res!.text()).slice(0, 200)}`)
-        const data = await res!.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] }
-        const arr = JSON.parse(data.candidates?.[0]?.content?.parts?.[0]?.text ?? '[]') as unknown[]
+- Lowercase, except names and the pronoun "I".`,
+          schema: STRING_LIST, temperature: 0, thinkingBudget: 0, timeoutMs: 60_000,
+        })
+        const arr = JSON.parse(out || '[]') as unknown[]
         if (!Array.isArray(arr) || arr.length !== batch.length) {
           throw new Error(`expected ${batch.length} words, got ${Array.isArray(arr) ? arr.length : 'non-array'}`)
         }
@@ -1220,7 +1206,7 @@ const LATIN = /[A-Za-z]/
 export async function toNativeScript(entries: SarvamWord[], languageCode: string): Promise<(string | undefined)[]> {
   const out: (string | undefined)[] = new Array(entries.length).fill(undefined)
   const langName = LANG_NAMES[languageCode]
-  if (!langName || !GEMINI_API_KEY) return out
+  if (!langName || !aiProvider()) return out
   const todo = entries
     .map((e, i) => ({ i, word: e.word.trim() }))
     .filter(x => LATIN.test(x.word) && !NATIVE_SCRIPT.test(x.word))
@@ -1235,33 +1221,16 @@ export async function toNativeScript(entries: SarvamWord[], languageCode: string
       return { core: m[1], tail: m[2] }
     })
     try {
-      let res: Response | undefined
-      for (const model of ['gemini-2.5-flash', 'gemini-flash-latest']) {
-        res = await fetchWithTimeout(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-            method: 'POST',
-            headers: { 'x-goog-api-key': GEMINI_API_KEY!, 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              systemInstruction: { parts: [{ text:
+      const answer = await askGemini(JSON.stringify(split.map(x => x.core)), {
+        system:
 `You write English words in ${langName} script, the way ${langName} captions and news write English words spoken in a ${langName} video (phonetically, as ${langName} speakers pronounce them).
 Rules:
 - Exactly one output string per input word, same order. Never merge, split, drop or add words.
 - Spell by sound in ${langName} script${langName === 'Telugu' ? ' (so → "సో", think → "థింక్", actually → "యాక్చువల్లీ", I → "ఐ", it\'s → "ఇట్స్", brand → "బ్రాండ్", YouTube → "యూట్యూబ్")' : ''}.
-- Numbers stay as digits. Keep capital-letter brand names readable by sound. No English letters in the output unless the input is only digits.` }] },
-              contents: [{ role: 'user', parts: [{ text: JSON.stringify(split.map(x => x.core)) }] }],
-              generationConfig: {
-                temperature: 0,
-                responseMimeType: 'application/json',
-                responseSchema: { type: 'ARRAY', items: { type: 'STRING' } },
-                thinkingConfig: { thinkingBudget: 0 },
-              },
-            }),
-          }, 60_000)
-        if (res.status !== 404) break
-      }
-      if (!res!.ok) throw new Error(`Gemini ${res!.status}: ${(await res!.text()).slice(0, 200)}`)
-      const data = await res!.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] }
-      const arr = JSON.parse(data.candidates?.[0]?.content?.parts?.[0]?.text ?? '[]') as unknown[]
+- Numbers stay as digits. Keep capital-letter brand names readable by sound. No English letters in the output unless the input is only digits.`,
+        schema: STRING_LIST, temperature: 0, thinkingBudget: 0, timeoutMs: 60_000,
+      })
+      const arr = JSON.parse(answer || '[]') as unknown[]
       if (!Array.isArray(arr) || arr.length !== batch.length) {
         throw new Error(`expected ${batch.length} words, got ${Array.isArray(arr) ? arr.length : 'non-array'}`)
       }
@@ -1324,7 +1293,7 @@ async function transliterateToRoman(
 
   // Gemini gives natural Tenglish/Hinglish (e.g. "nunchi", not "numchi"); words it
   // couldn't convert are filled from the fallback
-  if (GEMINI_API_KEY) {
+  if (aiProvider()) {
     const viaGemini = await transliterateWithGemini(entries, lang)
     if (viaGemini.every(Boolean)) return viaGemini
     const fb = await fallback()
