@@ -294,14 +294,51 @@ export function lazyFollow(values: number[], cropW: number, resets: number[] = [
   return out
 }
 
-/** Motion turned off: one still position per shot (the median of where the crop would look) */
-export function holdStill(values: number[], resets: number[] = []): number[] {
+/**
+ * Motion turned off: one still position per stretch (the median of where the crop would look).
+ * Stretches start at camera cuts (`resets`) and where the subject jumps across the frame
+ * (`jumps`: another person, or a detection blip). A jump stretch shorter than `minLen` frames
+ * joins its neighbour in the same shot, so a blip never flicks the crop away and back.
+ */
+export function holdStill(values: number[], resets: number[] = [], jumps: number[] = [], minLen = 0): number[] {
+  const hard = new Set(resets)
+  const starts = [...new Set([0, ...resets, ...jumps].filter(r => r >= 0 && r < values.length))].sort((a, b) => a - b)
+  const parts = starts.map((from, i) => ({ from, to: starts[i + 1] ?? values.length }))
+  for (;;) {
+    // The shortest stretch that can join a neighbour (one not across a camera cut)
+    const pick = parts
+      .map((p, i) => ({ p, i, len: p.to - p.from }))
+      .filter(({ p, i, len }) => len < minLen && ((i > 0 && !hard.has(p.from)) || (i < parts.length - 1 && !hard.has(parts[i + 1].from))))
+      .sort((a, b) => a.len - b.len)[0]
+    if (!pick) break
+    const { p, i } = pick
+    const prevOk = i > 0 && !hard.has(p.from)
+    const nextOk = i < parts.length - 1 && !hard.has(parts[i + 1].from)
+    const intoPrev = prevOk && (!nextOk || parts[i - 1].to - parts[i - 1].from >= parts[i + 1].to - parts[i + 1].from)
+    if (intoPrev) parts[i - 1].to = p.to
+    else parts[i + 1].from = p.from
+    parts.splice(i, 1)
+  }
   const out: number[] = []
-  const bounds = [0, ...resets.filter(r => r > 0 && r < values.length), values.length]
-  for (let b = 0; b < bounds.length - 1; b++) {
-    const part = values.slice(bounds[b], bounds[b + 1])
-    const m = median(part)
-    out.push(...part.map(() => m))
+  for (const p of parts) {
+    const m = median(values.slice(p.from, p.to))
+    for (let i = p.from; i < p.to; i++) out.push(m)
+  }
+  return out
+}
+
+/**
+ * Motion turned off: the crop jumps from one held position to the next (a hold keyframe 1 ms
+ * before each change, the way the editor makes a cut) instead of the renderer gliding between
+ * two keyframes a quarter second apart. Repeats of the same position are dropped.
+ */
+export function asCuts(kfs: SlotKf[]): SlotKf[] {
+  const out: SlotKf[] = []
+  for (const k of kfs) {
+    const prev = out[out.length - 1]
+    if (prev && prev.x === k.x && prev.y === k.y && prev.w === k.w && prev.h === k.h) continue
+    if (prev && k.t_ms - 1 > prev.t_ms) out.push({ ...prev, t_ms: k.t_ms - 1 })
+    out.push(k)
   }
   return out
 }
@@ -1341,7 +1378,8 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number, op
     }
   })
 
-  // Step 4: one ClipSegment per group, with keyframes smoothed between cuts
+  // Step 4: one ClipSegment per group, with keyframes smoothed between cuts (Motion off: held
+  // positions joined by cuts, never a glide)
   const built: ClipSegment[] = groups.map((g, gi) => {
     const start_ms = gi === 0 ? 0 : g.start_ms
     const end_ms = groups[gi + 1]?.start_ms ?? clipDurationMs
@@ -1356,7 +1394,7 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number, op
       const resets = [...new Set([...g.resets, ...jumps])].sort((a, b) => a - b)
       // A huge-motion shot: the crop holds still and only glides when the main character nears its edge
       const cx = opts.motion === false
-        ? holdStill(raw, resets)
+        ? holdStill(raw, g.resets, jumps, minSpeakerFrames)
         : g.layout === 'vertical' && g.frames.every(f => calmPath.has(f))
           ? lazyFollow(raw, reelW, resets)
           : stabilise(raw, resets)
@@ -1389,7 +1427,7 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number, op
       }
       return g.frames.map((f, i) => g.layout === 'vertical' ? vertKf(kfTime(f, i), cx[i]) : splitKf(kfTime(f, i), cx[i]))
     })
-    return { start_ms, end_ms, layout: g.layout, slotKfs }
+    return { start_ms, end_ms, layout: g.layout, slotKfs: opts.motion === false ? slotKfs.map(asCuts) : slotKfs }
   })
   // Interviews filmed one person per camera: reactions across shots
   if (!REACTIONS || opts.layouts === false) return built

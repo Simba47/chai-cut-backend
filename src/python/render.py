@@ -1815,14 +1815,14 @@ def main(
             t1   = ov.get("end_ms", clip_dur_ms) / 1000.0
             slbl = f"[img{oi}s]"
             olbl = f"[vov{oi}]"
-            # The whole photo inside its box, in its own shape (the preview shows it so: object-fit
-            # contain), in the box's middle; turned round that middle when it was rotated
+            # The whole photo stretched to fill its box, whatever its width and height (the preview
+            # shows it so: object-fit fill), in the box's middle; turned round that middle when it was rotated
             rot = float(ov.get("rotation") or 0) % 360
             turn = ""
             if rot:
                 rad = f"{rot * 3.141592653589793 / 180:.6f}"
                 turn = f",format=rgba,rotate={rad}:c=none:ow=rotw({rad}):oh=roth({rad})"
-            fp.append(f"{img_lbl}scale={iw}:{ih}:force_original_aspect_ratio=decrease:flags=lanczos{turn}{slbl}")
+            fp.append(f"{img_lbl}scale={iw}:{ih}:flags=lanczos,setsar=1{turn}{slbl}")
             fp.append(
                 f"{cur}{slbl}overlay=x={ix + iw / 2:.1f}-overlay_w/2:y={iy + ih / 2:.1f}-overlay_h/2"
                 f":enable='between(t,{t0:.3f},{t1:.3f})'{olbl}"
