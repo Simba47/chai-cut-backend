@@ -15,7 +15,88 @@ FRAME_TEMPLATES: dict[str, list[tuple[str, int | None, float]]] = {
     "frame_title_caption":  [("band", None, 0.16), ("slot", 0, 0.68), ("caption", None, 0.16)],
     "frame_big_small":      [("slot", 0, 0.70), ("slot", 1, 0.30)],
     "frame_photo_story":    [("band", None, 0.16), ("slot", 0, 0.42), ("slot", 1, 0.42)],
+    # Stacked frames added 2026-10 (their row options are in AREA_LOOKS below)
+    "frame_gameplay":       [("slot", 0, 0.50), ("slot", 1, 0.50)],
+    "frame_screenshot":     [("slot", 0, 0.42), ("slot", 1, 0.58)],
+    "frame_letterbox_wide": [("band", None, 0.34), ("slot", 0, 0.32), ("caption", None, 0.34)],
+    "frame_two_crops":      [("slot", 0, 0.50), ("slot", 1, 0.50)],
 }
+
+# Options of a stacked frame's rows, by row index: a slot showing its media whole ("contain") on a
+# fill colour. Mirrors the rows' fit / fill in the editor's frames.ts.
+ROW_LOOKS: dict[str, dict[int, dict]] = {
+    "frame_screenshot": {0: {"fit": "contain", "fill": "#111111"}},
+}
+
+# Frames whose areas sit anywhere (side by side, a grid, a floating box): shares of the 1080×1920
+# frame, drawn in this order (later ones on top). kind "slot" (slot), "band" (lane "band" or
+# "band2": a text area), "caption" (a strip for the captions), "wave" (the sound wave). Options:
+# fit "contain" (media shown whole), fill (a slot's colour where media doesn't cover it; "none":
+# see-through), bg / color / size (a text area's colour when empty and new text's look), radius (px
+# at 1080 wide, or "circle"), ticker (the text scrolls). Mirrors FRAME_TEMPLATES[...].areas in the
+# editor's frames.ts — keep the numbers in step.
+FREE_TEMPLATES: dict[str, list[dict]] = {
+    "frame_blur_fill": [
+        {"kind": "band", "lane": "band", "x": 0, "y": 0, "w": 1, "h": 0.22, "bg": "none"},
+        {"kind": "slot", "slot": 0, "x": 0, "y": 0.22, "w": 1, "h": 0.56, "fit": "contain", "fill": "none"},
+        {"kind": "caption", "x": 0, "y": 0.78, "w": 1, "h": 0.22, "bg": "none"},
+    ],
+    "frame_pip": [
+        {"kind": "slot", "slot": 0, "x": 0, "y": 0, "w": 1, "h": 1},
+        {"kind": "slot", "slot": 1, "x": 0.58, "y": 0.66, "w": 0.36, "h": 0.2025, "radius": 36},
+    ],
+    "frame_comment": [
+        {"kind": "slot", "slot": 0, "x": 0, "y": 0, "w": 1, "h": 1},
+        {"kind": "band", "lane": "band", "x": 0.07, "y": 0.1, "w": 0.86, "h": 0.13, "radius": 28, "bg": "#ffffff", "color": "#111111", "size": 46},
+    ],
+    "frame_side_by_side": [
+        {"kind": "band", "lane": "band", "x": 0, "y": 0, "w": 1, "h": 0.18},
+        {"kind": "slot", "slot": 0, "x": 0, "y": 0.18, "w": 0.5, "h": 0.64},
+        {"kind": "slot", "slot": 1, "x": 0.5, "y": 0.18, "w": 0.5, "h": 0.64},
+        {"kind": "caption", "x": 0, "y": 0.82, "w": 1, "h": 0.18},
+    ],
+    "frame_name_tags": [
+        {"kind": "slot", "slot": 0, "x": 0, "y": 0, "w": 1, "h": 0.5},
+        {"kind": "slot", "slot": 1, "x": 0, "y": 0.5, "w": 1, "h": 0.5},
+        {"kind": "band", "lane": "band", "x": 0.04, "y": 0.41, "w": 0.56, "h": 0.065, "radius": 14, "bg": "#111111", "size": 44},
+        {"kind": "band", "lane": "band2", "x": 0.04, "y": 0.91, "w": 0.56, "h": 0.065, "radius": 14, "bg": "#111111", "size": 44},
+    ],
+    "frame_brand_card": [
+        {"kind": "band", "lane": "band", "x": 0.06, "y": 0.05, "w": 0.88, "h": 0.15, "bg": "none"},
+        {"kind": "slot", "slot": 0, "x": 0.06, "y": 0.21, "w": 0.88, "h": 0.6, "radius": 40},
+        {"kind": "band", "lane": "band2", "x": 0.06, "y": 0.83, "w": 0.88, "h": 0.1, "bg": "none", "size": 40},
+    ],
+    "frame_top_list": [
+        {"kind": "band", "lane": "band", "x": 0, "y": 0, "w": 1, "h": 0.16},
+        {"kind": "slot", "slot": 0, "x": 0, "y": 0.16, "w": 1, "h": 0.84},
+        {"kind": "band", "lane": "band2", "x": 0.05, "y": 0.19, "w": 0.2, "h": 0.1, "radius": 24, "bg": "#c8ff00", "color": "#000000", "size": 96},
+    ],
+    "frame_screen_face": [
+        {"kind": "slot", "slot": 0, "x": 0, "y": 0, "w": 1, "h": 0.62, "fit": "contain", "fill": "#000000"},
+        {"kind": "slot", "slot": 1, "x": 0.3, "y": 0.66, "w": 0.4, "h": 0.225, "radius": "circle"},
+        {"kind": "caption", "x": 0, "y": 0.89, "w": 1, "h": 0.11},
+    ],
+    "frame_audiogram": [
+        {"kind": "band", "lane": "band", "x": 0, "y": 0, "w": 1, "h": 0.16},
+        {"kind": "slot", "slot": 0, "x": 0.15, "y": 0.18, "w": 0.7, "h": 0.39375, "radius": 32},
+        {"kind": "wave", "x": 0.1, "y": 0.6, "w": 0.8, "h": 0.12, "color": "#c8ff00"},
+        {"kind": "caption", "x": 0, "y": 0.76, "w": 1, "h": 0.2},
+    ],
+    "frame_grid": [
+        {"kind": "slot", "slot": 0, "x": 0, "y": 0, "w": 0.5, "h": 0.5},
+        {"kind": "slot", "slot": 1, "x": 0.5, "y": 0, "w": 0.5, "h": 0.5},
+        {"kind": "slot", "slot": 2, "x": 0, "y": 0.5, "w": 0.5, "h": 0.5},
+        {"kind": "slot", "slot": 3, "x": 0.5, "y": 0.5, "w": 0.5, "h": 0.5},
+    ],
+    "frame_news": [
+        {"kind": "slot", "slot": 0, "x": 0, "y": 0, "w": 1, "h": 1},
+        {"kind": "band", "lane": "band", "x": 0, "y": 0.7, "w": 1, "h": 0.09, "bg": "#dc2626", "color": "#ffffff", "size": 56},
+        {"kind": "band", "lane": "band2", "x": 0, "y": 0.79, "w": 1, "h": 0.05, "bg": "#111111", "color": "#ffffff", "size": 38, "ticker": True},
+    ],
+}
+
+# Under a frame's areas: a blurred copy of the main video, or the band's colour (default black)
+FRAME_BASE: dict[str, str] = {"frame_blur_fill": "blur", "frame_brand_card": "band"}
 
 MOTIONS = {"none", "zoom_in", "zoom_out", "pan_left", "pan_right"}
 
@@ -36,12 +117,59 @@ def corner_geometry(v) -> tuple[float, float] | None:
 
 
 def is_frame(layout: str | None) -> bool:
-    return bool(layout) and layout in FRAME_TEMPLATES
+    return bool(layout) and (layout in FRAME_TEMPLATES or layout in FREE_TEMPLATES)
+
+
+def _even(v: float) -> int:
+    return int(round(v / 2)) * 2
+
+
+def frame_areas(layout: str, out_w: int, out_h: int, show_band: bool = True, custom: list[float] | None = None) -> list[dict]:
+    """
+    Every area of a frame in drawing order, in even pixels: {kind, slot / lane, x, y, w, h, r (corner
+    radius px), and the area's options}. A stacked frame's rows are full-width areas (their heights
+    from frame_rows, so they add up exactly); a free frame's areas are placed where the template says.
+    Mirrors frameAreas() in the editor.
+    """
+    if layout in FREE_TEMPLATES:
+        out: list[dict] = []
+        k = out_w / 1080
+        for a in FREE_TEMPLATES[layout]:
+            if a["kind"] == "band" and not show_band:
+                continue
+            x, y = _even(a["x"] * out_w), _even(a["y"] * out_h)
+            w = min(out_w - x, max(2, _even((a["x"] + a["w"]) * out_w) - x))
+            h = min(out_h - y, max(2, _even((a["y"] + a["h"]) * out_h) - y))
+            rad = a.get("radius")
+            r = min(w, h) // 2 if rad == "circle" else int(round(float(rad or 0) * k))
+            out.append({**a, "x": x, "y": y, "w": w, "h": h, "r": min(r, w // 2, h // 2)})
+        return out
+    looks = ROW_LOOKS.get(layout, {})
+    tpl_rows = FRAME_TEMPLATES[layout]
+    # The rows that are shown, with the index each has in the template (for its options)
+    shown = [i for i, (kind, _, _) in enumerate(tpl_rows) if show_band or kind != "band"]
+    out, y = [], 0
+    for i, (kind, slot, h) in zip(shown, frame_rows(layout, out_h, show_band, custom)):
+        area = {**looks.get(i, {}), "kind": kind, "x": 0, "y": y, "w": out_w, "h": h, "r": 0}
+        if kind == "slot":
+            area["slot"] = slot
+        elif kind == "band":
+            area["lane"] = "band"
+        out.append(area)
+        y += h
+    return out
+
+
+def frame_base(layout: str | None) -> str | None:
+    """What's under a frame's areas: 'blur' (a blurred copy of the main video), 'band' (the band's colour) or None (black)."""
+    return FRAME_BASE.get(layout or "")
 
 
 def row_heights(seg: dict) -> list[float] | None:
     """A frame's resized row heights (frame.row_h), if they fit its template; else None. Mirrors validRowHeights() in the editor."""
     custom = (seg.get("frame") or {}).get("row_h")
+    if (seg.get("layout") or "") in FREE_TEMPLATES:
+        return None  # a free frame's areas don't resize
     tpl = FRAME_TEMPLATES.get(seg.get("layout") or "")
     if not tpl or not isinstance(custom, list) or len(custom) != len(tpl):
         return None
@@ -141,7 +269,7 @@ def frame_state(seg: dict) -> dict:
                 main_volume = b.get("volume") if b.get("volume") is not None else 1.0
                 main_muted = bool(b.get("muted"))
     band = f.get("band") or {}
-    if (band.get("text") or "").strip():
+    if (band.get("text") or "").strip() and any(a.get("lane") == "band" for a in frame_areas(seg.get("layout") or "", 1080, 1920)):
         items.append({"id": "legacy-band", "kind": "text", "lane": "band", "start_ms": s0, "end_ms": s1,
                       "text": band["text"], "bg": band.get("bg"), "color": band.get("color"), "size": band.get("size")})
     return {"band": {**band, "text": ""}, "main_slots": main, "main_volume": main_volume,
@@ -170,7 +298,7 @@ def lane_items(seg: dict, state: dict, lane) -> list[dict]:
 def frame_band_shown(seg: dict) -> bool:
     """Frames whose template has a band always show it: a solid space for text (editor: frameBandShown)."""
     layout = seg.get("layout")
-    return is_frame(layout) and any(kind == "band" for kind, _, _ in FRAME_TEMPLATES[layout])
+    return is_frame(layout) and any(a["kind"] == "band" for a in frame_areas(layout, 1080, 1920))
 
 
 def caption_band_zones(segments: list[dict], out_h: int) -> list[tuple[int, int, int]]:
@@ -182,15 +310,13 @@ def caption_band_zones(segments: list[dict], out_h: int) -> list[tuple[int, int,
         layout = seg.get("layout")
         if not is_frame(layout):
             continue
-        y = 0
         centre = None
         strip = None
-        for kind, _, h in frame_rows(layout, out_h, True, row_heights(seg)):
-            if kind == "band":
-                centre = y + h // 2
-            elif kind == "caption":
-                strip = y + h // 2
-            y += h
+        for a in frame_areas(layout, 1080, out_h, True, row_heights(seg)):
+            if a["kind"] == "band" and a.get("lane") == "band":
+                centre = a["y"] + a["h"] // 2
+            elif a["kind"] == "caption":
+                strip = a["y"] + a["h"] // 2
         s0 = int(seg["start_ms"])
         if centre is not None:
             for it in lane_items(seg, frame_state(seg), "band"):

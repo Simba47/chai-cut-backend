@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges, heard_speech_ranges
 import emoji as emoji_art   # colour emoji (Twemoji 17), drawn locally
-from frames import is_frame, frame_rows, row_heights, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry
+from frames import is_frame, row_heights, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base
 
 # ── Quality presets (identical to previous version) ───────────────────────────
 _QUALITY: dict[int, dict] = {
@@ -527,6 +527,30 @@ def _box_mask(tmp: str, w: int, h: int, x: int, y: int, bw: int, bh: int, r: int
     return path
 
 
+def _even(v: float) -> int:
+    return max(2, int(round(v / 2)) * 2)
+
+
+def _round_alpha_png(tmp: str, w: int, h: int, r: int) -> str:
+    """A w×h grayscale mask: white inside a rounded box (corner radius r; r = half the shorter side:
+    a circle), black outside. alphamerge'd onto an area it makes the corners see-through."""
+    path = os.path.join(tmp, f"round_{w}x{h}_{r}.png")
+    if os.path.exists(path):
+        return path
+    from PIL import Image, ImageDraw
+    k = 4  # drawn 4× and scaled down: smooth edges
+    big = Image.new("L", (w * k, h * k), 0)
+    ImageDraw.Draw(big).rounded_rectangle((0, 0, w * k - 1, h * k - 1), radius=r * k, fill=255)
+    big.resize((w, h), Image.LANCZOS).save(path)
+    return path
+
+
+def _scale_contain(w: int, h: int) -> str:
+    """Scale to fit inside w×h and centre it there on see-through (rgba): the media shown whole."""
+    return (f"scale=w={w}:h={h}:flags=lanczos:force_original_aspect_ratio=decrease,setsar=1,format=rgba,"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0")
+
+
 def _main_box_px(rect, w: int, h: int) -> tuple[int, int, int, int] | None:
     """The main video's resized box in a w×h slot as even pixels (x, y, bw, bh); None = the whole slot. Mirrors mainRect() in the editor."""
     if not isinstance(rect, dict):
@@ -723,27 +747,47 @@ def _turned_frame_text_png(lines: list[str], font_path: str, size: int, color: s
     return path
 
 
+# A ticker's speed: px a second at 1080 wide (the editor's TICKER_PX_S)
+_TICKER_PX_S = 160
+
+
 def _frame_text_chain(fp: list[str], inputs: list[str], next_input: int, key: str,
                       text: str, bg: str, color: str, size_1080: int, w: int, h: int, dur_s: float,
                       cx: float = 0.5, cy: float = 0.5, box_w: float | None = None,
-                      rotation: float = 0.0) -> tuple[str, int]:
+                      rotation: float = 0.0, frame_w: int | None = None, default_w: float | None = None,
+                      ticker: bool = False) -> tuple[str, int]:
     """A solid w×h card with wrapped text centred on (cx, cy) — shares of the card, set by dragging
     it in the editor; the text wraps inside its box's width (`box_w`, a share of the frame's) and
     is turned by `rotation` degrees. Appends its filter statements onto `fp` (and any emoji PNG
     inputs onto `inputs`, same scheme as the main text_overlays loop) and returns the finished
-    node's label plus the updated next_input counter."""
+    node's label plus the updated next_input counter. `bg` "none": see-through (rgba); the text is
+    sized by the frame's width (`frame_w`, not the card's); `default_w`: its box width when none was
+    set (a share of the frame: the area's width × 0.88); `ticker`: one line scrolling in from the right."""
     base_lbl = f"[{key}base]"
-    fp.append(f"color=c=0x{bg}:s={w}x{h}:d={dur_s:.3f}:r=30,format=yuv420p{base_lbl}")
+    if bg == "none":
+        fp.append(f"color=c=black@0:s={w}x{h}:d={dur_s:.3f}:r=30,format=rgba{base_lbl}")
+    else:
+        fp.append(f"color=c=0x{bg}:s={w}x{h}:d={dur_s:.3f}:r=30,format=yuv420p{base_lbl}")
     cur = base_lbl
     text = (text or "").strip()
     font = _frame_text_font(text) if text else ""
     ridx = 0
+    if text and font and ticker:
+        # One line, scrolling in from the right and out to the left, over and over
+        size = max(8, int(round(size_1080 * (frame_w or w) / 1080)))
+        line = " ".join(x.strip() for x in text.splitlines() if x.strip())
+        speed = _TICKER_PX_S * (frame_w or w) / 1080
+        olbl = f"[{key}tk]"
+        fp.append(f"{cur}drawtext=fontfile='{font}':{_text_opt(line)}:fontsize={size}:fontcolor=0x{color}"
+                  f":x=w-mod(t*{speed:.2f}\\,w+tw):y={int(cy * h - size / 2)}{olbl}")
+        cur = olbl
+        text = ""
     if text and font:
-        size = max(8, int(round(size_1080 * w / 1080)))
+        size = max(8, int(round(size_1080 * (frame_w or w) / 1080)))
         # `font` is escaped for the filter (Windows drive letters): Pillow needs the plain path
         plain_font = font.replace("\\:", ":")
         # Wrapped at 1080-wide scale, like the editor preview, so lines break in the same places
-        lines = _frame_text_lines(text, size_1080, box_w, plain_font)
+        lines = _frame_text_lines(text, size_1080, box_w or default_w, plain_font)
         if rotation and abs(rotation) >= 0.05 and lines:
             # Turned: drawn as one picture, turned round the text's centre, placed on it
             png = _turned_frame_text_png(lines, plain_font, size, color, rotation)
@@ -1200,9 +1244,12 @@ def main(
             if is_frame(seg.get("layout")):
                 # Only slots showing the main video read it; lane items are inputs of their own
                 main_slots = set(frame_state(seg).get("main_slots") or [])
-                for kind, slot, _ in frame_rows(seg["layout"], out_h, frame_band_shown(seg), row_heights(seg)):
-                    if kind == "slot" and slot in main_slots:
+                for a in frame_areas(seg["layout"], out_w, out_h, frame_band_shown(seg), row_heights(seg)):
+                    if a["kind"] == "slot" and a["slot"] in main_slots:
                         slot_counts[None] = slot_counts.get(None, 0) + 1
+                # A blurred copy of the main video under the frame (Blur fill) reads it once more
+                if frame_base(seg["layout"]) == "blur":
+                    slot_counts[None] = slot_counts.get(None, 0) + 1
                 continue
             n_slots = {"split": 2, "trio": 3}.get(seg.get("layout", "vertical"), 1)
             # For B-roll INSERT segments, remember the primary (slot-0) source so empty
@@ -1263,10 +1310,10 @@ def main(
             if not is_frame(seg.get("layout")):
                 continue
             st = frame_state(seg)
-            for kind, slot, _ in frame_rows(seg["layout"], out_h, frame_band_shown(seg), row_heights(seg)):
-                if kind != "slot":
+            for area in frame_areas(seg["layout"], out_w, out_h, frame_band_shown(seg), row_heights(seg)):
+                if area["kind"] != "slot":
                     continue
-                for it in lane_items(seg, st, slot):
+                for it in lane_items(seg, st, area["slot"]):
                     if it.get("hidden"):
                         continue  # kept only for its sound (the mix reads it on its own)
                     if it.get("kind") == "video" and it.get("source_video_id") in secondary_videos:
@@ -1362,9 +1409,9 @@ def main(
                 dur_s = dur_ms / 1000.0
                 st = frame_state(seg)
 
-                def media_box(corners, rect, rh: int) -> tuple[int, int, int, int, int, bool]:
+                def media_box(corners, rect, aw: int, rh: int) -> tuple[int, int, int, int, int, bool]:
                     """
-                    Where media goes in a slot of height rh: (width, height) it's scaled to, its top-left
+                    Where media goes in a slot aw×rh: (width, height) it's scaled to, its top-left
                     (px, py), the corner radius r, and whether it's set on black at all (False = it
                     fills the slot edge to edge). `rect`: its box when resized / moved; `corners`: its
                     rounded border.
@@ -1372,48 +1419,95 @@ def main(
                     g = corner_geometry(corners)
                     m = max(2, int(round(g[0] * out_w / 1080 / 2)) * 2) if g else 0
                     r = max(2, int(round(g[1] * out_w / 1080))) if g else 0
-                    px_box = _main_box_px(rect, out_w, rh)
-                    bx, by, bw, bh = px_box or (0, 0, out_w, rh)
+                    px_box = _main_box_px(rect, aw, rh)
+                    bx, by, bw, bh = px_box or (0, 0, aw, rh)
                     iw, ih = max(2, bw - 2 * m), max(2, bh - 2 * m)
                     return iw, ih, bx + m, by + m, min(r, iw // 2, ih // 2), bool(m or px_box)
 
-                def placed(chain: str, rh: int, iw: int, ih: int, px: int, py: int, r: int, boxed: bool, key: str) -> str:
+                def placed(chain: str, aw: int, rh: int, iw: int, ih: int, px: int, py: int, r: int, boxed: bool, key: str) -> str:
                     """Media (already iw×ih) set at its place in the slot on black, with rounded corners when it has them."""
                     if not boxed:
                         return chain
-                    fp.append(f"{chain},pad={out_w}:{rh}:{px}:{py}:color=black,format=yuv420p[{key}p]")
+                    fp.append(f"{chain},pad={aw}:{rh}:{px}:{py}:color=black,format=yuv420p[{key}p]")
                     if not r:
                         return f"[{key}p]setsar=1"
-                    mask = _box_mask(tmp, out_w, rh, px, py, iw, ih, r)
+                    mask = _box_mask(tmp, aw, rh, px, py, iw, ih, r)
                     fp.append(f"movie=filename={_filter_path(mask)},format=rgba[{key}k]")
                     return f"[{key}p][{key}k]overlay=0:0,format=yuv420p,setsar=1"
 
+                def canvas(colour: str, aw: int, ah: int, lbl: str) -> None:
+                    """A plain aw×ah area of one colour ("none": see-through)"""
+                    if colour == "none":
+                        fp.append(f"color=c=black@0:s={aw}x{ah}:d={dur_s:.3f}:r=30,format=rgba,setsar=1{lbl}")
+                    else:
+                        fp.append(f"color=c=0x{_hex6(colour, '000000')}:s={aw}x{ah}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{lbl}")
+
                 main_slots = set(st.get("main_slots") or [])
                 band = st.get("band") or {}
-                band_bg = _hex6(band.get("bg"), "000000")
-                row_lbls: list[str] = []
-                for ri, (kind, slot, rh) in enumerate(frame_rows(layout, out_h, frame_band_shown(seg), row_heights(seg))):
-                    lbl = f"[fr{si}r{ri}]"
-                    cur_row = f"[fr{si}r{ri}b]"
-                    # Underneath: the band colour, the main video (framed by this slot's crop box), or an empty dark slot
-                    if kind in ("band", "caption"):
-                        fp.append(f"color=c=0x{band_bg}:s={out_w}x{rh}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{cur_row}")
-                    elif slot in main_slots:
+                band_bg = "none" if band.get("bg") == "none" else _hex6(band.get("bg"), "000000")
+                # Where the main video starts in this format
+                first_box = next((b for b in boxes if not b.get("source_video_id") and not b.get("image_path")), boxes[0] if boxes else None)
+                base_off = seg.get("video_offset_ms")
+                if base_off is None:
+                    base_off = first_box.get("source_offset_ms") if first_box and first_box.get("source_offset_ms") is not None else smss
+
+                # Underneath: a blurred copy of the main video (Blur fill), the band's colour, or black
+                frame_lbl = f"[fr{si}base]"
+                base_kind = frame_base(layout)
+                if base_kind == "blur":
+                    ts = int(base_off) / 1000.0
+                    bw2, bh2 = _even(out_w * 1.1), _even(out_h * 1.1)
+                    fp.append(f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,"
+                              f"{_scale_cover(bw2, bh2)},crop={out_w}:{out_h},gblur=sigma={out_w / 22:.1f},"
+                              f"colorchannelmixer=rr=0.65:gg=0.65:bb=0.65,format=yuv420p,setsar=1{frame_lbl}")
+                else:
+                    canvas(band_bg if base_kind == "band" and band_bg != "none" else "000000", out_w, out_h, frame_lbl)
+                cur_frame = frame_lbl
+
+                for ri, area in enumerate(frame_areas(layout, out_w, out_h, frame_band_shown(seg), row_heights(seg))):
+                    kind, aw, rh = area["kind"], area["w"], area["h"]
+                    key = f"fr{si}r{ri}"
+                    lbl = f"[{key}]"
+                    cur_row = f"[{key}b]"
+                    contain = area.get("fit") == "contain"
+                    if kind == "wave":
+                        # The clip's sound (the finished mix, input 1, in clip time) as a moving wave
+                        colour = _hex6(area.get("color"), "c8ff00")
+                        fp.append(f"[1:a]atrim=start={smss / 1000:.3f}:duration={dur_s:.3f},asetpts=PTS-STARTPTS,"
+                                  f"showwaves=s={aw}x{rh}:mode=cline:rate=30:colors=0x{colour}:draw=full,format=rgba,setsar=1{cur_row}")
+                    elif kind in ("band", "caption"):
+                        # A text area's (or the caption strip's) own colour, else the band's
+                        own = area.get("bg")
+                        canvas(own if own == "none" else (_hex6(own, band_bg) if own else band_bg), aw, rh, cur_row)
+                    elif area["slot"] in main_slots:
+                        slot = area["slot"]
                         box = next((b for b in boxes if b.get("slot_index") == slot), None)
                         off_ms = seg.get("video_offset_ms")
                         if off_ms is None:
                             off_ms = box.get("source_offset_ms") if box and box.get("source_offset_ms") is not None else smss
                         ts = int(off_ms) / 1000.0
                         iw, ih, px, py, rr, boxed = media_box((st.get("main_corners") or {}).get(str(slot)),
-                                                              (st.get("main_rects") or {}).get(str(slot)), rh)
-                        chain = (f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,"
-                                 f"{_crop_filter(box, smss)},{_scale_cover(iw, ih)},setsar=1,format=yuv420p")
-                        fp.append(f"{placed(chain, rh, iw, ih, px, py, rr, boxed, f'fr{si}r{ri}m')}{cur_row}")
+                                                              (st.get("main_rects") or {}).get(str(slot)), aw, rh)
+                        if contain:
+                            # Shown whole (nothing cropped), on the slot's colour or see-through
+                            canvas(area.get("fill") or "000000", aw, rh, f"[{key}f]")
+                            chain = (f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,"
+                                     f"{_scale_contain(iw, ih)}")
+                            if boxed:
+                                fp.append(f"{chain},pad={aw}:{rh}:{px}:{py}:color=black@0[{key}m]")
+                            else:
+                                fp.append(f"{chain}[{key}m]")
+                            fp.append(f"[{key}f][{key}m]overlay=0:0{cur_row}")
+                        else:
+                            chain = (f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,"
+                                     f"{_crop_filter(box, smss)},{_scale_cover(iw, ih)},setsar=1,format=yuv420p")
+                            fp.append(f"{placed(chain, aw, rh, iw, ih, px, py, rr, boxed, f'{key}m')}{cur_row}")
                     else:
-                        fp.append(f"color=c=0x111111:s={out_w}x{rh}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{cur_row}")
+                        canvas(area.get("fill") or ("000000" if contain else "111111"), aw, rh, cur_row)
 
                     # On top: this lane's items, each only during its own time
-                    for ii, it in enumerate([] if kind == "caption" else lane_items(seg, st, "band" if kind == "band" else slot)):
+                    lane = area.get("lane") if kind == "band" else area.get("slot")
+                    for ii, it in enumerate([] if kind in ("caption", "wave") else lane_items(seg, st, lane)):
                         if it.get("hidden"):
                             continue  # hidden: what's under it shows (its sound, if on, is still mixed)
                         d, rel = it["dur_s"], it["rel_s"]
@@ -1421,44 +1515,67 @@ def main(
                         if ik == "text":
                             if it.get("captions"):
                                 continue  # the captions themselves are moved into the band (see _write_ass)
+                            own = area.get("bg") if kind == "band" else None
+                            fallback = (own if own == "none" else _hex6(own, band_bg)) if own else (band_bg if kind == "band" else "000000")
+                            card_bg = "none" if it.get("bg") == "none" else _hex6(it.get("bg"), fallback) if it.get("bg") else fallback
                             text_lbl, next_input = _frame_text_chain(
-                                fp, inputs, next_input, f"fr{si}r{ri}i{ii}txt",
-                                it.get("text") or "", _hex6(it.get("bg"), band_bg if kind == "band" else "000000"),
-                                _hex6(it.get("color"), "ffffff"), int(it.get("size") or 64), out_w, rh, d,
+                                fp, inputs, next_input, f"{key}i{ii}txt",
+                                it.get("text") or "", card_bg,
+                                _hex6(it.get("color"), "ffffff"), int(it.get("size") or 64), aw, rh, d,
                                 float(it["x"]) if it.get("x") is not None else 0.5,
                                 float(it["y"]) if it.get("y") is not None else 0.5,
                                 float(it["w"]) if it.get("w") else None,
-                                float(it.get("rotation") or 0))
+                                float(it.get("rotation") or 0),
+                                frame_w=out_w, default_w=0.88 * aw / out_w, ticker=bool(area.get("ticker")))
                             chain = f"{text_lbl}null"  # passthrough: the shared epilogue below appends setpts
                         elif ik == "photo" and (si, it["id"]) in frame_item_in:
                             src = frame_item_in[(si, it["id"])]
-                            iw, ih, px, py, rr, boxed = media_box(it.get("corners"), it.get("rect"), rh)
-                            zp = photo_motion_filter(it.get("motion") or "none", iw, ih, d)
-                            if zp:
+                            iw, ih, px, py, rr, boxed = media_box(it.get("corners"), it.get("rect"), aw, rh)
+                            zp = "" if contain else photo_motion_filter(it.get("motion") or "none", iw, ih, d)
+                            if contain:
+                                chain = f"{src}{_scale_contain(iw, ih)},trim=duration={d:.3f},setpts=PTS-STARTPTS"
+                                if boxed:
+                                    chain = f"{chain},pad={aw}:{rh}:{px}:{py}:color=black@0"
+                            elif zp:
                                 chain = (f"{src}scale={iw * 2}:{ih * 2}:force_original_aspect_ratio=increase,crop={iw * 2}:{ih * 2},"
                                          f"{zp},setsar=1,format=yuv420p,trim=duration={d:.3f},setpts=PTS-STARTPTS")
+                                chain = placed(chain, aw, rh, iw, ih, px, py, rr, boxed, f"{key}i{ii}c")
                             else:
                                 chain = f"{src}{_scale_cover(iw, ih)},setsar=1,format=yuv420p,trim=duration={d:.3f},setpts=PTS-STARTPTS"
-                            chain = placed(chain, rh, iw, ih, px, py, rr, boxed, f"fr{si}r{ri}i{ii}c")
+                                chain = placed(chain, aw, rh, iw, ih, px, py, rr, boxed, f"{key}i{ii}c")
                         elif ik == "video" and (si, it["id"]) in frame_item_in:
                             src = frame_item_in[(si, it["id"])]
-                            iw, ih, px, py, rr, boxed = media_box(it.get("corners"), it.get("rect"), rh)
-                            chain = f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{_scale_cover(iw, ih)},setsar=1,format=yuv420p"
-                            chain = placed(chain, rh, iw, ih, px, py, rr, boxed, f"fr{si}r{ri}i{ii}c")
+                            iw, ih, px, py, rr, boxed = media_box(it.get("corners"), it.get("rect"), aw, rh)
+                            if contain:
+                                chain = f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{_scale_contain(iw, ih)}"
+                                if boxed:
+                                    chain = f"{chain},pad={aw}:{rh}:{px}:{py}:color=black@0"
+                            else:
+                                chain = f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{_scale_cover(iw, ih)},setsar=1,format=yuv420p"
+                                chain = placed(chain, aw, rh, iw, ih, px, py, rr, boxed, f"{key}i{ii}c")
                         else:
                             print(f"[render] frame item skipped (media missing): {ik} {it.get('id')}", flush=True)
                             continue
-                        il, ol = f"[fr{si}r{ri}i{ii}]", f"[fr{si}r{ri}o{ii}]"
+                        il, ol = f"[{key}i{ii}]", f"[{key}o{ii}]"
                         fp.append(f"{chain},setpts=PTS+{rel:.3f}/TB{il}")
                         fp.append(f"{cur_row}{il}overlay=0:0:eof_action=pass:enable='between(t,{rel:.3f},{rel + d:.3f})'{ol}")
                         cur_row = ol
-                    fp.append(f"{cur_row}null{lbl}")
-                    row_lbls.append(lbl)
-                # One row (e.g. Single with no text yet) is the whole frame; vstack needs two or more
-                if len(row_lbls) == 1:
-                    fp.append(f"{row_lbls[0]}null{out_lbl}")
-                else:
-                    fp.append(f"{''.join(row_lbls)}vstack=inputs={len(row_lbls)}{out_lbl}")
+
+                    # A rounded or circle area: its corners see-through (an alpha mask), so what's under shows
+                    if area.get("r"):
+                        mask = _round_alpha_png(tmp, aw, rh, int(area["r"]))
+                        inputs += ["-loop", "1", "-framerate", "30", "-t", f"{dur_s:.3f}", "-i", mask]
+                        fp.append(f"{cur_row}format=rgba[{key}ra]")
+                        fp.append(f"[{next_input}:v]format=gray,setsar=1[{key}rm]")
+                        fp.append(f"[{key}ra][{key}rm]alphamerge{lbl}")
+                        next_input += 1
+                    else:
+                        fp.append(f"{cur_row}null{lbl}")
+                    # Laid on the frame at its place
+                    nxt = f"[fr{si}c{ri}]"
+                    fp.append(f"{cur_frame}{lbl}overlay={area['x']}:{area['y']}:eof_action=pass{nxt}")
+                    cur_frame = nxt
+                fp.append(f"{cur_frame}format=yuv420p,setsar=1{out_lbl}")
                 seg_labels.append(out_lbl)
                 continue
 
