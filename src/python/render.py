@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges, heard_speech_ranges
 import emoji as emoji_art   # colour emoji (Twemoji 17), drawn locally
-from frames import is_frame, frame_rows, row_heights, wrap_band_text, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry
+from frames import is_frame, frame_rows, row_heights, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry
 
 # ── Quality presets (identical to previous version) ───────────────────────────
 _QUALITY: dict[int, dict] = {
@@ -666,13 +666,72 @@ def _line_baseline(pil_font, runs: list[tuple[bool, str]], size: int) -> int:
     return above
 
 
+# Frame text: its box's width when the editor never set one (shares of the frame's width), and its
+# line height in em (the editor's FRAME_TEXT_W / FRAME_TEXT_LINE)
+_FRAME_TEXT_W = 0.88
+_FRAME_TEXT_LINE = 1.2
+
+
+def _frame_text_lines(text: str, size_1080: int, box_w: float | None, font_path: str) -> list[str]:
+    """Frame text's lines: wrapped inside its box's width (a word too long for the box broken across
+    lines), measured at 1080-wide scale with the font it is drawn in — the editor's frameTextLines."""
+    from PIL import ImageFont
+    pil = ImageFont.truetype(font_path, size_1080)
+
+    def measure(s: str) -> float:
+        return sum(size_1080 * emoji_art.ADVANCE_EM if is_e else pil.getlength(t) for is_e, t in emoji_art.split_emoji(s))
+    lines = _wrap_text_lines(text, (box_w or _FRAME_TEXT_W) * 1080, measure)
+    while lines and not lines[-1]:
+        lines.pop()
+    return lines
+
+
+def _turned_frame_text_png(lines: list[str], font_path: str, size: int, color: str, rotation: float) -> str:
+    """Turned frame text as a PNG: its lines centred, _FRAME_TEXT_LINE apart, each on the middle of
+    its line (as the editor's canvas draws them), turned `rotation` degrees clockwise round the
+    block's middle — the picture's middle is the text's centre."""
+    from PIL import Image, ImageDraw, ImageFont
+    font = ImageFont.truetype(font_path, size)
+    ascent, descent = font.getmetrics()
+    lh = size * _FRAME_TEXT_LINE
+    runs = [emoji_art.split_emoji(ln) for ln in lines]
+    widths = [[size * emoji_art.ADVANCE_EM if is_e else font.getlength(t) for is_e, t in r] for r in runs]
+    block_w = max([sum(w) for w in widths] + [1])
+    pad = int(size * 0.5) + 4
+    img = Image.new("RGBA", (int(block_w + 2 * pad + 0.5), int(lh * len(lines) + 2 * pad + 0.5)), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    rgb = tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+    for li, (r, ws) in enumerate(zip(runs, widths)):
+        cursor = pad + (block_w - sum(ws)) / 2
+        # The line's middle (canvas textBaseline 'middle': halfway between ascent and descent)
+        base = pad + (li + 0.5) * lh + (ascent - descent) / 2
+        for (is_emoji, piece), pw in zip(r, ws):
+            if piece:
+                if is_emoji:
+                    png = emoji_art.emoji_png(piece, int(size))
+                    if png:
+                        em = Image.open(png).convert("RGBA")
+                        img.alpha_composite(em, (int(cursor + size * emoji_art.SIDE_EM), int(base - size * emoji_art.ABOVE_EM)))
+                else:
+                    draw.text((cursor, base), piece, font=font, fill=(*rgb, 255), anchor="ls")
+            cursor += pw
+    # PIL turns anticlockwise for a positive angle; the editor turns clockwise
+    img = img.rotate(-rotation, resample=Image.BICUBIC, expand=True)
+    fd, path = tempfile.mkstemp(suffix=".png", prefix="ftext_")
+    os.close(fd)
+    img.save(path)
+    return path
+
+
 def _frame_text_chain(fp: list[str], inputs: list[str], next_input: int, key: str,
                       text: str, bg: str, color: str, size_1080: int, w: int, h: int, dur_s: float,
-                      cx: float = 0.5, cy: float = 0.5) -> tuple[str, int]:
+                      cx: float = 0.5, cy: float = 0.5, box_w: float | None = None,
+                      rotation: float = 0.0) -> tuple[str, int]:
     """A solid w×h card with wrapped text centred on (cx, cy) — shares of the card, set by dragging
-    it in the editor. Appends its filter statements onto `fp` (and any emoji PNG inputs onto
-    `inputs`, same scheme as the main text_overlays loop) and returns the finished node's label
-    plus the updated next_input counter."""
+    it in the editor; the text wraps inside its box's width (`box_w`, a share of the frame's) and
+    is turned by `rotation` degrees. Appends its filter statements onto `fp` (and any emoji PNG
+    inputs onto `inputs`, same scheme as the main text_overlays loop) and returns the finished
+    node's label plus the updated next_input counter."""
     base_lbl = f"[{key}base]"
     fp.append(f"color=c=0x{bg}:s={w}x{h}:d={dur_s:.3f}:r=30,format=yuv420p{base_lbl}")
     cur = base_lbl
@@ -681,9 +740,25 @@ def _frame_text_chain(fp: list[str], inputs: list[str], next_input: int, key: st
     ridx = 0
     if text and font:
         size = max(8, int(round(size_1080 * w / 1080)))
-        # Wrap at 1080-wide scale, like the editor preview, so lines break in the same places
-        lines = wrap_band_text(text, 1080, size_1080)
-        lh = int(size * 1.2)
+        # `font` is escaped for the filter (Windows drive letters): Pillow needs the plain path
+        plain_font = font.replace("\\:", ":")
+        # Wrapped at 1080-wide scale, like the editor preview, so lines break in the same places
+        lines = _frame_text_lines(text, size_1080, box_w, plain_font)
+        if rotation and abs(rotation) >= 0.05 and lines:
+            # Turned: drawn as one picture, turned round the text's centre, placed on it
+            png = _turned_frame_text_png(lines, plain_font, size, color, rotation)
+            from PIL import Image
+            with Image.open(png) as im:
+                pw, ph = im.size
+            inputs += ["-i", png]
+            src_lbl = f"[{next_input}:v]"
+            next_input += 1
+            slbl, olbl = f"[{key}rs]", f"[{key}r]"
+            fp.append(f"{src_lbl}format=rgba{slbl}")
+            fp.append(f"{cur}{slbl}overlay=x={int(round(cx * w - pw / 2))}:y={int(round(cy * h - ph / 2))}{olbl}")
+            cur = olbl
+            lines = []
+        lh = int(size * _FRAME_TEXT_LINE)
         top = cy * h - lh * len(lines) / 2
         for li, ln in enumerate(lines):
             if not ln:
@@ -701,7 +776,7 @@ def _frame_text_chain(fp: list[str], inputs: list[str], next_input: int, key: st
             # just centred on this line's own width instead of ffmpeg's (w-text_w)/2 expression
             from PIL import ImageFont
             # `font` is escaped for the filter (Windows drive letters): Pillow needs the plain path
-            pil_font = ImageFont.truetype(font.replace("\:", ":"), size)
+            pil_font = ImageFont.truetype(plain_font, size)
             # An emoji takes the Chai Emoji font's room (1.1 em, its square 0.05 em in from each side)
             # and sits on the baseline (0.82 em above, 0.18 em below) — as the editor's preview draws it
             run_widths = [size * emoji_art.ADVANCE_EM if is_e else pil_font.getlength(s) for is_e, s in runs]
@@ -1351,7 +1426,9 @@ def main(
                                 it.get("text") or "", _hex6(it.get("bg"), band_bg if kind == "band" else "000000"),
                                 _hex6(it.get("color"), "ffffff"), int(it.get("size") or 64), out_w, rh, d,
                                 float(it["x"]) if it.get("x") is not None else 0.5,
-                                float(it["y"]) if it.get("y") is not None else 0.5)
+                                float(it["y"]) if it.get("y") is not None else 0.5,
+                                float(it["w"]) if it.get("w") else None,
+                                float(it.get("rotation") or 0))
                             chain = f"{text_lbl}null"  # passthrough: the shared epilogue below appends setpts
                         elif ik == "photo" and (si, it["id"]) in frame_item_in:
                             src = frame_item_in[(si, it["id"])]
