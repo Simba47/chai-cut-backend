@@ -56,6 +56,9 @@ async function runMigrations() {
     'frame_two_crops','frame_side_by_side','frame_name_tags','frame_brand_card','frame_top_list',
     'frame_screen_face','frame_audiogram','frame_grid','frame_news'))`
   await db`ALTER TABLE segments ADD COLUMN IF NOT EXISTS frame JSONB`
+  // Where a segment's video starts when a true INSERT pushed it forward (render.py, audio.py, frames.py).
+  // Production got this column by hand; databases built from schema alone (QA) lacked it.
+  await db`ALTER TABLE segments ADD COLUMN IF NOT EXISTS video_offset_ms INTEGER`
   await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS image_path TEXT`
   await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS image_motion TEXT`
   await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS volume REAL NOT NULL DEFAULT 1`
@@ -98,6 +101,15 @@ async function runMigrations() {
   // The original schema only allowed 'transcribe' and 'render' jobs, so an 'ai_edit' job could not be queued
   await db`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_type_check`
   await db`ALTER TABLE jobs ADD CONSTRAINT jobs_type_check CHECK (type IN ('transcribe','render','ai_edit','proxy','track_subjects'))`
+  // One device per account: the current sign-in's id (the site's modules/auth/one-device.ts)
+  await db`ALTER TABLE users ADD COLUMN IF NOT EXISTS session_id TEXT`
+  // A running job's worker is alive (queue.ts heartbeat); a job whose heartbeat stops is taken back.
+  // Its own table: an update of jobs sets its updated_at (the jobs_updated_at trigger), which the
+  // site reads as when the job started
+  await db`CREATE TABLE IF NOT EXISTS job_heartbeats (
+    job_id uuid PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    at timestamptz NOT NULL DEFAULT now()
+  )`
   // Subjects: people the user marked in a clip (editor Subjects tool), followed through it by
   // jobs/track_subjects.ts. path: [[source ms, x, y, w, h], …] — their face 4× a second,
   // fractions of the frame, only where they were seen.
