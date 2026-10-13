@@ -9,6 +9,7 @@ import type { Job, AiEditJobPayload } from '../types.js'
 import { handleTranscribeJob } from './transcribe.js'
 import { findClips, type FoundClip } from '../lib/clipFinder.js'
 import { askGemini } from '../lib/gemini.js'
+import { findLoops } from '../lib/transcriptGuard.js'
 import { generateClipText, fontForText, type ClipText, type ClipTextLanguage } from '../lib/clipText.js'
 import { brollEnabled, pickBrollMoments, searchStock, downloadStock, withBroll } from '../lib/broll.js'
 import { findVisuals, describeVisuals, pickVisualMoments, detectPanels, refinePanels, type Visual, type VisualMoment, type Panel } from '../lib/visuals.js'
@@ -1612,10 +1613,16 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       await waitForFullTranscription(video_id, signal)
       ;({ words, whole } = await loadWords(video_id))
     }
-    if (complete()) {
+    // A transcript saved before the runaway guard (lib/transcriptGuard.ts) can hold a stuck
+    // reading: one phrase hundreds of times over, which clip finding reads instead of the video.
+    // It is read again (that reading is guarded, so a video is only read again once)
+    const loops = complete() ? findLoops(words) : []
+    if (complete() && !loops.length) {
       console.log(`[ai_edit] Using the saved transcript of ${video_id} (${words.length} words): nothing is sent for captions`)
     } else {
-      console.log(`[ai_edit] Transcript for ${video_id} missing or partial (${words.length} words) — transcribing now`)
+      console.log(loops.length
+        ? `[ai_edit] The saved transcript of ${video_id} has a stuck reading (${loops.reduce((n, l) => n + l.words * l.copies, 0)} of ${words.length} words are loops) — reading the video again`
+        : `[ai_edit] Transcript for ${video_id} missing or partial (${words.length} words) — transcribing now`)
       await handleTranscribeJob({
         id: `ai-edit-tx-${ai_edit_job_id}`,
         type: 'transcribe',

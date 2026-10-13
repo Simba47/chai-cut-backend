@@ -76,23 +76,28 @@ async function tick() {
   // Only jobs this worker can run (a worker from before a new kind of job leaves those to others).
   // Editing copies (proxy) wait for everything else, and only one is made at a time: renders and
   // captions always have a slot.
+  // Picked and claimed in one statement. SKIP LOCKED: with many workers (replicas × CONCURRENCY
+  // loops) each takes the next job nobody else is taking, instead of all reading the same oldest
+  // job, one winning and the rest sleeping a poll interval for nothing. The heartbeat starts in
+  // the same statement, as before.
   const types = [...handlers.keys()]
   const [job] = await db<Job[]>`
-    SELECT * FROM jobs
-    WHERE status = 'queued' AND type = ANY(${types})
-    ${isRailway ? db`AND NOT (type = 'transcribe' AND payload @> '{"requires_ytdlp":true}'::jsonb)` : db``}
-    AND NOT (type = 'proxy' AND EXISTS (SELECT 1 FROM jobs p WHERE p.type = 'proxy' AND p.status = 'processing'))
-    ORDER BY (type = 'proxy') ASC, created_at ASC LIMIT 1
+    WITH next AS (
+      SELECT id FROM jobs
+      WHERE status = 'queued' AND type = ANY(${types})
+      ${isRailway ? db`AND NOT (type = 'transcribe' AND payload @> '{"requires_ytdlp":true}'::jsonb)` : db``}
+      AND NOT (type = 'proxy' AND EXISTS (SELECT 1 FROM jobs p WHERE p.type = 'proxy' AND p.status = 'processing'))
+      ORDER BY (type = 'proxy') ASC, created_at ASC LIMIT 1
+      FOR UPDATE SKIP LOCKED
+    ), claimed AS (
+      UPDATE jobs j SET status = 'processing' FROM next WHERE j.id = next.id AND j.status = 'queued' RETURNING j.*
+    ), beat AS (
+      INSERT INTO job_heartbeats (job_id) SELECT id FROM claimed
+      ON CONFLICT (job_id) DO UPDATE SET at = now()
+    )
+    SELECT * FROM claimed
   `
   if (!job) return
-
-  const claimed = await db`
-    WITH c AS (UPDATE jobs SET status = 'processing' WHERE id = ${job.id} AND status = 'queued' RETURNING id)
-    INSERT INTO job_heartbeats (job_id) SELECT id FROM c
-    ON CONFLICT (job_id) DO UPDATE SET at = now()
-    RETURNING job_id
-  `
-  if (!claimed.length) return
 
   console.log(`[queue] Processing job ${job.id} (${job.type})`)
   const handler = handlers.get(job.type as JobType)
