@@ -138,6 +138,11 @@ async function runMigrations() {
   await db`ALTER TABLE clip_subjects ADD COLUMN IF NOT EXISTS cuts jsonb`
   // When the subject is talking ([start, end] source ms, to the word): the view cuts to them on their first word
   await db`ALTER TABLE clip_subjects ADD COLUMN IF NOT EXISTS speaking jsonb`
+  // A group subject: a camera shot (these people, in these places) marked with the format and views
+  // the user gave it (shot: { layout, boxes }); spans: [start, end] source ms wherever the clip shows
+  // that shot again (jobs/track_subjects.ts shotSpans) — the editor puts that format there
+  await db`ALTER TABLE clip_subjects ADD COLUMN IF NOT EXISTS shot jsonb`
+  await db`ALTER TABLE clip_subjects ADD COLUMN IF NOT EXISTS spans jsonb`
   // The editing copy of a video (jobs/proxy.ts): what the editor plays, quick to drag through
   await db`ALTER TABLE videos ADD COLUMN IF NOT EXISTS proxy_path TEXT`
   // "Make my clips": how far the job has got (0–100), and why the AI picked each clip

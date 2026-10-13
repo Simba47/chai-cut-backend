@@ -271,6 +271,117 @@ export function followSubjects(frames: FrameDetection[], cuts: number[], marks: 
   })
 }
 
+// ── Group subjects: a camera shot marked with its own format ────────────────────
+// The user marks a shot (say Split, its top view on two people and its bottom view on the third):
+// the shot is the faces in the picture at that moment — how many, and where. Wherever the clip shows
+// the same shot again (the same camera, the same people in the same places; one more or one fewer
+// is another shot), the editor gives it that format and those views.
+
+/** A face is the marked shot's face when its middle is this close (fractions of the frame) and its size about the same */
+const SHOT_REACH_X = 0.06
+const SHOT_REACH_Y = 0.08
+const SHOT_SIZE_RATIO = 1.45
+/** A face smaller than this share of the marked shot's smallest face is background (a poster, a face far behind) */
+const SHOT_BACKGROUND = 0.5
+/** Frames where a face isn't read (someone turns away) don't end the shot for this long */
+const SHOT_HOLD_MS = 2000
+/** The shot's edges snap to a camera cut this close */
+const SHOT_SNAP_MS = 750
+/** A stretch of the shot shorter than this isn't one */
+const SHOT_MIN_MS = 800
+
+export interface ShotResult { spans: Turn[]; path: PathPoint[]; error?: string }
+
+/**
+ * Where the clip shows the shot marked at `markT` (ms from the start of the scan): [start, end]
+ * stretches, and the people's box frame by frame. `cuts`: the camera cuts; `durationMs`: the scan.
+ */
+export function shotSpans(frames: FrameDetection[], cuts: number[], markT: number, durationMs: number): ShotResult {
+  const fr: FrameDetection[] = [...frames]
+    .sort((a, b) => a.frame_index - b.frame_index)
+    .map(f => ({ ...f, faces: f.faces.filter(face => (face.score ?? 0) > 0) }))
+  const timeOf = (fi: number) => fr[fi].frame_index * FRAME_INTERVAL_MS + FRAME_SHOWS_MS
+  const bounds = [0, ...cuts.filter(c => c > 0 && c < durationMs), durationMs]
+  const stretchOf = (t: number) => { let k = 0; while (k < bounds.length - 2 && t >= bounds[k + 1]) k++; return k }
+  // The marked shot: the faces at the mark — the face count seen most in the second around it (one
+  // frame can miss a face), in the frame nearest the mark with that count
+  const home = stretchOf(markT)
+  const around = fr.map((f, fi) => ({ f, t: timeOf(fi) })).filter(x => Math.abs(x.t - markT) <= 1000 && stretchOf(x.t) === home)
+  const counts = new Map<number, number>()
+  for (const x of around) counts.set(x.f.faces.length, (counts.get(x.f.faces.length) ?? 0) + 1)
+  const want = [...counts].sort((a, b) => b[1] - a[1] || b[0] - a[0])[0]?.[0] ?? 0
+  const ref = around.filter(x => x.f.faces.length === want).sort((a, b) => Math.abs(a.t - markT) - Math.abs(b.t - markT))[0]
+  if (!ref || !want) return { spans: [], path: [], error: 'No faces in the picture here. Mark a shot where the people’s faces can be seen.' }
+  const refFaces = ref.f.faces
+  const smallest = Math.min(...refFaces.map(f => f.w))
+  const mid = (f: CropBox) => [f.x + f.w / 2, f.y + f.h / 2]
+
+  // Each frame: the marked shot (every face where it was, nobody else), part of it (some faces not
+  // read, nobody else), another shot, or no faces read
+  type State = 'match' | 'part' | 'other' | 'none'
+  const states = fr.map((f): { s: State; box?: CropBox } => {
+    const faces = f.faces.filter(face => face.w >= SHOT_BACKGROUND * smallest)
+    if (!faces.length) return { s: 'none' }
+    const used = new Set<number>()
+    let found = 0
+    for (const r of refFaces) {
+      const [rx, ry] = mid(r)
+      let best = -1, bestD = Infinity
+      faces.forEach((face, k) => {
+        if (used.has(k)) return
+        const [x, y] = mid(face)
+        const ratio = Math.max(face.w / r.w, r.w / face.w)
+        if (Math.abs(x - rx) > SHOT_REACH_X || Math.abs(y - ry) > SHOT_REACH_Y || ratio > SHOT_SIZE_RATIO) return
+        const d = Math.abs(x - rx) + Math.abs(y - ry)
+        if (d < bestD) { bestD = d; best = k }
+      })
+      if (best >= 0) { used.add(best); found++ }
+    }
+    if (used.size < faces.length) return { s: 'other' }     // someone who isn't in the marked shot
+    if (found < refFaces.length) return { s: 'part' }
+    const xs = faces.flatMap(face => [face.x, face.x + face.w]), ys = faces.flatMap(face => [face.y, face.y + face.h])
+    const x = Math.min(...xs), y = Math.min(...ys)
+    return { s: 'match', box: { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y } }
+  })
+
+  // The stretches: from a matching frame to the last one, within one camera shot; faces not read
+  // for a moment carry it on, someone else in the picture (two frames running) ends it
+  const spans: Turn[] = []
+  const path: PathPoint[] = []
+  let run: { start: number; last: number; k: number } | null = null
+  let others = 0
+  const close = () => {
+    if (!run) return
+    const lo = bounds[run.k], hi = bounds[run.k + 1]
+    let a = run.start - FRAME_INTERVAL_MS / 2, b = run.last + FRAME_INTERVAL_MS / 2
+    if (a - lo <= SHOT_SNAP_MS) a = lo
+    if (hi - b <= SHOT_SNAP_MS) b = hi
+    a = Math.max(lo, a); b = Math.min(hi, b)
+    if (b - a >= SHOT_MIN_MS) spans.push([Math.round(a), Math.round(b)])
+    run = null
+  }
+  fr.forEach((_, fi) => {
+    const t = timeOf(fi), k = stretchOf(t), st = states[fi]
+    if (run && (k !== run.k || t - run.last > SHOT_HOLD_MS)) close()
+    if (st.s === 'other') { if (++others >= 2) close(); return }
+    others = 0
+    if (st.s !== 'match') return
+    if (!run) run = { start: t, last: t, k }
+    run.last = t
+    const b = st.box!
+    path.push([t, round4(b.x), round4(b.y), round4(b.w), round4(b.h), 0])
+  })
+  close()
+  // Joined where two stretches meet (the same shot either side of a cut that isn't one)
+  const joined: Turn[] = []
+  for (const s of spans) {
+    const last = joined[joined.length - 1]
+    if (last && s[0] - last[1] <= 1) last[1] = s[1]
+    else joined.push([s[0], s[1]])
+  }
+  return { spans: joined, path }
+}
+
 /**
  * Where FFmpeg reads the clip's video from: a temporary link to the editing copy (at most 720p,
  * its frames keep the original's times), else the original — read through range requests, so only
@@ -314,6 +425,22 @@ async function spokenWords(videoId: string, from: number, to: number): Promise<S
   }
 }
 
+/** A group subject's result: where its shot is (source ms), or why it couldn't be found */
+async function saveShot(id: string, r: ShotResult, from: number, to: number, sourceCuts: number[]) {
+  if (r.error) {
+    await db`UPDATE clip_subjects SET status = 'failed', error = ${r.error}, progress = 100, path = NULL, spans = NULL WHERE id = ${id}`
+    return
+  }
+  const path = r.path.map(([t, x, y, w, h]) => [Math.round(t + from), x, y, w, h, 0])
+  const spans = r.spans.map(([a, b]) => [Math.round(a + from), Math.round(b + from)])
+  await db`
+    UPDATE clip_subjects SET status = 'done', error = NULL, progress = 100,
+      path = ${db.json(path as never)}, spans = ${db.json(spans as never)}, cuts = ${db.json(sourceCuts as never)},
+      speaking = NULL, scan_start_ms = ${from}, scan_end_ms = ${to}
+    WHERE id = ${id}
+  `
+}
+
 async function setSubjects(ids: string[], patch: { status?: string; progress?: number; error?: string | null }) {
   if (!ids.length) return
   await db`
@@ -329,10 +456,10 @@ export async function handleTrackSubjectsJob(job: Job, signal?: AbortSignal) {
   const { clip_id, start_ms, end_ms, auto } = job.payload as unknown as TrackSubjectsJobPayload
   if (auto) return subEditClip(job.id, clip_id, signal)
   // The subjects waiting when this job starts (ones marked later get a job of their own)
-  const subjects = await db<{ id: string; mark_ms: number; mark_x: number; mark_y: number }[]>`
+  const subjects = await db<{ id: string; mark_ms: number; mark_x: number; mark_y: number; shot: unknown }[]>`
     UPDATE clip_subjects SET status = 'running', progress = 5, error = NULL
     WHERE clip_id = ${clip_id} AND status = 'queued'
-    RETURNING id, mark_ms, mark_x, mark_y
+    RETURNING id, mark_ms, mark_x, mark_y, shot
   `
   if (!subjects.length) return
   const ids = subjects.map(s => s.id)
@@ -359,9 +486,14 @@ export async function handleTrackSubjectsJob(job: Job, signal?: AbortSignal) {
     signal?.throwIfAborted()
     await setSubjects(ids, { progress: 90 })
 
-    const results = followSubjects(info.frames, cuts, subjects.map(s => ({ id: s.id, t: s.mark_ms - from, x: s.mark_x, y: s.mark_y })), speech, to - from)
+    // People are followed; a group subject (a marked shot) is found wherever the clip shows that shot
+    const people = subjects.filter(s => !s.shot), shots = subjects.filter(s => s.shot)
+    const results = people.length
+      ? followSubjects(info.frames, cuts, people.map(s => ({ id: s.id, t: s.mark_ms - from, x: s.mark_x, y: s.mark_y })), speech, to - from)
+      : []
     // The camera cuts, in the source video's time (exact to the frame: the editor switches on them)
     const sourceCuts = cuts.map(c => Math.round(c + from))
+    for (const s of shots) await saveShot(s.id, shotSpans(info.frames, cuts, s.mark_ms - from, to - from), from, to, sourceCuts)
     for (const r of results) {
       if (r.error) {
         await db`UPDATE clip_subjects SET status = 'failed', error = ${r.error}, progress = 100, path = NULL WHERE id = ${r.id}`
@@ -378,7 +510,7 @@ export async function handleTrackSubjectsJob(job: Job, signal?: AbortSignal) {
       `
     }
     const seen = results.map(r => `${r.error ? 'failed' : `${r.path.length} frames, ${r.speaking.length} turn(s)`}`).join(', ')
-    console.log(`[track_subjects] clip ${clip_id}: ${info.frames.length} frames, ${cuts.length} cut(s), subjects: ${seen} (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
+    console.log(`[track_subjects] clip ${clip_id}: ${info.frames.length} frames, ${cuts.length} cut(s), subjects: ${seen || 'none'}, shots: ${shots.length} (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     await setSubjects(ids, { status: 'failed', error: `Tracking failed: ${msg}`, progress: 100 }).catch(() => {})
@@ -493,9 +625,12 @@ async function subEditSteps(clipId: string, signal: AbortSignal, onCreated: (ids
     const found = findPeople(info.frames, cuts)
     if (!found.length) throw new Error('No people could be found in this clip')
 
-    // They become the clip's subjects (the Subjects tool shows them), replacing any marked before
+    // They become the clip's subjects (the Subjects tool shows them), replacing the people marked
+    // before. Group subjects (marked shots) stay — the user's own choice — found again in this clip
+    const groups = await db<{ id: string; mark_ms: number }[]>`SELECT id, mark_ms FROM clip_subjects WHERE clip_id = ${clipId} AND shot IS NOT NULL`
+    for (const g of groups) await saveShot(g.id, shotSpans(info.frames, cuts, Number(g.mark_ms) - from, to - from), from, to, cuts.map(c => Math.round(c + from)))
     const marks = await db.begin(async tx => {
-      await tx`DELETE FROM clip_subjects WHERE clip_id = ${clipId}`
+      await tx`DELETE FROM clip_subjects WHERE clip_id = ${clipId} AND shot IS NULL`
       const rows = await tx<{ id: string }[]>`
         INSERT INTO clip_subjects ${tx(found.map((m, i) => ({
           clip_id: clipId, label: String.fromCharCode(65 + i), color: SUBJECT_COLORS[i % SUBJECT_COLORS.length],
