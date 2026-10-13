@@ -5,8 +5,9 @@
  * Copied as-is between the repos (chai-cut-backend/src/lib/clipText.ts, chai-cut-frontend
  * src/lib/clipText.ts): the worker writes them for "Make my clips", the app's Regenerate button
  * rewrites them. Keep the two identical.
+ *
+ * No framework or AI imports: the model call is passed in (`ask`, see lib/gemini.ts askGemini).
  */
-import { GoogleGenerativeAI } from '@google/generative-ai'
 
 // The same rule as clipFinder.ts ROMAN_RULE: text in Roman letters (Tenglish, Hinglish…)
 const ROMAN_RULE = `Write the text in Roman (English) letters, in the speaker's own language the way people type it in chats: Telugu as Tenglish (e.g. "Ee cinema ki audience pichi ekkaru!"), Hindi as Hinglish (e.g. "Yeh scene dekh ke sab hil gaye!"), Tamil as Tanglish, and so on; keep English words as they are, and if the speaker talks in English write English. Never use Telugu, Devanagari, Tamil or any other non-Latin script.`
@@ -49,8 +50,11 @@ function clipLines(words: TextWord[]): string {
 
 const clean = (v: unknown, max: number) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, max) : '')
 
+/** Sends one prompt to the model and returns its raw text answer */
+export type AskText = (prompt: string) => Promise<string>
+
 /** Hook, title, post caption and hashtags for a clip; throws if Gemini fails or answers badly */
-export async function generateClipText(words: TextWord[], videoTitle: string | null, apiKey: string, language: ClipTextLanguage = 'roman'): Promise<ClipText> {
+export async function generateClipText(words: TextWord[], videoTitle: string | null, ask: AskText, language: ClipTextLanguage = 'roman'): Promise<ClipText> {
   if (!words.length) throw new Error('This clip has no transcript yet')
 
   const prompt = `You write the text that goes with a short vertical video clip (Reels / Shorts) for an Indian creator. The speech can be Telugu, Hindi, Tamil or another Indian language, often mixed with English. Judge meaning in the original language.
@@ -66,8 +70,7 @@ ${language === 'english' ? ENGLISH_RULE : language === 'native' ? NATIVE_RULE : 
 - post_caption: 1-2 sentences for the post.
 - hashtags: exactly 5, no # sign needed, no spaces inside a tag, a mix of language-specific and English tags.`
 
-  const model = new GoogleGenerativeAI(apiKey).getGenerativeModel({ model: 'gemini-2.5-flash' })
-  const text = (await model.generateContent(prompt)).response.text()
+  const text = await ask(prompt)
   const match = text.match(/\{[\s\S]*\}/)
   if (!match) throw new Error('Gemini did not return JSON')
   const raw = JSON.parse(match[0]) as Record<string, unknown>

@@ -7,12 +7,12 @@
  * 24 h as its API terms ask). Both free for commercial use.
  * Env: AUTO_BROLL=on to enable (default off). PEXELS_API_URL / PIXABAY_API_URL only for testing.
  */
-import { GoogleGenerativeAI } from '@google/generative-ai'
 import { createWriteStream } from 'node:fs'
 import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
 import { join } from 'node:path'
 import { buildLines, type FinderWord } from './clipFinder.js'
+import { askGemini } from './gemini.js'
 
 export const MAX_BROLL = 3
 const MIN_MS = 1500, MAX_MS = 3000
@@ -41,7 +41,7 @@ export async function searchStock(query: string): Promise<StockVideo | null> {
  * would help, each with an English search query. Gemini reads the clip's lines once; moments
  * are then held to 1.5–3 s, kept out of the first 3 s and last 2 s, and at least 5 s apart.
  */
-export async function pickBrollMoments(words: FinderWord[], clipStart: number, clipEnd: number, apiKey: string): Promise<BrollMoment[]> {
+export async function pickBrollMoments(words: FinderWord[], clipStart: number, clipEnd: number): Promise<BrollMoment[]> {
   const lines = buildLines(words.filter(w => w.start_ms >= clipStart && w.end_ms <= clipEnd))
   if (lines.length < 2) return []
   const text = lines.map(l => `L${l.index} [${((l.start_ms - clipStart) / 1000).toFixed(1)}s] ${l.text}`).join('\n')
@@ -54,8 +54,7 @@ Pick up to ${MAX_BROLL} lines where the speaker describes a concrete thing, plac
 For each, write a short English stock-footage search query (2-4 words).
 Return ONLY JSON: [{"start_line": n, "end_line": n, "query": "..."}]. [] is fine.`
 
-  const model = new GoogleGenerativeAI(apiKey).getGenerativeModel({ model: 'gemini-2.5-flash' })
-  const out = (await model.generateContent(prompt)).response.text()
+  const out = await askGemini(prompt)
   const match = out.match(/\[[\s\S]*\]/)
   if (!match) return []
   const raw = JSON.parse(match[0]) as Array<{ start_line?: number; end_line?: number; query?: string }>
