@@ -232,45 +232,50 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal, onRead
     const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, languageCode, signal, kept, onRead)
     signal?.throwIfAborted()
 
+    // The slow part first — in the transcript's script and in Roman letters takes minutes for a long
+    // video — and only then is anything saved, all at once: a transcript saved before its words read
+    // as a whole video with no speech (Make my clips failed with "no speech" while it was being
+    // written, and for good when a restart cut it off half-saved)
+    const entries = sarvamResult.words
+    const offsetMs = isClipJob ? payload.clip_start_ms! : 0
+    const romanized = entries.length ? await transliterateToRoman(entries, sarvamResult.language_code) : []
+    // English spoken inside a regional-language video: store it in that language's script too,
+    // so "Auto language" captions are all in one script (word_roman keeps the English spelling)
+    const native = entries.length ? await toNativeScript(entries, sarvamResult.language_code) : []
+    signal?.throwIfAborted()
+
     // Clip jobs (first transcription or retranscribe): replace only this clip's time range in the
     // video's transcript, so other clips of the same video keep their captions. The editor reads
     // one transcript per video (the newest), so a clip job must never start a separate one —
     // that hid every other clip's captions. created_at is bumped so the editor's "since" poll
     // picks up the new words.
-    const [existing] = isClipJob
-      ? await db`
-          SELECT t.id FROM transcripts t
-          WHERE t.video_id = ${payload.video_id}
-            AND (t.whole_video OR EXISTS (SELECT 1 FROM transcript_words w WHERE w.transcript_id = t.id))
-          ORDER BY t.created_at DESC LIMIT 1`
-      : []
-    let transcript: { id: string }
-    if (existing) {
-      await db`DELETE FROM transcript_words WHERE transcript_id = ${existing.id} AND start_ms >= ${payload.clip_start_ms!} AND start_ms < ${payload.clip_end_ms!}`
-      await db`UPDATE transcripts SET language = ${sarvamResult.language_code}, created_at = now() WHERE id = ${existing.id}`
-      transcript = { id: existing.id as string }
-    } else {
-      if (isRetranscribe) {
-        await db`DELETE FROM transcripts WHERE video_id = ${payload.video_id}`
+    await db.begin(async tx => {
+      const [existing] = isClipJob
+        ? await tx`
+            SELECT t.id FROM transcripts t
+            WHERE t.video_id = ${payload.video_id}
+              AND (t.whole_video OR EXISTS (SELECT 1 FROM transcript_words w WHERE w.transcript_id = t.id))
+            ORDER BY t.created_at DESC LIMIT 1`
+        : []
+      let transcriptId: string
+      if (existing) {
+        await tx`DELETE FROM transcript_words WHERE transcript_id = ${existing.id} AND start_ms >= ${payload.clip_start_ms!} AND start_ms < ${payload.clip_end_ms!}`
+        await tx`UPDATE transcripts SET language = ${sarvamResult.language_code}, created_at = now() WHERE id = ${existing.id}`
+        transcriptId = existing.id as string
+      } else {
+        if (isRetranscribe) {
+          await tx`DELETE FROM transcripts WHERE video_id = ${payload.video_id}`
+        }
+        // whole_video: the whole video was read, so nothing needs to read it again (see ai_edit)
+        const [inserted] = await tx`
+          INSERT INTO transcripts (video_id, language, whole_video) VALUES (${payload.video_id}, ${sarvamResult.language_code}, ${!isClipJob}) RETURNING id
+        `
+        if (!inserted) throw new Error('Failed to insert transcript row')
+        transcriptId = inserted.id as string
       }
-      // whole_video: the whole video was read, so nothing needs to read it again (see ai_edit)
-      const [inserted] = await db`
-        INSERT INTO transcripts (video_id, language, whole_video) VALUES (${payload.video_id}, ${sarvamResult.language_code}, ${!isClipJob}) RETURNING id
-      `
-      if (!inserted) throw new Error('Failed to insert transcript row')
-      transcript = { id: inserted.id as string }
-    }
-
-    const entries = sarvamResult.words
-    if (entries.length > 0) {
-      const offsetMs = isClipJob ? payload.clip_start_ms! : 0
-      const romanized = await transliterateToRoman(entries, sarvamResult.language_code)
-      // English spoken inside a regional-language video: store it in that language's script too,
-      // so "Auto language" captions are all in one script (word_roman keeps the English spelling)
-      const native = await toNativeScript(entries, sarvamResult.language_code)
 
       const words = entries.map((e, i) => ({
-        transcript_id: transcript.id,
+        transcript_id: transcriptId,
         word: native[i] ?? e.word,
         word_roman: romanized[i] ?? null,
         start_ms: Math.round(e.start * 1000) + offsetMs,
@@ -279,9 +284,9 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal, onRead
         confidence:  e.confidence ?? null,
       }))
       for (let i = 0; i < words.length; i += 500) {
-        await db`INSERT INTO transcript_words ${db(words.slice(i, i + 500))}`
+        await tx`INSERT INTO transcript_words ${tx(words.slice(i, i + 500))}`
       }
-    }
+    })
 
     // The transcript is saved: the kept chunks have done their job
     if (readingKey) await r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: readingKey })).catch(() => {})
