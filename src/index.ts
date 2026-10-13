@@ -143,6 +143,20 @@ async function runMigrations() {
   // that shot again (jobs/track_subjects.ts shotSpans) — the editor puts that format there
   await db`ALTER TABLE clip_subjects ADD COLUMN IF NOT EXISTS shot jsonb`
   await db`ALTER TABLE clip_subjects ADD COLUMN IF NOT EXISTS spans jsonb`
+  // The clip's camera angles (jobs/track_subjects.ts findAngles), listed in the editor's Subjects
+  // tool so every one gets its subject or group. angles: [{ people, at, faces, spans }, …] in source ms
+  await db`
+    CREATE TABLE IF NOT EXISTS clip_angles (
+      clip_id uuid PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+      status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'done', 'failed')),
+      error text,
+      progress integer NOT NULL DEFAULT 0,
+      scan_start_ms integer,
+      scan_end_ms integer,
+      angles jsonb,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )
+  `
   // The editing copy of a video (jobs/proxy.ts): what the editor plays, quick to drag through
   await db`ALTER TABLE videos ADD COLUMN IF NOT EXISTS proxy_path TEXT`
   // "Make my clips": how far the job has got (0–100), and why the AI picked each clip
