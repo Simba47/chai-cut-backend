@@ -10,13 +10,13 @@
  * 3. pickVisualMoments (per clip): Gemini reads the clip's lines and the list of visuals and
  *    picks where the speaker talks about something one of them shows.
  */
-import { GoogleGenerativeAI } from '@google/generative-ai'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { mkdir, readdir, readFile, rm } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { buildLines, type FinderWord } from './clipFinder.js'
+import { askGemini } from './gemini.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -26,7 +26,6 @@ function jsonArray<T>(text: string): T[] {
   if (!match) return []
   try { const v = JSON.parse(match[0]); return Array.isArray(v) ? v as T[] : [] } catch { return [] }
 }
-const MODEL = 'gemini-2.5-flash'
 
 export interface Visual {
   /** Source-video ms */
@@ -50,7 +49,7 @@ const MAX_PANEL_FRAMES = 120
  * (one Gemini call with all of them). A vertical crop on the speaker would cut them off; the clip
  * shows them under the speaker instead. [] on any failure.
  */
-export async function detectPanels(videoPath: string, startMs: number, endMs: number, tmp: string, apiKey: string, signal?: AbortSignal): Promise<Panel[]> {
+export async function detectPanels(videoPath: string, startMs: number, endMs: number, tmp: string, signal?: AbortSignal): Promise<Panel[]> {
   const dir = join(tmp, `panels-${startMs}`)
   await mkdir(dir, { recursive: true })
   try {
@@ -66,8 +65,7 @@ export async function detectPanels(videoPath: string, startMs: number, endMs: nu
     parts.push({ text: `These are frames (one per second) from a video of people talking. In which frames is a graphic placed on top of the camera picture — a screenshot, web page, product image, photo, chart or slide shown in a box or panel beside or over the people? Ignore captions, logos, name tags and things that are physically in the room (TVs, posters, laptops on the table).
 For each such frame give the graphic's box as box_2d [ymin, xmin, ymax, xmax] on a 0–1000 scale.
 Return ONLY JSON: [{"frame": "F3", "box_2d": [ymin, xmin, ymax, xmax]}]. [] if there are none.` })
-    const model = new GoogleGenerativeAI(apiKey).getGenerativeModel({ model: MODEL, generationConfig: { responseMimeType: 'application/json', temperature: 0 } })
-    const out = (await model.generateContent(parts)).response.text()
+    const out = await askGemini(parts, { json: true, temperature: 0 })
     const hits = jsonArray<{ frame?: string; box_2d?: number[] }>(out)
       .map(r => ({ i: Number(String(r.frame ?? '').replace(/\D/g, '')), b: r.box_2d }))
       .filter((r): r is { i: number; b: number[] } => Number.isFinite(r.i) && Array.isArray(r.b) && r.b.length === 4)
@@ -157,7 +155,7 @@ export async function findVisuals(videoPath: string, outDir: string, signal?: Ab
  * app screen, page, chart, place or object — not logos, title cards or blank frames). One
  * Gemini call with all the pictures.
  */
-export async function describeVisuals(visuals: Visual[], apiKey: string): Promise<Visual[]> {
+export async function describeVisuals(visuals: Visual[]): Promise<Visual[]> {
   if (!visuals.length) return []
   const parts: Array<{ inlineData: { mimeType: string; data: string } } | { text: string }> = []
   for (const [i, v] of visuals.entries()) {
@@ -167,8 +165,7 @@ export async function describeVisuals(visuals: Visual[], apiKey: string): Promis
   parts.push({ text: `These images come from cutaways in a video (screen recordings, product shots, footage shown while people talk).
 For each image, write in simple English what it shows in at most 12 words, naming products, apps or brands you can read (e.g. "Apple website page for the iPhone Duo Folio case"). Mark useful=true when it shows a specific product, app screen, web page, document, chart, place or object that a viewer would want to see when the speakers mention it; useful=false for logos, title cards, intros, blank or blurry frames.
 Return ONLY JSON: [{"id": "V1", "about": "...", "useful": true}, ...] with one entry per image.` })
-  const model = new GoogleGenerativeAI(apiKey).getGenerativeModel({ model: MODEL, generationConfig: { responseMimeType: 'application/json', temperature: 0 } })
-  const out = (await model.generateContent(parts)).response.text()
+  const out = await askGemini(parts, { json: true, temperature: 0 })
   const raw = jsonArray<{ id?: string; about?: string; useful?: boolean }>(out)
   const described: Visual[] = []
   for (const r of raw) {
@@ -184,7 +181,7 @@ Return ONLY JSON: [{"id": "V1", "about": "...", "useful": true}, ...] with one e
  * ms, at most MAX_MOMENTS, 1.5–4.5 s each, not in the first moments, apart from each other).
  * Visuals already on screen in the clip at that moment are left out (they show anyway).
  */
-export async function pickVisualMoments(words: FinderWord[], clipStart: number, clipEnd: number, visuals: Visual[], apiKey: string): Promise<VisualMoment[]> {
+export async function pickVisualMoments(words: FinderWord[], clipStart: number, clipEnd: number, visuals: Visual[]): Promise<VisualMoment[]> {
   const near = visuals.filter(v => !(v.start_ms < clipEnd && v.end_ms > clipStart))
   const lines = buildLines(words.filter(w => w.start_ms >= clipStart && w.end_ms <= clipEnd))
   if (!near.length || lines.length < 2) return []
@@ -200,8 +197,7 @@ ${list}
 
 Pick up to ${MAX_MOMENTS} lines where the speaker is clearly talking about the very thing one of these visuals shows (the same product, app, page, object or event — not just the same topic). The visual will be shown under the speaker while they say it. Skip it when no visual truly matches.
 Return ONLY JSON: [{"start_line": n, "end_line": n, "visual": "V<number>"}]. [] is fine.`
-  const model = new GoogleGenerativeAI(apiKey).getGenerativeModel({ model: MODEL, generationConfig: { responseMimeType: 'application/json', temperature: 0 } })
-  const out = (await model.generateContent(prompt)).response.text()
+  const out = await askGemini(prompt, { json: true, temperature: 0 })
   const raw = jsonArray<{ start_line?: number; end_line?: number; visual?: string }>(out)
   const dur = clipEnd - clipStart
   const moments: VisualMoment[] = []

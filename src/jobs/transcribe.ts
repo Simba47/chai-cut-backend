@@ -11,6 +11,9 @@ import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from '@aws-sd
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { GoogleAuth } from 'google-auth-library'
 import { r2, R2_BUCKET, r2DownloadToFile, r2UploadFile } from '../r2.js'
+import { aiProvider, askGemini, retryAfterMs, retryDelayMs } from '../lib/gemini.js'
+import { runawayReason, trimRunaway } from '../lib/transcriptGuard.js'
+import { convertWordForWord } from '../lib/wordConvert.js'
 import db from '../db.js'
 import type { Job, TranscribeJobPayload } from '../types.js'
 import { queueProxy } from './proxy.js'
@@ -231,45 +234,50 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal, onRead
     const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, languageCode, signal, kept, onRead)
     signal?.throwIfAborted()
 
+    // The slow part first — in the transcript's script and in Roman letters takes minutes for a long
+    // video — and only then is anything saved, all at once: a transcript saved before its words read
+    // as a whole video with no speech (Make my clips failed with "no speech" while it was being
+    // written, and for good when a restart cut it off half-saved)
+    const entries = sarvamResult.words
+    const offsetMs = isClipJob ? payload.clip_start_ms! : 0
+    const romanized = entries.length ? await transliterateToRoman(entries, sarvamResult.language_code) : []
+    // English spoken inside a regional-language video: store it in that language's script too,
+    // so "Auto language" captions are all in one script (word_roman keeps the English spelling)
+    const native = entries.length ? await toNativeScript(entries, sarvamResult.language_code) : []
+    signal?.throwIfAborted()
+
     // Clip jobs (first transcription or retranscribe): replace only this clip's time range in the
     // video's transcript, so other clips of the same video keep their captions. The editor reads
     // one transcript per video (the newest), so a clip job must never start a separate one —
     // that hid every other clip's captions. created_at is bumped so the editor's "since" poll
     // picks up the new words.
-    const [existing] = isClipJob
-      ? await db`
-          SELECT t.id FROM transcripts t
-          WHERE t.video_id = ${payload.video_id}
-            AND (t.whole_video OR EXISTS (SELECT 1 FROM transcript_words w WHERE w.transcript_id = t.id))
-          ORDER BY t.created_at DESC LIMIT 1`
-      : []
-    let transcript: { id: string }
-    if (existing) {
-      await db`DELETE FROM transcript_words WHERE transcript_id = ${existing.id} AND start_ms >= ${payload.clip_start_ms!} AND start_ms < ${payload.clip_end_ms!}`
-      await db`UPDATE transcripts SET language = ${sarvamResult.language_code}, created_at = now() WHERE id = ${existing.id}`
-      transcript = { id: existing.id as string }
-    } else {
-      if (isRetranscribe) {
-        await db`DELETE FROM transcripts WHERE video_id = ${payload.video_id}`
+    await db.begin(async tx => {
+      const [existing] = isClipJob
+        ? await tx`
+            SELECT t.id FROM transcripts t
+            WHERE t.video_id = ${payload.video_id}
+              AND (t.whole_video OR EXISTS (SELECT 1 FROM transcript_words w WHERE w.transcript_id = t.id))
+            ORDER BY t.created_at DESC LIMIT 1`
+        : []
+      let transcriptId: string
+      if (existing) {
+        await tx`DELETE FROM transcript_words WHERE transcript_id = ${existing.id} AND start_ms >= ${payload.clip_start_ms!} AND start_ms < ${payload.clip_end_ms!}`
+        await tx`UPDATE transcripts SET language = ${sarvamResult.language_code}, created_at = now() WHERE id = ${existing.id}`
+        transcriptId = existing.id as string
+      } else {
+        if (isRetranscribe) {
+          await tx`DELETE FROM transcripts WHERE video_id = ${payload.video_id}`
+        }
+        // whole_video: the whole video was read, so nothing needs to read it again (see ai_edit)
+        const [inserted] = await tx`
+          INSERT INTO transcripts (video_id, language, whole_video) VALUES (${payload.video_id}, ${sarvamResult.language_code}, ${!isClipJob}) RETURNING id
+        `
+        if (!inserted) throw new Error('Failed to insert transcript row')
+        transcriptId = inserted.id as string
       }
-      // whole_video: the whole video was read, so nothing needs to read it again (see ai_edit)
-      const [inserted] = await db`
-        INSERT INTO transcripts (video_id, language, whole_video) VALUES (${payload.video_id}, ${sarvamResult.language_code}, ${!isClipJob}) RETURNING id
-      `
-      if (!inserted) throw new Error('Failed to insert transcript row')
-      transcript = { id: inserted.id as string }
-    }
-
-    const entries = sarvamResult.words
-    if (entries.length > 0) {
-      const offsetMs = isClipJob ? payload.clip_start_ms! : 0
-      const romanized = await transliterateToRoman(entries, sarvamResult.language_code)
-      // English spoken inside a regional-language video: store it in that language's script too,
-      // so "Auto language" captions are all in one script (word_roman keeps the English spelling)
-      const native = await toNativeScript(entries, sarvamResult.language_code)
 
       const words = entries.map((e, i) => ({
-        transcript_id: transcript.id,
+        transcript_id: transcriptId,
         word: native[i] ?? e.word,
         word_roman: romanized[i] ?? null,
         start_ms: Math.round(e.start * 1000) + offsetMs,
@@ -278,9 +286,9 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal, onRead
         confidence:  e.confidence ?? null,
       }))
       for (let i = 0; i < words.length; i += 500) {
-        await db`INSERT INTO transcript_words ${db(words.slice(i, i + 500))}`
+        await tx`INSERT INTO transcript_words ${tx(words.slice(i, i + 500))}`
       }
-    }
+    })
 
     // The transcript is saved: the kept chunks have done their job
     if (readingKey) await r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: readingKey })).catch(() => {})
@@ -689,9 +697,10 @@ async function vertexTranscribeChunk(buf: Buffer, languageCode?: string): Promis
     // 429 on Vertex means shared capacity is busy for a moment (there is no daily cap): retry
     const retryable = res.status === 429 || res.status >= 500
     if (!retryable || attempt >= GEMINI_MAX_TRIES) throw new Error(`Vertex transcribe ${res.status}: ${text.slice(0, 300)}`)
-    const delaySec = Math.min(30, 5 * attempt)
-    console.warn(`[vertex] ${res.status} on attempt ${attempt}, retrying in ${delaySec}s`)
-    await new Promise(r => setTimeout(r, delaySec * 1000))
+    // Spread out at random, so the many jobs a busy moment refused don't all come back together
+    const delayMs = retryDelayMs(attempt, retryAfterMs(res.headers.get('retry-after')))
+    console.warn(`[vertex] ${res.status} on attempt ${attempt}, retrying in ${(delayMs / 1000).toFixed(1)}s`)
+    await new Promise(r => setTimeout(r, delayMs))
   }
 }
 
@@ -812,8 +821,26 @@ export async function transcribeAudio(audioPath: string, videoId?: string, langu
     await unlink(chunkPath).catch(() => {})
     if (buf.length < 16_000) return []  // < 0.5s of audio — nothing to transcribe
 
+    const label = tag.startsWith('probe') ? `language ${tag}` : `chunk ${parseInt(tag, 10) + 1}/${numChunks}`
     let words = await geminiTranscribeChunk(buf, lang)
-    console.log(`[gemini] ${tag.startsWith('probe') ? `language ${tag}` : `chunk ${parseInt(tag, 10) + 1}/${numChunks}`} (${Math.round(durSec)}s): ${words.length} words${lang ? ` (${lang})` : ''}`)
+    console.log(`[gemini] ${label} (${Math.round(durSec)}s): ${words.length} words${lang ? ` (${lang})` : ''}`)
+    // A stuck reading (one phrase over and over, more words than anyone can say) would fill the
+    // transcript with the loop: read the chunk once more, and if that is wrong too, cut the loops
+    const seconds = Math.min(durSec, Math.max(0, totalSec - startSec))
+    const wrong = runawayReason(words, seconds)
+    if (wrong) {
+      console.warn(`[transcribe] ${label}: the reading looks stuck (${wrong}) — reading it again`)
+      const again = await geminiTranscribeChunk(buf, lang)
+      const stillWrong = runawayReason(again, seconds)
+      if (!stillWrong) {
+        console.log(`[transcribe] ${label}: second reading is fine (${again.length} words)`)
+        words = again
+      } else {
+        const trimmed = trimRunaway(again.length <= words.length ? again : words, seconds)
+        console.warn(`[transcribe] ${label}: still stuck (${stillWrong}) — loops cut: ${Math.min(words.length, again.length)} → ${trimmed.length} words`)
+        words = trimmed
+      }
+    }
     // Locked to an Indian language, Gemini drops sentences spoken purely in English — re-read
     // the stretches it left empty as English and merge those words in
     if (lang && !lang.startsWith('en')) {
@@ -1137,71 +1164,34 @@ function detectSarvamLang(text: string): string | undefined {
   return undefined
 }
 
+/** Gemini's answer for the script conversions: one string per input word */
+const STRING_LIST = { type: 'ARRAY', items: { type: 'STRING' } }
+
 // Gemini batch transliteration → natural Tenglish / Hinglish (how people type it on
 // WhatsApp/YouTube), English loanwords in normal English spelling. One output per
-// input word, same order; any batch that doesn't come back 1:1 is left undefined so
-// the caller falls back to the rule-based Telugu transliterator for those words.
+// input word, same order; words it couldn't convert are left undefined so the caller
+// falls back to the rule-based Telugu transliterator for those words.
 async function transliterateWithGemini(
   entries: SarvamWord[],
   languageCode: string,
 ): Promise<(string | undefined)[]> {
   const langName = LANG_NAMES[languageCode] ?? 'Indian'
   const style = langName === 'Telugu' ? 'Tenglish' : langName === 'Hindi' ? 'Hinglish' : `romanized ${langName}`
-  const BATCH = 80
-  const result: (string | undefined)[] = new Array(entries.length).fill(undefined)
-
-  for (let i = 0; i < entries.length; i += BATCH) {
-    const batch = entries.slice(i, i + BATCH)
-    const words = batch.map(e => e.word.trim())
-    // A batch occasionally comes back merged/split despite temperature 0 and explicit
-    // instructions — one retry before falling back recovers most of these for free.
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        // gemini-2.5-flash writes the most natural Tenglish in tests; Google has started retiring
-        // 2.5 models for new accounts, so fall back to the always-current Flash alias on 404
-        let res: Response | undefined
-        for (const model of ['gemini-2.5-flash', 'gemini-flash-latest']) {
-          res = await fetchWithTimeout(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-            method: 'POST',
-            headers: { 'x-goog-api-key': GEMINI_API_KEY!, 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              systemInstruction: { parts: [{ text:
+  const system =
 `You convert ${langName} caption words into ${style}: the way ${langName} speakers write their language in English letters on WhatsApp or YouTube comments.
 Rules:
 - Exactly one output string per input word, same order. Never merge, split, drop or add words.
 - Use common, natural spellings (e.g. నుంచి → "nunchi", నేను → "nenu", ఏమైంది → "emaindi", మనదే → "manade"), not academic transliteration and no diacritics.
 - English words written in ${langName} script get their normal English spelling (ఇట్స్ → "it's", ట్రూ → "true", కాటన్ → "cotton", యాక్టర్స్ → "actors", యాడ్ → "ad").
 - Numbers and words already in English letters stay as they are. Drop trailing punctuation.
-- Lowercase, except names and the pronoun "I".` }] },
-              contents: [{ role: 'user', parts: [{ text: JSON.stringify(words) }] }],
-              generationConfig: {
-                temperature: 0,
-                responseMimeType: 'application/json',
-                responseSchema: { type: 'ARRAY', items: { type: 'STRING' } },
-                thinkingConfig: { thinkingBudget: 0 },
-              },
-            }),
-          }, 60_000)
-          if (res.status !== 404) break
-        }
-        if (!res!.ok) throw new Error(`Gemini ${res!.status}: ${(await res!.text()).slice(0, 200)}`)
-        const data = await res!.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] }
-        const arr = JSON.parse(data.candidates?.[0]?.content?.parts?.[0]?.text ?? '[]') as unknown[]
-        if (!Array.isArray(arr) || arr.length !== batch.length) {
-          throw new Error(`expected ${batch.length} words, got ${Array.isArray(arr) ? arr.length : 'non-array'}`)
-        }
-        for (let j = 0; j < batch.length; j++) {
-          const v = arr[j]
-          result[i + j] = typeof v === 'string' && v.trim() ? stripDiacritics(v.trim()).replace(/[.,!?।]+$/g, '') : undefined
-        }
-        break
-      } catch (err) {
-        if (attempt === 2) console.warn(`[transliterate] Gemini batch ${i}-${i + batch.length} failed, using fallback:`, err)
-      }
-    }
-  }
-
+- Lowercase, except names and the pronoun "I".`
+  const answers = await convertWordForWord(
+    entries.map(e => e.word.trim()),
+    // gemini-2.5-flash writes the most natural Tenglish in tests
+    batch => askGemini(JSON.stringify(batch), { system, schema: STRING_LIST, temperature: 0, thinkingBudget: 0, timeoutMs: 60_000 }),
+    '[transliterate]',
+  )
+  const result = answers.map(v => (typeof v === 'string' && v.trim() ? stripDiacritics(v.trim()).replace(/[.,!?।]+$/g, '') : undefined))
   console.log(`[transliterate] ${languageCode} → ${style} via Gemini for ${entries.length} word(s)`)
   return result
 }
@@ -1220,60 +1210,33 @@ const LATIN = /[A-Za-z]/
 export async function toNativeScript(entries: SarvamWord[], languageCode: string): Promise<(string | undefined)[]> {
   const out: (string | undefined)[] = new Array(entries.length).fill(undefined)
   const langName = LANG_NAMES[languageCode]
-  if (!langName || !GEMINI_API_KEY) return out
+  if (!langName || !aiProvider()) return out
   const todo = entries
     .map((e, i) => ({ i, word: e.word.trim() }))
     .filter(x => LATIN.test(x.word) && !NATIVE_SCRIPT.test(x.word))
   if (!todo.length) return out
 
-  const BATCH = 80
-  for (let b = 0; b < todo.length; b += BATCH) {
-    const batch = todo.slice(b, b + BATCH)
-    // Punctuation stays outside the conversion and goes back on afterwards
-    const split = batch.map(x => {
-      const m = x.word.match(/^(.*?)([.,!?।…:;"')\]]*)$/)!
-      return { core: m[1], tail: m[2] }
-    })
-    try {
-      let res: Response | undefined
-      for (const model of ['gemini-2.5-flash', 'gemini-flash-latest']) {
-        res = await fetchWithTimeout(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-            method: 'POST',
-            headers: { 'x-goog-api-key': GEMINI_API_KEY!, 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              systemInstruction: { parts: [{ text:
+  // Punctuation stays outside the conversion and goes back on afterwards
+  const split = todo.map(x => {
+    const m = x.word.match(/^(.*?)([.,!?।…:;"')\]]*)$/)!
+    return { core: m[1], tail: m[2] }
+  })
+  const system =
 `You write English words in ${langName} script, the way ${langName} captions and news write English words spoken in a ${langName} video (phonetically, as ${langName} speakers pronounce them).
 Rules:
 - Exactly one output string per input word, same order. Never merge, split, drop or add words.
 - Spell by sound in ${langName} script${langName === 'Telugu' ? ' (so → "సో", think → "థింక్", actually → "యాక్చువల్లీ", I → "ఐ", it\'s → "ఇట్స్", brand → "బ్రాండ్", YouTube → "యూట్యూబ్")' : ''}.
-- Numbers stay as digits. Keep capital-letter brand names readable by sound. No English letters in the output unless the input is only digits.` }] },
-              contents: [{ role: 'user', parts: [{ text: JSON.stringify(split.map(x => x.core)) }] }],
-              generationConfig: {
-                temperature: 0,
-                responseMimeType: 'application/json',
-                responseSchema: { type: 'ARRAY', items: { type: 'STRING' } },
-                thinkingConfig: { thinkingBudget: 0 },
-              },
-            }),
-          }, 60_000)
-        if (res.status !== 404) break
-      }
-      if (!res!.ok) throw new Error(`Gemini ${res!.status}: ${(await res!.text()).slice(0, 200)}`)
-      const data = await res!.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] }
-      const arr = JSON.parse(data.candidates?.[0]?.content?.parts?.[0]?.text ?? '[]') as unknown[]
-      if (!Array.isArray(arr) || arr.length !== batch.length) {
-        throw new Error(`expected ${batch.length} words, got ${Array.isArray(arr) ? arr.length : 'non-array'}`)
-      }
-      batch.forEach((x, j) => {
-        const v = arr[j]
-        // Only take real conversions; anything still in English letters keeps the original
-        if (typeof v === 'string' && v.trim() && NATIVE_SCRIPT.test(v) && !LATIN.test(v)) out[x.i] = v.trim() + split[j].tail
-      })
-    } catch (err) {
-      console.warn(`[native-script] batch ${b}-${b + batch.length} failed, keeping English letters:`, err)
-    }
-  }
+- Numbers stay as digits. Keep capital-letter brand names readable by sound. No English letters in the output unless the input is only digits.`
+  const answers = await convertWordForWord(
+    split.map(x => x.core),
+    batch => askGemini(JSON.stringify(batch), { system, schema: STRING_LIST, temperature: 0, thinkingBudget: 0, timeoutMs: 60_000 }),
+    '[native-script]',
+  )
+  todo.forEach((x, j) => {
+    const v = answers[j]
+    // Only take real conversions; anything still in English letters keeps the original
+    if (typeof v === 'string' && v.trim() && NATIVE_SCRIPT.test(v) && !LATIN.test(v)) out[x.i] = v.trim() + split[j].tail
+  })
   console.log(`[native-script] ${todo.length} English word(s) → ${langName} script`)
   return out
 }
@@ -1324,7 +1287,7 @@ async function transliterateToRoman(
 
   // Gemini gives natural Tenglish/Hinglish (e.g. "nunchi", not "numchi"); words it
   // couldn't convert are filled from the fallback
-  if (GEMINI_API_KEY) {
+  if (aiProvider()) {
     const viaGemini = await transliterateWithGemini(entries, lang)
     if (viaGemini.every(Boolean)) return viaGemini
     const fb = await fallback()

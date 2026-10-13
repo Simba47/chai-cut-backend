@@ -8,11 +8,11 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { r2, R2_BUCKET, r2DownloadToFile, r2UploadFile } from '../r2.js'
 import db from '../db.js'
 import type { Job, RenderJobPayload } from '../types.js'
-import { GoogleGenerativeAI } from '@google/generative-ai'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { computeCutRanges, keptRanges, makeTimeMap, reactionRanges, removedMs, type Range } from '../lib/cuts.js'
 import { cleanTrims } from '../lib/trims.js'
+import { aiProvider, askGemini } from '../lib/gemini.js'
 
 const execFileAsync = promisify(execFile)
 import { fileURLToPath } from 'node:url'
@@ -277,8 +277,10 @@ const PRESETS = new Set(['pop', 'highlight', 'bounce', 'word', 'hormozi', 'box',
  * render.py and the editor look words up by). Gemini reads the clip's lines once; null when it
  * fails, so the clip renders without emphasis.
  */
+const EMPHASIS_SCHEMA = { type: 'OBJECT', properties: { words: { type: 'ARRAY', items: { type: 'INTEGER' } } }, required: ['words'] }
+
 export async function pickEmphasis(words: Array<{ word: string; start_ms: number; end_ms: number }>): Promise<Record<string, true> | null> {
-  if (!words.length || !process.env.GEMINI_API_KEY) return null
+  if (!words.length || !aiProvider()) return null
   // Lines as the captions break them: a pause over 300 ms or 5 words
   const lines: number[][] = []
   words.forEach((w, i) => {
@@ -293,8 +295,8 @@ Return ONLY JSON: {"words": [index, ...]}
 
 ${text}`
   try {
-    const model = new GoogleGenerativeAI(process.env.GEMINI_API_KEY).getGenerativeModel({ model: 'gemini-2.5-flash' })
-    const out = (await model.generateContent(prompt)).response.text()
+    // A fixed answer shape: without it the model sometimes nests the indices per line
+    const out = await askGemini(prompt, { schema: EMPHASIS_SCHEMA, temperature: 0, thinkingBudget: 0 })
     const match = out.match(/\{[\s\S]*\}/)
     const idx: unknown = match ? JSON.parse(match[0]).words : null
     if (!Array.isArray(idx)) return null

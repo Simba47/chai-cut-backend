@@ -1,4 +1,3 @@
-import { GoogleGenerativeAI } from '@google/generative-ai'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
@@ -9,6 +8,8 @@ import db from '../db.js'
 import type { Job, AiEditJobPayload } from '../types.js'
 import { handleTranscribeJob } from './transcribe.js'
 import { findClips, type FoundClip } from '../lib/clipFinder.js'
+import { askGemini } from '../lib/gemini.js'
+import { findLoops } from '../lib/transcriptGuard.js'
 import { generateClipText, fontForText, type ClipText, type ClipTextLanguage } from '../lib/clipText.js'
 import { brollEnabled, pickBrollMoments, searchStock, downloadStock, withBroll } from '../lib/broll.js'
 import { findVisuals, describeVisuals, pickVisualMoments, detectPanels, refinePanels, type Visual, type VisualMoment, type Panel } from '../lib/visuals.js'
@@ -1443,11 +1444,7 @@ type Word = { word: string; start_ms: number; end_ms: number; speaker_id?: strin
 // Gemini picks the clips: the numbered-line, windowed, scored method shared with the app's
 // "Best moments" (src/lib/clipFinder.ts)
 async function selectHighlights(words: Word[], clipCount: number, durationMs: number, exclude: Array<[number, number]> = []): Promise<FoundClip[]> {
-  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!)
-  const ask = async (system: string, user: string) => {
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', systemInstruction: system })
-    return (await model.generateContent(user)).response.text()
-  }
+  const ask = (system: string, user: string) => askGemini(user, { system })
   // Enough candidates per window that a short video (one window) can still fill the request
   const windowCount = Math.max(1, Math.ceil(durationMs / (9 * 60_000)))
   // More candidates when earlier batches already took some moments
@@ -1616,10 +1613,16 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       await waitForFullTranscription(video_id, signal)
       ;({ words, whole } = await loadWords(video_id))
     }
-    if (complete()) {
+    // A transcript saved before the runaway guard (lib/transcriptGuard.ts) can hold a stuck
+    // reading: one phrase hundreds of times over, which clip finding reads instead of the video.
+    // It is read again (that reading is guarded, so a video is only read again once)
+    const loops = complete() ? findLoops(words) : []
+    if (complete() && !loops.length) {
       console.log(`[ai_edit] Using the saved transcript of ${video_id} (${words.length} words): nothing is sent for captions`)
     } else {
-      console.log(`[ai_edit] Transcript for ${video_id} missing or partial (${words.length} words) — transcribing now`)
+      console.log(loops.length
+        ? `[ai_edit] The saved transcript of ${video_id} has a stuck reading (${loops.reduce((n, l) => n + l.words * l.copies, 0)} of ${words.length} words are loops) — reading the video again`
+        : `[ai_edit] Transcript for ${video_id} missing or partial (${words.length} words) — transcribing now`)
       await handleTranscribeJob({
         id: `ai-edit-tx-${ai_edit_job_id}`,
         type: 'transcribe',
@@ -1673,7 +1676,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       await new Promise(r => setTimeout(r, (i % 4) * 250)) // spread the calls a little
       try {
         const said = words.filter(w => w.start_ms >= h.start_ms && w.start_ms < h.end_ms)
-        return await generateClipText(said, video.title ?? null, process.env.GEMINI_API_KEY!, titleLanguageFor(payload.title_language, said))
+        return await generateClipText(said, video.title ?? null, prompt => askGemini(prompt), titleLanguageFor(payload.title_language, said))
       } catch (e) {
         console.warn(`[ai_edit] clip text failed for ${h.start_ms}-${h.end_ms}:`, e instanceof Error ? e.message : e)
         return null
@@ -1693,7 +1696,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       // under the speaker when they talk about them
       let visuals: Visual[] = []
       try {
-        visuals = await describeVisuals(await findVisuals(videoPath, join(tmp, 'visuals'), signal), process.env.GEMINI_API_KEY!)
+        visuals = await describeVisuals(await findVisuals(videoPath, join(tmp, 'visuals'), signal))
         console.log(`[ai_edit] ${visuals.length} related visual(s) available${visuals.length ? `: ${visuals.slice(0, 5).map(v => v.about).join('; ')}` : ''}`)
       } catch (e) {
         console.warn('[ai_edit] related visuals skipped:', e instanceof Error ? e.message : e)
@@ -1711,7 +1714,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         const tDetect = Date.now()
         const analysis = await analyseClip(tmp, videoPath, highlight.start_ms, highlight.end_ms, size, words, signal)
         // Graphics the video's editor put next to the speaker (shown under them, not cut off)
-        analysis.panels = await detectPanels(videoPath, highlight.start_ms, highlight.end_ms, tmp, process.env.GEMINI_API_KEY!, signal)
+        analysis.panels = await detectPanels(videoPath, highlight.start_ms, highlight.end_ms, tmp, signal)
           .then(found => refinePanels(found, analysis.cuts, clipDurationMs, videoPath, highlight.start_ms))
           .catch(e => { console.warn('[ai_edit] panel detection skipped:', e instanceof Error ? e.message : e); return [] })
         const detectS = ((Date.now() - tDetect) / 1000).toFixed(1)
@@ -1720,7 +1723,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         let segments: ClipSegment[] = buildSegments(analysis, clipDurationMs, framing)
         // Related visuals: the speaker on top, what they're talking about below (a split: not with cuts off)
         if (visuals.length && framing.layouts) {
-          const moments = await pickVisualMoments(words, highlight.start_ms, highlight.end_ms, visuals, process.env.GEMINI_API_KEY!)
+          const moments = await pickVisualMoments(words, highlight.start_ms, highlight.end_ms, visuals)
             .catch(e => { console.warn('[ai_edit] related visual picking failed:', e instanceof Error ? e.message : e); return [] })
           const vw = visualWindows(moments, analysis, highlight.start_ms)
           if (vw.length) {
@@ -1777,7 +1780,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
  */
 async function addStockBroll(segments: ClipSegment[], words: Word[], highlight: FoundClip, userId: string, tmp: string): Promise<ClipSegment[]> {
   try {
-    const moments = await pickBrollMoments(words, highlight.start_ms, highlight.end_ms, process.env.GEMINI_API_KEY!)
+    const moments = await pickBrollMoments(words, highlight.start_ms, highlight.end_ms)
     const shots: Array<{ start_ms: number; end_ms: number; videoId: string }> = []
     for (const m of moments) {
       try {
