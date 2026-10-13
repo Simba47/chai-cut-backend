@@ -43,6 +43,11 @@ export interface TrackSubjectsJobPayload {
    * and frame the clip on whoever is talking — written into the clip
    */
   auto?: boolean
+  /**
+   * The editor's Subjects tool: only list the clip's camera angles (its clip_angles row) — nobody
+   * is tracked
+   */
+  angles?: boolean
 }
 
 /** The editing copy of a video (jobs/proxy.ts) */
