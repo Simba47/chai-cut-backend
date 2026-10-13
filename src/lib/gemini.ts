@@ -8,6 +8,9 @@
  * (`gcloud auth application-default login` on a developer PC). Without GOOGLE_CLOUD_PROJECT the
  * request goes to the Gemini API with GEMINI_API_KEY, as before.
  *
+ * Built for many users at once: a cap on requests in flight per process (AI_MAX_CONCURRENT) and
+ * retries spread out at random (see "Many users at once" below).
+ *
  * Only Node built-ins, so this file is copied as-is between the repos:
  * chai-cut-backend/src/lib/gemini.ts and chai-cut-frontend/src/lib/gemini.ts. Keep the two identical.
  */
@@ -80,20 +83,63 @@ export async function askGemini(input: string | GeminiPart[], opts: AskOptions =
   }
 
   // Vertex answers 429 when shared capacity is briefly busy: wait and try again
-  const tries = 4
   for (let attempt = 1; ; attempt++) {
-    const res = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(opts.timeoutMs ?? 120_000) })
+    const res = await inTurn(() => fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(opts.timeoutMs ?? 120_000) }))
     if (res.ok) {
       const data = await res.json() as { candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] } }[] }
       return (data.candidates?.[0]?.content?.parts ?? []).filter(p => !p.thought).map(p => p.text ?? '').join('')
     }
     const text = await res.text()
-    if ((res.status === 429 || res.status >= 500) && attempt < tries) {
-      await new Promise(r => setTimeout(r, 2000 * 2 ** (attempt - 1)))
+    if ((res.status === 429 || res.status >= 500) && attempt < TRIES) {
+      await new Promise(r => setTimeout(r, retryDelayMs(attempt, retryAfterMs(res.headers.get('retry-after')))))
       continue
     }
     throw new GeminiError(`Gemini ${res.status} (${provider}): ${text.slice(0, 300)}`, res.status)
   }
+}
+
+// ── Many users at once ───────────────────────────────────────────────────────
+// Every user's AI calls share one Google Cloud project's capacity. A burst from one process only
+// earns "busy" (429) answers, and many workers retrying on the same schedule hit the same busy
+// moment again. So each process sends at most AI_MAX_CONCURRENT requests at a time (the rest wait
+// their turn), and retries wait a random part of a growing delay, or as long as Google asks.
+
+/** Tries per request: about a minute of waiting in all before giving up */
+const TRIES = 6
+/** Requests one process has in flight at most (AI_MAX_CONCURRENT, default 8) */
+const MAX_IN_FLIGHT = Math.max(1, Number(process.env.AI_MAX_CONCURRENT) || 8)
+let inFlight = 0
+const waiting: Array<() => void> = []
+
+/** Runs `send` when fewer than MAX_IN_FLIGHT requests are out; a finished one hands its turn to the next in line */
+async function inTurn<T>(send: () => Promise<T>): Promise<T> {
+  if (inFlight < MAX_IN_FLIGHT) inFlight++
+  else await new Promise<void>(r => waiting.push(r))
+  try {
+    return await send()
+  } finally {
+    const next = waiting.shift()
+    if (next) next()
+    else inFlight--
+  }
+}
+
+/**
+ * How long to wait before try `attempt + 1`: half of a delay that doubles from 2 s (up to 30 s)
+ * plus a random part of the other half, so workers that were refused together come back apart;
+ * never less than Google's own hint
+ */
+export function retryDelayMs(attempt: number, hintMs = 0): number {
+  const cap = Math.min(30_000, 2000 * 2 ** (attempt - 1))
+  return Math.max(hintMs, cap / 2 + Math.random() * (cap / 2))
+}
+
+/** A Retry-After header (seconds, or an HTTP date) in ms; 0 when there is none, capped at 60 s */
+export function retryAfterMs(header: string | null): number {
+  if (!header) return 0
+  const sec = Number(header)
+  const ms = Number.isFinite(sec) ? sec * 1000 : Date.parse(header) - Date.now()
+  return Number.isFinite(ms) && ms > 0 ? Math.min(60_000, ms) : 0
 }
 
 // ── Vertex AI login ──────────────────────────────────────────────────────────
