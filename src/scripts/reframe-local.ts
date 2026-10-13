@@ -8,7 +8,7 @@
  *                                        [--words-from <video id>] [--visuals]
  *
  * --visuals finds the whole video's own visuals and picks related ones for the clip (two small
- * Gemini calls, with GEMINI_API_KEY from .env).
+ * Gemini calls: Vertex AI with GOOGLE_CLOUD_PROJECT from .env, else GEMINI_API_KEY).
  * --words-from reads that video's transcript (read-only) for real sentence endings and speakers.
  * Without it, someone is assumed to be talking the whole time (one speaker label).
  */
@@ -25,11 +25,19 @@ process.env.DATABASE_URL ||= 'postgres://unused@localhost/unused'
 process.env.R2_ENDPOINT ||= 'http://localhost'
 process.env.R2_ACCESS_KEY_ID ||= 'unused'
 process.env.R2_SECRET_ACCESS_KEY ||= 'unused'
-process.env.GEMINI_API_KEY ||= 'unused'
 const { analyseClip, buildSegments, probeSize, trackFaces, planSpeakers, reactionStrength, personShots, visualWindows, withShotReactions } = await import('../jobs/ai_edit.js')
 const { findVisuals, describeVisuals, pickVisualMoments, detectPanels, refinePanels } = await import('../lib/visuals.js')
 
 const exec = promisify(execFile)
+
+/** --visuals: the AI settings from .env (Vertex AI or the Gemini API key), and nothing else from it */
+async function loadAiSettings() {
+  const { config } = await import('dotenv')
+  const parsed = config({ processEnv: {} }).parsed ?? {}
+  for (const k of ['GOOGLE_CLOUD_PROJECT', 'GOOGLE_CLOUD_LOCATION', 'GOOGLE_CREDENTIALS_JSON', 'GEMINI_API_KEY']) if (parsed[k]) process.env[k] ||= parsed[k]
+  const { aiProvider } = await import('../lib/gemini.js')
+  if (!aiProvider()) throw new Error('--visuals needs GOOGLE_CLOUD_PROJECT (Vertex AI) or GEMINI_API_KEY in .env')
+}
 const arg = (name: string, fallback?: string) => {
   const i = process.argv.indexOf(`--${name}`)
   return i >= 0 ? process.argv[i + 1] : fallback
@@ -77,21 +85,18 @@ try {
   const t0 = Date.now()
   const analysis = await analyseClip(tmp, clip, 0, durMs, size, words)
   if (process.argv.includes('--visuals')) {
-    const { config } = await import('dotenv')
-    const key = (config({ processEnv: {} }).parsed ?? {}).GEMINI_API_KEY!
-    analysis.panels = await refinePanels(await detectPanels(clip, 0, durMs, tmp, key), analysis.cuts, durMs, clip, 0)
+    await loadAiSettings()
+    analysis.panels = await refinePanels(await detectPanels(clip, 0, durMs, tmp), analysis.cuts, durMs, clip, 0)
     for (const p of analysis.panels) console.log(`  graphic panel ${(p.start_ms / 1000).toFixed(1)}–${(p.end_ms / 1000).toFixed(1)}s at x ${p.x.toFixed(2)} y ${p.y.toFixed(2)} w ${p.w.toFixed(2)} h ${p.h.toFixed(2)}`)
   }
   let segments = buildSegments(analysis, durMs)
 
   // Related visuals (the speaker on top, what they talk about below), from the whole video
   if (process.argv.includes('--visuals')) {
-    const { config } = await import('dotenv')
-    const key = (config({ processEnv: {} }).parsed ?? {}).GEMINI_API_KEY
-    if (!key) throw new Error('--visuals needs GEMINI_API_KEY in .env')
+    await loadAiSettings()
     console.log('• Finding the video\'s own visuals (key frames of the whole video) …')
     const found = await findVisuals(video, join(tmp, 'visuals'))
-    const visuals = await describeVisuals(found, key)
+    const visuals = await describeVisuals(found)
     console.log(`  ${found.length} faceless stretch(es), ${visuals.length} worth showing:`)
     for (const v of visuals) console.log(`    ${(v.start_ms / 1000).toFixed(1)}s  ${v.about}`)
     // The transcript's words in source time, for picking
@@ -110,7 +115,7 @@ try {
       await sql.end()
       srcWords.splice(0, srcWords.length, ...rows.map(w => ({ word: w.word as string, start_ms: w.start_ms as number, end_ms: w.end_ms as number })))
     }
-    const moments = await pickVisualMoments(srcWords, from, from + durMs, visuals, key)
+    const moments = await pickVisualMoments(srcWords, from, from + durMs, visuals)
     for (const m of moments) console.log(`  related visual at ${(m.start_ms / 1000).toFixed(1)}–${(m.end_ms / 1000).toFixed(1)}s: ${m.visual.about}`)
     segments = withShotReactions(segments, visualWindows(moments, analysis, from), analysis.reelW)
   }
