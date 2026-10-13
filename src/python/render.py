@@ -183,13 +183,13 @@ def _write_ass(
         " BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
         f"Style: Default,{font_name},{font_size},{primary},&H00FFFFFF,&H00000000,{shadow},"
         "0,0,0,0,100,100,0,0,1,3,2,5,10,10,10,1",
-        *_preset_styles(style, font_name, font_size),
+        *_preset_styles(style, font_name, font_size, latin=roman or _is_latin(" ".join(_word_display(w, roman) for w in words))),
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
 
-    if style.get("animation") in _PRESETS:
+    if _is_preset(style):
         lines += _preset_events(clip_words, style, out_w, out_h, band_zones or [])
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(emoji_art.colour_emoji_ass(lines)) + "\n")
@@ -289,6 +289,54 @@ def _line_times(sentences: list[list[dict]]) -> list[tuple[int, int]]:
 # in highlight_color and 15% larger.
 
 _PRESETS = {"pop", "highlight", "bounce", "word", "hormozi", "box", "glow"}
+
+# ── Caption styles ("templates") ──────────────────────────────────────────────
+# A ready-made look: one of the presets above (`base`) drawn in its own font, with its own
+# capitals, outline, shadow, box and layout. The colours stay the user's (color, highlight_color).
+# The one picked is caption_styles.template. They are listed in caption_templates.json — the SAME file as the editor's
+# (frontend src/modules/captions/caption_templates.json): keep the two identical.
+#   base      — the preset whose animation it uses; "plain" = the spoken word changes colour, nothing else
+#   font      — a key of the file's fonts (used for Latin text; other scripts keep their Noto font)
+#   liveFont  — the spoken word is drawn in this font instead
+#   upper     — capital letters
+#   stack     — one word a line
+#   box       — the line sits on a box: "hl" = filled with highlight_color, "#RRGGBB" = that colour
+#               (base "box" without it: dark glass)
+#   liveText  — the spoken word keeps the text colour (no karaoke colour change)
+#   scale     — base "hormozi": how big the spoken word is (%)
+#   stroke    — outline thickness, shadow — drop shadow distance (px at 1080 wide)
+#   perLine   — words per caption line
+#   size      — % of the caption size it is drawn at (narrow fonts read small at the same size)
+def _load_templates() -> tuple[dict[str, dict], dict[str, tuple[str, int, int]]]:
+    try:
+        with open(Path(__file__).parent / "caption_templates.json", encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"[render] caption styles not loaded: {e}", file=sys.stderr)
+        return {}, {}
+    fonts = {k: (v["family"], int(v["bold"]), int(v["italic"])) for k, v in doc.get("fonts", {}).items()}
+    return {t["id"]: t for t in doc.get("templates", []) if t.get("font") in fonts}, fonts
+
+
+# id → template; font key → (the family name libass finds it by, Bold, Italic). Bold / Italic are
+# what the file already is, so libass never thickens or slants it itself (the editor draws the
+# same file as it is).
+_TEMPLATES, _TEMPLATE_FONTS = _load_templates()
+
+
+def _template(style: dict) -> dict:
+    """The caption style picked for these captions (caption_styles.template), {} when none.
+    `animation` keeps its base preset, which is what a worker from before templates draws."""
+    return _TEMPLATES.get(style.get("template") or "") or {}
+
+
+def _is_preset(style: dict) -> bool:
+    return style.get("animation") in _PRESETS or bool(_template(style))
+
+
+def _is_latin(text: str) -> bool:
+    """Only Latin letters (and digits, punctuation, emoji): a template's own font can draw it"""
+    return not any(ch.isalpha() and ord(ch) > 0x024F for ch in text)
 _POP_MS = 150
 _BOUNCE_MS = 180
 _BOX_PAD = 14          # highlight box padding (px at 1080 wide)
@@ -322,24 +370,34 @@ def _text_on(hex_color: str) -> str:
     return "#000000" if 0.299 * r + 0.587 * g + 0.114 * b > 150 else "#FFFFFF"
 
 
-def _preset_styles(style: dict, font_name: str, font_size: int) -> list[str]:
-    if style.get("animation") not in _PRESETS:
+def _preset_styles(style: dict, font_name: str, font_size: int, latin: bool = False) -> list[str]:
+    if not _is_preset(style):
         return []
     # The Noto Indic fonts have no Latin letters: Roman-letter captions use Roboto (the editor too)
     if style.get("language") == "roman":
         font_name = _FONT_NAMES["roboto"]
-    stroke = int(style.get("stroke_width") if style.get("stroke_width") is not None else 4)
+    tpl = _template(style)
+    bold, italic = 1, 0
+    # A template's own font, for text it can draw (Latin letters)
+    if tpl and latin:
+        font_name, bold, italic = _TEMPLATE_FONTS[tpl["font"]]
+        font_size = round(font_size * float(tpl.get("size") or 100) / 100)
+    stroke = int(tpl["stroke"] if "stroke" in tpl else style.get("stroke_width") if style.get("stroke_width") is not None else 4)
+    shadow = int(tpl.get("shadow", 2))
     hl = _hex_to_ass(style.get("highlight_color") or "#FFE700", 0)
     primary = _hex_to_ass(style.get("color") or "#ffffff", 0)
+    box = tpl.get("box")
+    line_box = hl if box == "hl" else _hex_to_ass(box, 0) if box else _LINE_BOX
     return [
         f"Style: Preset,{font_name},{font_size},{primary},&H00FFFFFF,&H00000000,&H80000000,"
-        f"1,0,0,0,100,100,0,0,1,{stroke},2,5,10,10,10,1",
+        f"{bold},{italic},0,0,100,100,0,0,1,{stroke},{shadow},5,10,10,10,1",
         # Opaque box (BorderStyle 3) in the highlight colour; its text is never drawn
         f"Style: PresetBox,{font_name},{font_size},&HFF000000,&H00FFFFFF,{hl},&H00000000,"
-        f"1,0,0,0,100,100,0,0,3,{_BOX_PAD},0,5,10,10,10,1",
-        # box preset: one dark box round the whole line; its text is never drawn
-        f"Style: PresetLine,{font_name},{font_size},&HFF000000,&H00FFFFFF,{_LINE_BOX},&H00000000,"
-        f"1,0,0,0,100,100,0,0,3,{_BOX_PAD},0,5,10,10,10,1",
+        f"{bold},{italic},0,0,100,100,0,0,3,{_BOX_PAD},0,5,10,10,10,1",
+        # box preset: one box round the whole line (dark glass, or a template's highlight colour);
+        # its text is never drawn
+        f"Style: PresetLine,{font_name},{font_size},&HFF000000,&H00FFFFFF,{line_box},&H00000000,"
+        f"{bold},{italic},0,0,100,100,0,0,3,{_BOX_PAD},0,5,10,10,10,1",
     ]
 
 
@@ -349,8 +407,15 @@ def _esc(text: str) -> str:
 
 def _preset_events(words: list[dict], style: dict, out_w: int, out_h: int, zones: list[tuple[int, int, int]]) -> list[str]:
     anim = style["animation"]
+    # A template (see _TEMPLATES) is drawn as its base preset, with its own settings
+    tpl = _template(style)
+    if tpl:
+        anim = tpl["base"]
     roman = style.get("language") == "roman"
-    upper = bool(style.get("uppercase")) or anim == "hormozi"
+    upper = bool(style.get("uppercase")) or (bool(tpl.get("upper")) if tpl else anim == "hormozi")
+    # The spoken word in another font: Latin text only (as the template's own font)
+    live_font = _TEMPLATE_FONTS.get(tpl.get("liveFont") or "")
+    joiner = "\\N" if tpl.get("stack") else " "
     color = style.get("color") or "#ffffff"
     hl = style.get("highlight_color") or "#FFE700"
     emphasis = style.get("emphasis") or {}
@@ -359,12 +424,13 @@ def _preset_events(words: list[dict], style: dict, out_w: int, out_h: int, zones
             emphasis = json.loads(emphasis)
         except ValueError:
             emphasis = {}
-    stroke = int(style.get("stroke_width") if style.get("stroke_width") is not None else 4)
-    if anim == "hormozi":
+    stroke = int(tpl["stroke"] if "stroke" in tpl else style.get("stroke_width") if style.get("stroke_width") is not None else 4)
+    if anim == "hormozi" and not tpl:
         stroke += _HORMOZI_STROKE
     if anim == "box":
         stroke = 0
-    per_line = 1 if anim == "word" else int(style.get("words_per_line") or (3 if anim in ("highlight", "hormozi") else _MAX_PHRASE_WORDS))
+    hormozi_scale = int(tpl.get("scale") or _HORMOZI_SCALE)
+    per_line = 1 if anim == "word" else int(style.get("words_per_line") or tpl.get("perLine") or (3 if anim in ("highlight", "hormozi") else _MAX_PHRASE_WORDS))
     pos_y_frac = style.get("position_y")
     pos_y = int(float(pos_y_frac if pos_y_frac is not None else (0.5 if anim == "word" else 0.84)) * out_h)
     pos_x = out_w // 2
@@ -379,15 +445,28 @@ def _preset_events(words: list[dict], style: dict, out_w: int, out_h: int, zones
         shown = [(w, (t.upper() if upper else t)) for w, t in shown if t]
         if not shown:
             continue
-        for a, b, y in _split_by_zones(start_ms, end_ms, zones, pos_y):
+        pieces = _split_by_zones(start_ms, end_ms, zones, pos_y)
+        use_live_font = bool(live_font) and (roman or _is_latin(" ".join(t for _, t in shown)))
+        if use_live_font:
+            # A font can't change part-way through a line: one piece per spoken word
+            marks = sorted({w["start_ms"] for w, _ in shown[1:] if start_ms < w["start_ms"] < end_ms})
+            split: list[tuple[int, int, int]] = []
+            for a, b, y in pieces:
+                edges = [a, *[m for m in marks if a < m < b], b]
+                split += [(edges[i], edges[i + 1], y) for i in range(len(edges) - 1)]
+            pieces = split
+        for a, b, y in pieces:
             text_runs, box_runs = [], []
             for j, (w, t) in enumerate(shown):
                 on = w["start_ms"] - a                      # spoken from (piece-relative)
                 off = (shown[j + 1][0]["start_ms"] if j + 1 < len(shown) else end_ms) - a
                 emph = bool(emphasis.get(str(w.get("_src_start", w["start_ms"]))))
                 sc = round(base_scale * (_EMPHASIS_SCALE if emph else 100) / 100)
-                rest = _ass_color(hl if emph else color)
+                # (on a box filled with the highlight colour an emphasised word stays the text colour: only bigger)
+                rest = _ass_color(hl if emph and not tpl.get("box") else color)
                 live = _ass_color(_text_on(hl)) if anim == "highlight" else _ass_color(hl)
+                if tpl.get("liveText"):
+                    live = rest   # the spoken word keeps its colour
                 spoken = on <= 0 < off
                 tags = f"\\fscx{sc}\\fscy{sc}"
                 if anim in ("pop", "word"):
@@ -399,7 +478,7 @@ def _preset_events(words: list[dict], style: dict, out_w: int, out_h: int, zones
                                 f"\\t({on},{on + _POP_MS // 2},\\fscx{hi}\\fscy{hi})"
                                 f"\\t({on + _POP_MS // 2},{on + _POP_MS},\\fscx{sc}\\fscy{sc})")
                 if anim == "hormozi":
-                    big = round(sc * _HORMOZI_SCALE / 100)
+                    big = round(sc * hormozi_scale / 100)
                     if spoken:
                         tags = f"\\fscx{big}\\fscy{big}"
                     if on > 0:
@@ -437,18 +516,21 @@ def _preset_events(words: list[dict], style: dict, out_w: int, out_h: int, zones
                     if 0 < off < b - a:
                         box += f"\\t({off},{off + 1},\\3a&HFF&)"
                     box_runs.append(f"{{{box}}}{_esc(t)}")
+                if use_live_font and spoken:
+                    # (last, so nothing above replaces it; this piece is cut to the word's own time)
+                    tags = f"\\fn{live_font[0]}\\b{live_font[1]}\\i{live_font[2]}" + tags
                 text_runs.append(f"{{{tags}}}{_esc(t)}")
             if anim == "bounce" and a == start_ms:
                 dy = round(out_h * 0.02)
                 head = f"{{\\move({pos_x},{y + dy},{pos_x},{y},0,{_BOUNCE_MS})\\fad(80,0)}}"
             else:
                 head = f"{{\\pos({pos_x},{y})}}"
-            if anim == "box":
+            if anim == "box" or (tpl.get("box") and not tpl.get("stack")):
                 plain = " ".join(_esc(t) for _, t in shown)
                 events.append(f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},PresetLine,,0,0,0,,{head}{plain}")
             if box_runs:
-                events.append(f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},PresetBox,,0,0,0,,{head}{' '.join(box_runs)}")
-            events.append(f"Dialogue: 1,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},Preset,,0,0,0,,{head}{' '.join(text_runs)}")
+                events.append(f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},PresetBox,,0,0,0,,{head}{joiner.join(box_runs)}")
+            events.append(f"Dialogue: 1,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},Preset,,0,0,0,,{head}{joiner.join(text_runs)}")
     return events
 
 
