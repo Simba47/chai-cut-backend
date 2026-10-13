@@ -8,8 +8,7 @@ import db from '../db.js'
 import type { TransactionSql } from 'postgres'
 import type { Job, TrackSubjectsJobPayload } from '../types.js'
 import { detectFaces, detectCuts, trackFaces, probeSize, FRAME_INTERVAL_MS, type FrameDetection, type CropBox, type SpokenWord } from './ai_edit.js'
-import { buildKeyframes, type SubjectPoint, type ViewChange } from './subject_framing.js'
-import { layoutSections } from './subedit_layouts.js'
+import { autoDirectChanges, followChanges, buildKeyframes, type SubjectPoint } from './subject_framing.js'
 
 // ── Subjects: people the user marked in a clip, followed through it ────────────
 // In the editor the user pauses on a person and clicks them (a "subject"). This job looks at the
@@ -400,6 +399,8 @@ const SUBJECT_COLORS = ['#f472b6', '#38bdf8', '#facc15', '#a78bfa', '#fb923c', '
 const MAX_PEOPLE = 6
 /** Everyone seen at least this long is registered (4 frames a second: 1 s), so a passing face isn't */
 const MIN_PERSON_FRAMES = 4
+/** Frame slots that show the main video whole (not cropped): their view isn't moved (frames.ts "contain") */
+const CONTAIN_SLOTS: Record<string, number[]> = { frame_blur_fill: [0], frame_screenshot: [0], frame_screen_face: [0] }
 
 /**
  * The people in the clip, as marks: the face tracks, grouped into people by the colours of face and
@@ -527,55 +528,78 @@ async function subEditSteps(clipId: string, signal: AbortSignal, onCreated: (ids
     if (!tracked.length) throw new Error('No one could be followed through this clip')
     // Last chance to stop before the clip itself changes
     signal.throwIfAborted()
-    const sections = await rebuildClip(clipId, from, to, tracked, sourceCuts, size)
-    console.log(`[track_subjects] sub-edit clip ${clipId}: ${found.length} people, ${sections} (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
+    const framed = await frameClip(clipId, from, to, tracked, sourceCuts, size)
+    console.log(`[track_subjects] sub-edit clip ${clipId}: ${found.length} people, ${framed} view(s) framed (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
   } finally {
     await rm(tmp, { recursive: true, force: true })
   }
 }
 
 /**
- * Sub-edit's clip: its sections rebuilt from who is in the picture (subedit_layouts.ts) — one
- * person: Vertical on them; two: Split, one each; three: Trio, the one talking in the middle; more:
- * Split by halves. Each person's slot follows them. The clip's earlier sections (their layouts,
- * views, frames and videos on top) are replaced; its text, photos, music and captions stay. The
- * old export no longer matches. One transaction. Returns what it made ("3 sections: …").
+ * Frame the clip on the tracked people (the editor's frameClipOnSubjects): in every section, a view
+ * showing the main video switches to whoever is talking; a section with two or three such views
+ * (split, trio, a frame) puts one person in each. Views keep their size. Locked and Horizontal
+ * sections, photos, other videos and slots showing the video whole are left alone. A clip never
+ * opened (no sections yet) gets one Vertical section. The clip's old export no longer matches.
  */
-async function rebuildClip(
+async function frameClip(
   clipId: string, clipStart: number, clipEnd: number, people: Array<{ id: string; path: SubjectPoint[]; speaking: Array<[number, number]> }>,
   cuts: number[], size: { width: number; height: number } | null,
-): Promise<string> {
+): Promise<number> {
   // Sections and keyframes are kept in clip time (ms from the clip's start)
   const toSource = (t: number) => clipStart + t
   const toTimeline = (s: number) => s - clipStart
-  const videoAR = size ? size.width / size.height : 16 / 9
-  const parts = layoutSections(people, 0, clipEnd - clipStart, toSource, toTimeline, cuts, videoAR)
-  if (!parts.length) throw new Error('No one could be followed through this clip')
-  await db.begin(async tx => {
-    // (crop boxes, their keyframes and the transitions go with the sections)
-    await tx`DELETE FROM segments WHERE clip_id = ${clipId}`
-    const segRows = await tx<{ id: string; sort_order: number }[]>`
-      INSERT INTO segments ${tx(parts.map((p, i) => ({ clip_id: clipId, start_ms: Math.round(p.from), end_ms: Math.round(p.to), layout: p.layout, sort_order: i })))}
-      RETURNING id, sort_order
+  const length = clipEnd - clipStart
+  // A 9:16 view at full height, as a share of the source's width
+  const reelW = size ? Math.min(1, (9 / 16) * (size.height / size.width)) : 81 / 256
+  return db.begin(async tx => {
+    const segs = await tx<{ id: string; start_ms: number; end_ms: number; layout: string; frame: { main_slots?: number[] } | null; locked?: boolean | null }[]>`
+      SELECT * FROM segments WHERE clip_id = ${clipId} ORDER BY start_ms
     `
-    const segId = new Map(segRows.map(r => [Number(r.sort_order), r.id]))
-    const boxInputs = parts.flatMap((p, i) => p.slots.map((changes, slot) => ({
-      row: { segment_id: segId.get(i)!, slot_index: slot, source_video_id: null, source_offset_ms: Math.round(p.from), muted: false },
-      changes, start: Math.round(p.from),
-    })))
-    const boxRows = await tx<{ id: string; segment_id: string; slot_index: number }[]>`
-      INSERT INTO crop_boxes ${tx(boxInputs.map(b => b.row))} RETURNING id, segment_id, slot_index
+    if (!segs.length) {
+      // Never opened: one Vertical section over the whole clip (as the editor would open it)
+      const changes = autoDirectChanges(people, 0, length, toSource, { w: reelW, h: 1 }, cuts, toTimeline)
+      if (!changes) return 0
+      const [seg] = await tx`INSERT INTO segments (clip_id, start_ms, end_ms, layout, sort_order) VALUES (${clipId}, 0, ${length}, 'vertical', 0) RETURNING id`
+      const [box] = await tx`INSERT INTO crop_boxes (segment_id, slot_index, source_video_id, source_offset_ms, muted) VALUES (${seg.id}, 0, NULL, 0, false) RETURNING id`
+      await insertKeyframes(tx, box.id as string, changes, 0)
+      await tx`UPDATE clips SET status = 'draft', output_url = NULL WHERE id = ${clipId}`
+      return 1
+    }
+    const boxes = await tx<{ id: string; segment_id: string; slot_index: number; source_video_id: string | null; image_path: string | null }[]>`
+      SELECT id, segment_id, slot_index, source_video_id, image_path FROM crop_boxes WHERE segment_id = ANY(${segs.map(s => s.id)}) ORDER BY slot_index
     `
-    const boxId = new Map(boxRows.map(r => [`${r.segment_id}:${r.slot_index}`, r.id]))
-    for (const b of boxInputs) await insertKeyframes(tx, boxId.get(`${b.row.segment_id}:${b.row.slot_index}`)!, b.changes, b.start)
-    // The editor's note about videos on top described the old sections: gone with them
-    await tx`UPDATE clips SET layers = NULL, status = 'draft', output_url = NULL WHERE id = ${clipId}`
+    const kfs = await tx<{ box_id: string; t_ms: number; w: number; h: number }[]>`
+      SELECT box_id, t_ms, w, h FROM box_keyframes WHERE box_id = ANY(${boxes.map(b => b.id)}) ORDER BY t_ms
+    `
+    let framed = 0
+    for (const seg of segs) {
+      const start = Number(seg.start_ms), end = Number(seg.end_ms)
+      if (seg.locked || seg.layout === 'horizontal' || end - start <= 250) continue
+      const frame = seg.layout.startsWith('frame_')
+      const mainSlots = frame ? seg.frame?.main_slots ?? [0] : null
+      const views = boxes.filter(b => b.segment_id === seg.id && !b.image_path && !b.source_video_id
+        && (!mainSlots || (mainSlots.includes(b.slot_index) && !(CONTAIN_SLOTS[seg.layout] ?? []).includes(b.slot_index))))
+      for (const [i, box] of views.entries()) {
+        // The view keeps its size (its first keyframe); never framed: a full-height 9:16 in a Vertical section
+        const first = kfs.find(k => k.box_id === box.id)
+        const view = first ? { w: Number(first.w), h: Number(first.h) } : seg.layout === 'vertical' ? { w: reelW, h: 1 } : null
+        if (!view) continue
+        const changes = views.length === 1
+          ? autoDirectChanges(people, start, end, toSource, view, cuts, toTimeline)
+          : followChanges(people[i % people.length].path, start, end, toSource, view, 'smooth', cuts)
+        if (!changes?.length) continue
+        await tx`DELETE FROM box_keyframes WHERE box_id = ${box.id}`
+        await insertKeyframes(tx, box.id, changes, start)
+        framed++
+      }
+    }
+    if (framed) await tx`UPDATE clips SET status = 'draft', output_url = NULL WHERE id = ${clipId}`
+    return framed
   })
-  const names = parts.map(p => (p.layout === 'split' && p.slots.length === 2 && p.slots[0][0]?.w === 0.5 ? 'halves' : p.layout))
-  return `${parts.length} section(s): ${names.join(', ')}`
 }
 
-async function insertKeyframes(tx: TransactionSql, boxId: string, changes: readonly ViewChange[], start: number) {
+async function insertKeyframes(tx: TransactionSql, boxId: string, changes: ReturnType<typeof followChanges> & object, start: number) {
   const kfs = buildKeyframes(changes.map((c, k) => (k === 0 ? { ...c, t_ms: start } : c)))
     .map(k => ({ box_id: boxId, t_ms: Math.round(k.t_ms), x: round4(k.x), y: round4(k.y), w: round4(k.w), h: round4(k.h) }))
   for (let i = 0; i < kfs.length; i += 5000) await tx`INSERT INTO box_keyframes ${tx(kfs.slice(i, i + 5000))}`
