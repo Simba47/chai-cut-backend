@@ -205,7 +205,8 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
 
   // Animated presets emphasise the words that matter; asked once per clip and kept
   const style = captionStyles[0]
-  if (style && PRESETS.has(style.animation) && style.emphasis == null && words.length) {
+  // (a caption style — style.template — is a preset in its own look: it shows emphasis too)
+  if (style && (PRESETS.has(style.animation) || style.template) && style.emphasis == null && words.length) {
     const clipWords = words.filter(w => w.start_ms >= clip.start_ms && w.start_ms < clip.end_ms)
     const emphasis = await pickEmphasis(clipWords.map(w => ({ word: w.word as string, start_ms: w.start_ms as number, end_ms: w.end_ms as number })))
     if (emphasis) {
