@@ -1281,6 +1281,19 @@ def main(
     # use the default framing: a full-frame box, which the cover scale crops to a centred 9:16
     # (the same default the editor preview shows). Filling them keeps video, audio and captions
     # the same length and in sync.
+    # (videos put in between: the main video waits during each, so after one it is behind the
+    # clip's own time — render.ts sets each part's video_offset_ms; a filled part gets it here)
+    _inserts = spec.get("pieces") or []
+
+    def _video_at(t: int) -> int:
+        # (render.ts's pieces: each a stretch of the timeline, the main video from `from`, or held at `hold`)
+        for _p in _inserts:
+            if t < _p["at"] + _p["ms"]:
+                if _p.get("hold") is not None:
+                    return int(_p["hold"])
+                return int((_p.get("from") or 0) + max(0, t - _p["at"]))
+        return int(t)
+
     _filled: list[dict] = []
     _cursor = 0
     for _s in segments + [None]:
@@ -1289,8 +1302,9 @@ def main(
             print(f"[render] default framing for uncovered {_cursor}ms–{_gap_end}ms", flush=True)
             _filled.append({
                 "start_ms": _cursor, "end_ms": _gap_end, "layout": "vertical", "sort_order": 0,
+                **({"video_offset_ms": _video_at(_cursor)} if _inserts else {}),
                 "crop_boxes": [{
-                    "slot_index": 0, "source_video_id": None, "source_offset_ms": _cursor,
+                    "slot_index": 0, "source_video_id": None, "source_offset_ms": _video_at(_cursor),
                     "box_keyframes": [{"t_ms": _cursor, "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}],
                 }],
             })
@@ -1401,10 +1415,13 @@ def main(
         # ── FFmpeg inputs ──────────────────────────────────────────────────────
         clip_start_s = clip_start_ms / 1000.0
         clip_dur_s   = clip_dur_ms   / 1000.0
+        # (a clip of pieces can read further into the main video than it is long: a part cut from
+        # its edge skips video — render.ts says how far, source_ms)
+        read_s = max(clip_dur_s, float(spec.get("source_ms") or 0) / 1000.0)
         inputs = [
             "ffmpeg", "-y",
             "-ss", f"{clip_start_s:.3f}",
-            "-t",  f"{clip_dur_s:.3f}",
+            "-t",  f"{read_s:.3f}",
             "-i",  video_path,    # index 0
             "-i",  audio_path,    # index 1
         ]
@@ -2008,9 +2025,11 @@ def main(
             sclbl  = f"[pip{vi}s]"
             olbl   = f"[vpip{vi}]"
             # Trim overlay video to the display window starting at source_offset_ms
+            # (its frames moved to where its bar starts: without that the window showed the video's
+            # first seconds from the clip's start and was used up before its bar came)
             fp.append(
                 f"{vid_lbl}trim=start={off_s:.3f}:duration={pip_dur:.3f},"
-                f"setpts=PTS-STARTPTS{tslbl}"
+                f"setpts=PTS-STARTPTS+{t0:.3f}/TB{tslbl}"
             )
             fp.append(f"{tslbl}scale={vw}:{vh}:flags=lanczos{sclbl}")
             fp.append(
