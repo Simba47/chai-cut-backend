@@ -165,6 +165,10 @@ async function runMigrations() {
   // the moments it found, and a yes from the user queues it again to make exactly those
   await db`ALTER TABLE ai_edit_jobs DROP CONSTRAINT IF EXISTS ai_edit_jobs_status_check`
   await db`ALTER TABLE ai_edit_jobs ADD CONSTRAINT ai_edit_jobs_status_check CHECK (status IN ('queued', 'running', 'done', 'failed', 'confirm'))`
+  // Transitions between sections (the editor's Transitions tool): the kinds render.py draws with
+  // ffmpeg's xfade, besides the first three. ('fade' = a dissolve, 'wipe' = wipeleft.)
+  await db`ALTER TABLE transitions DROP CONSTRAINT IF EXISTS transitions_type_check`
+  await db`ALTER TABLE transitions ADD CONSTRAINT transitions_type_check CHECK (type IN ('cut', 'fade', 'wipe', 'fadeblack', 'fadewhite', 'slideleft', 'slideup', 'zoomin', 'circleopen'))`
   await db`ALTER TABLE ai_edit_jobs ADD COLUMN IF NOT EXISTS found JSONB`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_score INTEGER`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_reason TEXT`

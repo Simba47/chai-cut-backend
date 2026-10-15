@@ -578,6 +578,49 @@ def _probe(path: str) -> tuple[float, bool]:
     return _probe_cache[path]
 
 
+def _probe_fps(path: str) -> float:
+    """The video's frame rate (its average), 30 when it can't be read; kept between 15 and 60."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        num, _, den = (r.stdout or "").strip().partition("/")
+        fps = float(num) / float(den or 1)
+        return min(60.0, max(15.0, fps)) if fps > 0 else 30.0
+    except Exception:
+        return 30.0
+
+
+# ── Transitions between sections (the editor's Transitions tool, table transitions) ──────────
+# Saved kind → ffmpeg xfade transition. 'fade' is a dissolve, 'wipe' the older name of wipeleft.
+# The editor's preview draws each the same way (VideoPreview drawTransition).
+_XFADE = {
+    "fade": "fade", "wipe": "wipeleft", "fadeblack": "fadeblack", "fadewhite": "fadewhite",
+    "slideleft": "slideleft", "slideup": "slideup", "zoomin": "zoomin", "circleopen": "circleopen",
+}
+_MIN_TRANSITION_MS = 80
+
+
+def _transition_joins(segments: list[dict], transitions: list[dict]) -> list[tuple[str, float] | None]:
+    """
+    For each join between two parts in a row (part i and i + 1): (xfade name, length in s) when
+    part i has a transition (transitions.after_segment_id) and part i + 1 starts where it ends;
+    else None (a cut). A transition never runs longer than either part.
+    """
+    by_after = {t.get("after_segment_id"): t for t in transitions or [] if t.get("type") and t.get("type") != "cut"}
+    joins: list[tuple[str, float] | None] = []
+    for a, b in zip(segments, segments[1:]):
+        t = by_after.get(a.get("id"))
+        if not t or abs(int(b["start_ms"]) - int(a["end_ms"])) > 1:
+            joins.append(None)
+            continue
+        room = min(int(a["end_ms"]) - int(a["start_ms"]), int(b["end_ms"]) - int(b["start_ms"]))
+        d = min(int(t.get("duration_ms") or 500), room)
+        joins.append((_XFADE.get(t["type"], "fade"), d / 1000.0) if d >= _MIN_TRANSITION_MS else None)
+    return joins
+
+
 def _hex6(v: str | None, fallback: str) -> str:
     h = (v or "").lstrip("#")
     return h[:6] if len(h) >= 6 and all(c in "0123456789abcdefABCDEF" for c in h[:6]) else fallback
@@ -1726,12 +1769,41 @@ def main(
             seg_labels.append(out_lbl)
 
         # ── Concatenate segments ───────────────────────────────────────────────
+        joins = _transition_joins(segments, spec.get("transitions", [])) if len(seg_labels) > 1 else []
         if len(seg_labels) == 1:
             cur = seg_labels[0]
-        else:
+        elif not any(joins):
             n = len(seg_labels)
             fp.append(f"{''.join(seg_labels)}concat=n={n}:v=1:a=0[vmain]")
             cur = "[vmain]"
+        else:
+            # Transitions: the parts are joined one after another — a cut where a join has none, an
+            # xfade where it has one. So the clip keeps its length (and stays in step with its sound
+            # and captions), the outgoing part's last frame is held for half the transition after
+            # the join and the incoming part's first frame for half before it; the blend runs across
+            # the join. xfade needs both sides alike: one frame rate (the video's own), one format.
+            fps = _probe_fps(video_path)
+            norm = []
+            for si, lbl in enumerate(seg_labels):
+                fp.append(f"{lbl}fps={fps:.3f},format=yuv420p,setsar=1,settb=AVTB[tn{si}]")
+                norm.append(f"[tn{si}]")
+            cur = norm[0]
+            cum = (int(segments[0]["end_ms"]) - int(segments[0]["start_ms"])) / 1000.0
+            for si in range(1, len(norm)):
+                dur = (int(segments[si]["end_ms"]) - int(segments[si]["start_ms"])) / 1000.0
+                j = joins[si - 1]
+                out = f"[tj{si}]"
+                if j is None:
+                    fp.append(f"{cur}{norm[si]}concat=n=2:v=1:a=0{out}")
+                else:
+                    name, d = j
+                    h = d / 2
+                    fp.append(f"{cur}tpad=stop_mode=clone:stop_duration={h + 0.05:.3f}[ta{si}]")
+                    fp.append(f"{norm[si]}tpad=start_mode=clone:start_duration={h:.3f}[tb{si}]")
+                    fp.append(f"[ta{si}][tb{si}]xfade=transition={name}:duration={d:.3f}:offset={max(0.0, cum - h):.3f}{out}")
+                    print(f"[render] transition {name} {d:.2f}s at {cum:.2f}s", flush=True)
+                cur = out
+                cum += dur
 
         # ── Hidden main video: black there (captions, text and photos still go on top) ──
         blank_ranges = [(int(r["start_ms"]), int(r["end_ms"])) for r in spec.get("blank_ranges", [])
