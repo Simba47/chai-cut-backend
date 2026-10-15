@@ -598,6 +598,11 @@ def _probe_fps(path: str) -> float:
 _XFADE = {
     "fade": "fade", "wipe": "wipeleft", "fadeblack": "fadeblack", "fadewhite": "fadewhite",
     "slideleft": "slideleft", "slideup": "slideup", "zoomin": "zoomin", "circleopen": "circleopen",
+    "slideright": "slideright", "slidedown": "slidedown", "hblur": "hblur",
+    # Whip: a slide to the left, smeared sideways through its middle (the blur is added after the
+    # xfade; ffmpeg's own "smoothleft" is a soft wipe, not a whip)
+    "smoothleft": "slideleft",
+    "radial": "radial", "pixelize": "pixelize",
 }
 _MIN_TRANSITION_MS = 80
 
@@ -1800,7 +1805,13 @@ def main(
                     h = d / 2
                     fp.append(f"{cur}tpad=stop_mode=clone:stop_duration={h + 0.05:.3f}[ta{si}]")
                     fp.append(f"{norm[si]}tpad=start_mode=clone:start_duration={h:.3f}[tb{si}]")
-                    fp.append(f"[ta{si}][tb{si}]xfade=transition={name}:duration={d:.3f}:offset={max(0.0, cum - h):.3f}{out}")
+                    off = max(0.0, cum - h)
+                    if segments[si - 1].get("id") and any(t.get("type") == "smoothleft" and t.get("after_segment_id") == segments[si - 1].get("id") for t in spec.get("transitions", []) or []):
+                        # Whip: the slide, then a sideways blur over its middle 60%
+                        fp.append(f"[ta{si}][tb{si}]xfade=transition={name}:duration={d:.3f}:offset={off:.3f}[tw{si}]")
+                        fp.append(f"[tw{si}]avgblur=sizeX=28:sizeY=1:enable='between(t,{off + d * 0.2:.3f},{off + d * 0.8:.3f})'{out}")
+                    else:
+                        fp.append(f"[ta{si}][tb{si}]xfade=transition={name}:duration={d:.3f}:offset={off:.3f}{out}")
                     print(f"[render] transition {name} {d:.2f}s at {cum:.2f}s", flush=True)
                 cur = out
                 cum += dur
