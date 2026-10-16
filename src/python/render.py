@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges, heard_speech_ranges
 import emoji as emoji_art   # colour emoji (Twemoji 17), drawn locally
-from frames import is_frame, row_heights, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base
+from frames import is_frame, row_heights, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base, BLUR_SOURCE_SLOT
 
 # ── Quality presets (identical to previous version) ───────────────────────────
 _QUALITY: dict[int, dict] = {
@@ -1587,9 +1587,23 @@ def main(
                 if base_kind == "blur":
                     ts = int(base_off) / 1000.0
                     bw2, bh2 = _even(out_w * 1.1), _even(out_h * 1.1)
-                    fp.append(f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,"
-                              f"{_scale_cover(bw2, bh2)},crop={out_w}:{out_h},gblur=sigma={out_w / 22:.1f},"
-                              f"colorchannelmixer=rr=0.65:gg=0.65:bb=0.65,format=yuv420p,setsar=1{frame_lbl}")
+                    blur = (f"{_scale_cover(bw2, bh2)},crop={out_w}:{out_h},gblur=sigma={out_w / 22:.1f},"
+                            f"colorchannelmixer=rr=0.65:gg=0.65:bb=0.65,format=yuv420p,setsar=1")
+                    fp.append(f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,{blur}{frame_lbl}")
+                    # While its slot shows a photo or video put there, that's what's blurred behind
+                    # (the item's input is split: one copy for the slot, one for the background)
+                    for bi, it in enumerate(lane_items(seg, st, BLUR_SOURCE_SLOT)):
+                        if it.get("hidden") or it.get("kind") not in ("photo", "video") or (si, it["id"]) not in frame_item_in:
+                            continue
+                        bk = f"fr{si}bl{bi}"
+                        fp.append(f"{frame_item_in[(si, it['id'])]}split=2[{bk}a][{bk}b]")
+                        frame_item_in[(si, it["id"])] = f"[{bk}a]"
+                        d, rel = it["dur_s"], it["rel_s"]
+                        start = (f"setpts=PTS-STARTPTS,trim=duration={d:.3f}" if it.get("kind") == "video"
+                                 else f"trim=duration={d:.3f},setpts=PTS-STARTPTS")
+                        fp.append(f"[{bk}b]{start},{blur},setpts=PTS+{rel:.3f}/TB[{bk}c]")
+                        fp.append(f"{frame_lbl}[{bk}c]overlay=0:0:eof_action=pass:enable='between(t,{rel:.3f},{rel + d:.3f})'[{bk}o]")
+                        frame_lbl = f"[{bk}o]"
                 else:
                     canvas(band_bg if base_kind == "band" and band_bg != "none" else "000000", out_w, out_h, frame_lbl)
                 cur_frame = frame_lbl
@@ -1627,7 +1641,12 @@ def main(
                                 fp.append(f"{chain},pad={aw}:{rh}:{px}:{py}:color=black@0[{key}m]")
                             else:
                                 fp.append(f"{chain}[{key}m]")
-                            fp.append(f"[{key}f][{key}m]overlay=0:0{cur_row}")
+                            # Shown whole, a photo or video put in this slot doesn't cover all of it:
+                            # while one shows, the main video isn't drawn here (it would peek around it)
+                            covered = [(it["rel_s"], it["rel_s"] + it["dur_s"]) for it in lane_items(seg, st, slot)
+                                       if not it.get("hidden") and it.get("kind") in ("photo", "video") and (si, it["id"]) in frame_item_in]
+                            off = f":enable='not({'+'.join(f'between(t,{x:.3f},{y:.3f})' for x, y in covered)})'" if covered else ""
+                            fp.append(f"[{key}f][{key}m]overlay=0:0{off}{cur_row}")
                         else:
                             chain = (f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,"
                                      f"{_crop_filter(box, smss)},{_scale_cover(iw, ih)},setsar=1,format=yuv420p")

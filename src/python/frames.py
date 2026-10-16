@@ -165,6 +165,11 @@ def frame_base(layout: str | None) -> str | None:
     return FRAME_BASE.get(layout or "")
 
 
+# The slot whose picture, blurred, fills a 'blur' frame's background: the main video, or a photo /
+# video put in that slot while it shows (editor: BLUR_SOURCE_SLOT)
+BLUR_SOURCE_SLOT = 0
+
+
 def row_heights(seg: dict) -> list[float] | None:
     """A frame's resized row heights (frame.row_h), if they fit its template; else None. Mirrors validRowHeights() in the editor."""
     custom = (seg.get("frame") or {}).get("row_h")
