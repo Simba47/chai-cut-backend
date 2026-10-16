@@ -294,10 +294,8 @@ const SHOT_SAME_PEOPLE = 0.5
 const SHOT_JOIN_MS = 1000
 /** A face smaller than this share of the marked shot's smallest face is background (a poster, a face far behind) */
 const SHOT_BACKGROUND = 0.5
-/** Frames where a face isn't read (someone turns away) don't end the shot for this long */
-const SHOT_HOLD_MS = 2000
-/** The shot's edges snap to a camera cut this close */
-const SHOT_SNAP_MS = 750
+/** Inside one camera shot, something else for this long is another shot (shorter: the face reader's misreads) */
+const SHOT_CHANGE_MS = 2000
 /** A stretch of the shot shorter than this isn't one */
 const SHOT_MIN_MS = 800
 
@@ -373,34 +371,47 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
     return { s: 'match', box: { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y } }
   })
 
-  // The stretches: from a matching frame to the last one, within one camera shot; faces not read
-  // for a moment carry it on, someone else in the picture (two frames running) ends it
+  // The stretches. A camera shot (cut to cut) is one shot: when most of its frames are the marked
+  // shot, all of it is — the face reader misses or misreads a face now and then, mostly as a shot
+  // starts or ends (it used to leave a second of the shot unmarked there). Only something else for
+  // SHOT_CHANGE_MS or longer (someone walks in, the camera turns to others) splits a camera shot.
   const spans: Turn[] = []
-  const path: PathPoint[] = []
-  let run: { start: number; last: number; k: number } | null = null
-  let others = 0
-  const close = () => {
-    if (!run) return
-    const lo = bounds[run.k], hi = bounds[run.k + 1]
-    let a = run.start - FRAME_INTERVAL_MS / 2, b = run.last + FRAME_INTERVAL_MS / 2
-    if (a - lo <= SHOT_SNAP_MS) a = lo
-    if (hi - b <= SHOT_SNAP_MS) b = hi
-    a = Math.max(lo, a); b = Math.min(hi, b)
-    if (b - a >= SHOT_MIN_MS) spans.push([Math.round(a), Math.round(b)])
-    run = null
+  const half = FRAME_INTERVAL_MS / 2
+  for (let k = 0; k < bounds.length - 1; k++) {
+    const lo = bounds[k], hi = bounds[k + 1]
+    const idx = fr.map((_, fi) => fi).filter(fi => stretchOf(timeOf(fi)) === k)
+    let from = lo
+    let piece: number[] = []
+    const flush = (to: number) => {
+      const match = piece.filter(fi => states[fi].s === 'match').length
+      const other = piece.filter(fi => states[fi].s === 'other').length
+      if (match && match >= other && to - from >= SHOT_MIN_MS) spans.push([Math.round(from), Math.round(to)])
+      piece = []
+    }
+    let i = 0
+    while (i < idx.length) {
+      if (states[idx[i]].s !== 'other') { piece.push(idx[i++]); continue }
+      let j = i
+      while (j < idx.length && states[idx[j]].s === 'other') j++
+      if (timeOf(idx[j - 1]) - timeOf(idx[i]) + FRAME_INTERVAL_MS >= SHOT_CHANGE_MS) {
+        // Another shot for a while: what came before ends here, what comes after starts after it
+        flush(Math.max(from, timeOf(idx[i]) - half))
+        from = Math.min(hi, timeOf(idx[j - 1]) + half)
+      } else {
+        piece.push(...idx.slice(i, j))
+      }
+      i = j
+    }
+    flush(hi)
   }
+  // The people's box, frame by frame, where the shot is
+  const path: PathPoint[] = []
   fr.forEach((_, fi) => {
-    const t = timeOf(fi), k = stretchOf(t), st = states[fi]
-    if (run && (k !== run.k || t - run.last > SHOT_HOLD_MS)) close()
-    if (st.s === 'other') { if (++others >= 2) close(); return }
-    others = 0
-    if (st.s !== 'match') return
-    if (!run) run = { start: t, last: t, k }
-    run.last = t
-    const b = st.box!
-    path.push([t, round4(b.x), round4(b.y), round4(b.w), round4(b.h), 0])
+    const t = timeOf(fi), st = states[fi]
+    if (st.s !== 'match' || !spans.some(([x, y]) => t >= x && t <= y)) return
+    const bx = st.box!
+    path.push([t, round4(bx.x), round4(bx.y), round4(bx.w), round4(bx.h), 0])
   })
-  close()
   // Joined where two stretches meet (the same shot either side of a cut that isn't one), or are a
   // moment apart inside one camera shot
   const joined: Turn[] = []
