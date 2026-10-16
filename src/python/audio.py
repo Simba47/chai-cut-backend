@@ -193,7 +193,10 @@ def build_segment_audio_args(
     main_vol = 0.0 if main_detached else max(0.0, float(main_volume))
 
     fp: list[str] = []
-    if not sorted_segs or (not has_broll_audio and not has_frames):
+    # (parts that say where the main video is — a clip of pieces: cut parts skip video — are
+    # played part by part too)
+    has_positions = any(s.get("video_offset_ms") is not None for s in sorted_segs)
+    if not sorted_segs or (not has_broll_audio and not has_frames and not has_positions):
         # ── Bed, simple case: the main video's sound for the clip ──
         inputs: list[str] = ["ffmpeg", "-y", "-ss", f"{clip_start_s:.3f}", "-t", f"{clip_len_s:.3f}", "-i", source_video]
         fp.append(f"[0:a]asetpts=PTS-STARTPTS,{fmt},volume={main_vol:.3f}[speech]")
@@ -208,9 +211,14 @@ def build_segment_audio_args(
                 continue
             box = (seg.get("crop_boxes") or [{}])[0]
             vid_id = box.get("source_video_id") if box else None
-            if vid_id and box.get("muted"):
-                # A muted B-roll shot is a cutaway: the speaker keeps talking under it
-                plans.append([(None, int(seg["start_ms"]) / 1000.0, main_vol, 0.0, seg_dur)])
+            if vid_id and box.get("muted") and seg.get("inserted"):
+                # A muted video put in between: the main video waits meanwhile, so nothing is heard
+                plans.append([(None, 0.0, 0.0, 0.0, seg_dur)])
+            elif vid_id and box.get("muted"):
+                # A muted B-roll shot is a cutaway: the speaker keeps talking under it (from where
+                # the main video is: later than the shot's own time after a video put in between)
+                main_at = seg.get("video_offset_ms")
+                plans.append([(None, int(main_at if main_at is not None else seg["start_ms"]) / 1000.0, main_vol, 0.0, seg_dur)])
             elif vid_id and vid_id in secondary_videos:
                 # Its own sound, at the volume set on it
                 vol = box.get("volume")

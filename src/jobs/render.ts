@@ -47,7 +47,11 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
     // render.py and audio.py need no changes.
     let videoInput = videoSignedUrl
     let renderSpec = baseSpec
-    if (baseSpec.remove_fillers || baseSpec.trim_ranges.length) {
+    // (videos put in between can't be combined with cut parts yet: the editor allows one or the
+    // other; an older save with both renders without the cuts rather than out of step)
+    if (baseSpec.inserts.length && (baseSpec.remove_fillers || baseSpec.trim_ranges.length)) {
+      console.warn('[render] clip has videos put in between: removed parts and pause cuts are not applied')
+    } else if (baseSpec.remove_fillers || baseSpec.trim_ranges.length) {
       const cut = await condenseClip(clip_id, baseSpec, videoSignedUrl, tmp, signal)
       if (cut) { videoInput = cut.path; renderSpec = cut.spec }
     }
@@ -123,8 +127,19 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
     // Music (uploaded from the editor): downloaded, read locally by audio.py; one that can't be
     // fetched is left out rather than failing the export
     const musicTracks = (renderSpec.audio_tracks ?? []) as Row[]
+    // Picture in picture: the video's own sound plays with it (unless muted), mixed like a song
+    // placed on its bar — at full volume, not dipped under speech
+    for (const ov of (renderSpec.overlays ?? []) as Row[]) {
+      const lp = ov.type === 'video' && !ov.muted ? overlayVideos[ov.source_video_id] : null
+      if (!lp) continue
+      musicTracks.push({
+        id: `pip-${ov.id}`, kind: 'music', storage_path: `pip/${ov.source_video_id}`, local_path: lp,
+        start_ms: Number(ov.start_ms), end_ms: Number(ov.end_ms), offset_ms: Number(ov.source_offset_ms ?? 0),
+        volume: 1, fade_in: false, fade_out: false, duck_under_speech: false,
+      })
+    }
     for (const tr of musicTracks) {
-      if (tr.kind !== 'music' || !tr.storage_path) continue
+      if (tr.kind !== 'music' || !tr.storage_path || tr.local_path) continue
       try {
         const ext = (String(tr.storage_path).split('.').pop() ?? 'audio').replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'audio'
         const localPath = join(tmp, `music_${createHash('sha1').update(String(tr.storage_path)).digest('hex').slice(0, 16)}.${ext}`)
@@ -217,34 +232,63 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
   }
 
   const dims = QUALITY_DIMS[quality] ?? QUALITY_DIMS['1080p']
+  // A clip of pieces (the editor's inserts.ts): videos put in between (the main video waits while
+  // each plays) and parts that skip video (cut from their edges) — each part says which moment of
+  // the main video it starts at. Every part gets that as video_offset_ms (render.py and audio.py
+  // read it), the clip is as long as its pieces, and the words go where they are heard (those in
+  // video cut out are gone). A clip whose parts simply follow the video is left as it is.
+  const inserts = insertSpans(segments as Row[], clip.video_id)
+  const clipStart = Number(clip.start_ms)
+  const trimmed = cleanTrims(clip.trim_ranges, Number(clip.start_ms), Number(clip.end_ms)).length > 0
+  const pieces = trimmed ? [] : piecesOfRows(segments as Row[], clip.video_id)
+  const piecesOn = !trimmed && (inserts.length > 0 || pieces.some(p => p.from != null && Math.abs(p.from - p.at) > 1))
+  const placedSegments = piecesOn
+    ? (segments as Row[]).map(s => (isInsertRow(s, clip.video_id)
+      ? { ...s, inserted: true }
+      : { ...s, video_offset_ms: Math.round(videoAtPieces(pieces, Number(s.start_ms))) }))
+    : segments as Row[]
+  const placedWords = piecesOn
+    ? (words as Row[]).flatMap(w => {
+      const rel = Number(w.start_ms) - clipStart
+      if (rel < 0) return [w]
+      const mid = (Number(w.start_ms) + Number(w.end_ms)) / 2 - clipStart
+      if (!pieces.some(p => p.from != null && mid >= p.from && mid < p.from + p.ms)) return []
+      const d = timelineAtPieces(pieces, rel) - rel
+      return d ? [{ ...w, start_ms: Number(w.start_ms) + d, end_ms: Number(w.end_ms) + d }] : [w]
+    })
+    : words
+  const piecesLen = pieces.length ? pieces[pieces.length - 1].at + pieces[pieces.length - 1].ms : 0
   return {
     clip_id: clipId,
+    inserts,
     // Crop boxes showing this id show the clip's own video at another moment (borrowed reactions)
     main_video_id: clip.video_id,
     start_ms: clip.start_ms,
-    end_ms: clip.end_ms,
+    end_ms: piecesOn ? clipStart + Math.round(piecesLen) : Number(clip.end_ms),
+    // How much of the main video (from the clip's start) the pieces read: render.py opens that much
+    ...(piecesOn ? { source_ms: Math.round(Math.max(...pieces.map(p => (p.from ?? 0) + p.ms), piecesLen)), pieces } : {}),
     remove_fillers: clip.remove_fillers === true,
     // Parts of the video removed from the clip in the editor, in source ms (lib/trims.ts)
     trim_ranges: cleanTrims(clip.trim_ranges, Number(clip.start_ms), Number(clip.end_ms)),
     // Hidden in the editor = not in the export (as in the preview): a hidden added video leaves its
     // time to the main video (default framing); hidden photos, videos and text in a frame are left out
-    segments: shownSegments(segments as Row[], clip.video_id),
+    segments: shownSegments(placedSegments, clip.video_id),
     // Where the main video is hidden: black (captions, text and photos still go on top)
-    blank_ranges: blankRanges(segments as Row[], clip.video_id),
+    blank_ranges: blankRanges(placedSegments, clip.video_id),
     caption_styles: captionStyles,
     text_overlays: (textOverlays as Row[]).filter(t => !t.hidden),
     // Music (uploaded from the editor) and detached original-sound bars, each placed where its bar
     // is (audio.py). Music saved before uploads existed has only a file name: it can't be mixed in
     // (the editor asks to re-add it)
-    audio_tracks: specAudioTracks(audioTracks as Row[], clip.start_ms),
+    audio_tracks: specAudioTracks(audioTracks as Row[], clip.start_ms, t => (piecesOn ? videoAtPieces(pieces, t) : t)),
     // The original sound detached onto its own bar: the picture's main-video sound goes quiet
     main_detached: (audioTracks as Row[]).some(isOriginalSound),
     // The clip's own sound level (top of the Music panel): muted = 0
     main_volume: clip.original_muted === true ? 0 : clip.original_volume == null ? 1 : Number(clip.original_volume),
     // Muted sections: the picture's own sound (and the detached original sound) is silent there —
     // the music keeps playing
-    mute_ranges: muteRanges(segments as Row[], clip.video_id),
-    transitions, overlays: (overlays as Row[]).filter(o => !o.hidden), words,
+    mute_ranges: muteRanges(placedSegments, clip.video_id),
+    transitions, overlays: (overlays as Row[]).filter(o => !o.hidden), words: placedWords,
     output_width: dims.w, output_height: dims.h,
   }
 }
@@ -468,6 +512,94 @@ function blankRanges(segments: Row[], mainVideoId: string): { start_ms: number; 
     .filter(r => r.end_ms > r.start_ms)
 }
 
+// ── Videos put in between (the editor's modules/editor/inserts.ts) ──────────────
+
+/** A video put in between: on the timeline [at, at + ms), the main video held at `hold` (clip ms) */
+export type InsertSpan = { at: number; ms: number; hold: number }
+
+/** A row that is a video put in between: another video, with where the main video waits meanwhile */
+export function isInsertRow(s: Row, mainVideoId: string): boolean {
+  return s.video_offset_ms != null && !String(s.layout).startsWith('frame_') && !!addedVideo(s, mainVideoId)
+}
+
+/** The videos put in between, in time order (rows of one, cut by a video on top, joined up again) */
+export function insertSpans(segments: Row[], mainVideoId: string): InsertSpan[] {
+  const out: InsertSpan[] = []
+  const rows = segments.filter(s => isInsertRow(s, mainVideoId) && Number(s.end_ms) > Number(s.start_ms))
+    .sort((a, b) => Number(a.start_ms) - Number(b.start_ms))
+  for (const s of rows) {
+    const at = Number(s.start_ms), ms = Number(s.end_ms) - at, hold = Number(s.video_offset_ms)
+    const prev = out[out.length - 1]
+    if (prev && prev.hold === hold && Math.abs(prev.at + prev.ms - at) <= 1) prev.ms = at + ms - prev.at
+    else out.push({ at, ms, hold })
+  }
+  return out
+}
+
+/** A stretch of the timeline [at, at + ms): the main video from `from` on, or held at `hold` (clip ms) */
+export type Piece = { at: number; ms: number; from?: number; hold?: number }
+
+/**
+ * The clip's pieces from its saved rows (as the editor's piecesOf): a video put in between holds
+ * the main video; a part of the main video plays it from its main crop box's moment; a video on
+ * top (a B-roll row) and time no row covers carry the main video on underneath.
+ */
+export function piecesOfRows(rows: Row[], mainVideoId: string): Piece[] {
+  const sorted = rows.filter(s => Number(s.end_ms) > Number(s.start_ms)).sort((a, b) => Number(a.start_ms) - Number(b.start_ms))
+  const out: Piece[] = []
+  let cursor = 0, videoNow = 0
+  for (const s of sorted) {
+    const s0 = Number(s.start_ms), e0 = Number(s.end_ms)
+    if (s0 > cursor + 1) { out.push({ at: cursor, ms: s0 - cursor, from: videoNow }); videoNow += s0 - cursor }
+    const at = Math.max(cursor, s0), ms = e0 - at
+    if (ms <= 0) continue
+    if (isInsertRow(s, mainVideoId)) out.push({ at, ms, hold: Number(s.video_offset_ms) })
+    else {
+      const main = String(s.layout).startsWith('frame_') || !addedVideo(s, mainVideoId)
+        ? ((s.crop_boxes ?? []) as Row[]).find(b => !b.source_video_id && !b.image_path)
+        : null
+      const from = (main && main.source_offset_ms != null ? Number(main.source_offset_ms) : videoNow) + (at - s0)
+      out.push({ at, ms, from })
+      videoNow = from + ms
+    }
+    cursor = at + ms
+  }
+  return out
+}
+
+/** Where the main video is at timeline `t` (clip ms) over the pieces; in a held piece: where it waits */
+export function videoAtPieces(pieces: Piece[], t: number): number {
+  let p = pieces[pieces.length - 1]
+  for (const x of pieces) if (t < x.at + x.ms) { p = x; break }
+  if (!p) return Math.max(0, t)
+  return p.hold != null ? p.hold : (p.from ?? 0) + Math.min(p.ms, Math.max(0, t - p.at))
+}
+
+/** Where on the timeline the main video shows its moment `v` (clip ms); a moment cut out lands where the clip goes on after it */
+export function timelineAtPieces(pieces: Piece[], v: number): number {
+  for (const p of pieces) if (p.from != null && v >= p.from && v < p.from + p.ms) return p.at + (v - p.from)
+  const next = pieces.find(p => p.from != null && p.from > v)
+  return next ? next.at : (pieces.length ? pieces[pieces.length - 1].at + pieces[pieces.length - 1].ms : v)
+}
+
+/** Where the main video is at timeline `t` (clip ms); inside a video put in between: where it waits */
+export function videoAtTimeline(inserts: InsertSpan[], t: number): number {
+  let before = 0
+  for (const i of inserts) {
+    if (t < i.at) break
+    if (t < i.at + i.ms) return i.hold
+    before += i.ms
+  }
+  return t - before
+}
+
+/** The timeline time where the main video shows its moment `v` (clip ms): after any video put in at or before it */
+export function timelineAtVideo(inserts: InsertSpan[], v: number): number {
+  let t = v
+  for (const i of inserts) if (i.hold <= v) t += i.ms
+  return t
+}
+
 /** A music-lane bar that is the main video's own sound, detached ("main-video:<id>") */
 const isOriginalSound = (t: Row) => typeof t.storage_path === 'string' && t.storage_path.startsWith('main-video:')
 
@@ -477,14 +609,14 @@ const isOriginalSound = (t: Row) => typeof t.storage_path === 'string' && t.stor
  * from offset_ms, its source time — in step with the clip unless the bar was moved). Muted tracks
  * and old music saved as just a file name (never uploaded) are left out.
  */
-export function specAudioTracks(audioTracks: Row[], clipStartMs: number): Row[] {
+export function specAudioTracks(audioTracks: Row[], clipStartMs: number, videoAt: (t: number) => number = t => t): Row[] {
   return audioTracks.filter(t => !t.muted && typeof t.storage_path === 'string').flatMap(t => {
     const base = {
       id: t.id, start_ms: Math.max(0, Number(t.start_ms) || 0), end_ms: t.end_ms == null ? null : Number(t.end_ms),
       volume: t.volume == null ? null : Number(t.volume), fade_in: t.fade_in === true, fade_out: t.fade_out === true,
     }
     if (isOriginalSound(t)) {
-      return [{ ...base, kind: 'original', offset_ms: t.offset_ms != null ? Number(t.offset_ms) : clipStartMs + base.start_ms, duck_under_speech: false }]
+      return [{ ...base, kind: 'original', offset_ms: t.offset_ms != null ? Number(t.offset_ms) : clipStartMs + videoAt(base.start_ms), duck_under_speech: false }]
     }
     if (!String(t.storage_path).includes('/')) return []
     return [{ ...base, kind: 'music', storage_path: t.storage_path, offset_ms: t.offset_ms != null ? Number(t.offset_ms) : 0, duck_under_speech: t.duck_under_speech !== false }]

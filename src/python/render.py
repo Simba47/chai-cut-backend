@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges, heard_speech_ranges
 import emoji as emoji_art   # colour emoji (Twemoji 17), drawn locally
-from frames import is_frame, row_heights, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base
+from frames import is_frame, row_heights, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base, BLUR_SOURCE_SLOT
 
 # ── Quality presets (identical to previous version) ───────────────────────────
 _QUALITY: dict[int, dict] = {
@@ -1281,6 +1281,19 @@ def main(
     # use the default framing: a full-frame box, which the cover scale crops to a centred 9:16
     # (the same default the editor preview shows). Filling them keeps video, audio and captions
     # the same length and in sync.
+    # (videos put in between: the main video waits during each, so after one it is behind the
+    # clip's own time — render.ts sets each part's video_offset_ms; a filled part gets it here)
+    _inserts = spec.get("pieces") or []
+
+    def _video_at(t: int) -> int:
+        # (render.ts's pieces: each a stretch of the timeline, the main video from `from`, or held at `hold`)
+        for _p in _inserts:
+            if t < _p["at"] + _p["ms"]:
+                if _p.get("hold") is not None:
+                    return int(_p["hold"])
+                return int((_p.get("from") or 0) + max(0, t - _p["at"]))
+        return int(t)
+
     _filled: list[dict] = []
     _cursor = 0
     for _s in segments + [None]:
@@ -1289,8 +1302,9 @@ def main(
             print(f"[render] default framing for uncovered {_cursor}ms–{_gap_end}ms", flush=True)
             _filled.append({
                 "start_ms": _cursor, "end_ms": _gap_end, "layout": "vertical", "sort_order": 0,
+                **({"video_offset_ms": _video_at(_cursor)} if _inserts else {}),
                 "crop_boxes": [{
-                    "slot_index": 0, "source_video_id": None, "source_offset_ms": _cursor,
+                    "slot_index": 0, "source_video_id": None, "source_offset_ms": _video_at(_cursor),
                     "box_keyframes": [{"t_ms": _cursor, "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}],
                 }],
             })
@@ -1401,10 +1415,13 @@ def main(
         # ── FFmpeg inputs ──────────────────────────────────────────────────────
         clip_start_s = clip_start_ms / 1000.0
         clip_dur_s   = clip_dur_ms   / 1000.0
+        # (a clip of pieces can read further into the main video than it is long: a part cut from
+        # its edge skips video — render.ts says how far, source_ms)
+        read_s = max(clip_dur_s, float(spec.get("source_ms") or 0) / 1000.0)
         inputs = [
             "ffmpeg", "-y",
             "-ss", f"{clip_start_s:.3f}",
-            "-t",  f"{clip_dur_s:.3f}",
+            "-t",  f"{read_s:.3f}",
             "-i",  video_path,    # index 0
             "-i",  audio_path,    # index 1
         ]
@@ -1587,9 +1604,23 @@ def main(
                 if base_kind == "blur":
                     ts = int(base_off) / 1000.0
                     bw2, bh2 = _even(out_w * 1.1), _even(out_h * 1.1)
-                    fp.append(f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,"
-                              f"{_scale_cover(bw2, bh2)},crop={out_w}:{out_h},gblur=sigma={out_w / 22:.1f},"
-                              f"colorchannelmixer=rr=0.65:gg=0.65:bb=0.65,format=yuv420p,setsar=1{frame_lbl}")
+                    blur = (f"{_scale_cover(bw2, bh2)},crop={out_w}:{out_h},gblur=sigma={out_w / 22:.1f},"
+                            f"colorchannelmixer=rr=0.65:gg=0.65:bb=0.65,format=yuv420p,setsar=1")
+                    fp.append(f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,{blur}{frame_lbl}")
+                    # While its slot shows a photo or video put there, that's what's blurred behind
+                    # (the item's input is split: one copy for the slot, one for the background)
+                    for bi, it in enumerate(lane_items(seg, st, BLUR_SOURCE_SLOT)):
+                        if it.get("hidden") or it.get("kind") not in ("photo", "video") or (si, it["id"]) not in frame_item_in:
+                            continue
+                        bk = f"fr{si}bl{bi}"
+                        fp.append(f"{frame_item_in[(si, it['id'])]}split=2[{bk}a][{bk}b]")
+                        frame_item_in[(si, it["id"])] = f"[{bk}a]"
+                        d, rel = it["dur_s"], it["rel_s"]
+                        start = (f"setpts=PTS-STARTPTS,trim=duration={d:.3f}" if it.get("kind") == "video"
+                                 else f"trim=duration={d:.3f},setpts=PTS-STARTPTS")
+                        fp.append(f"[{bk}b]{start},{blur},setpts=PTS+{rel:.3f}/TB[{bk}c]")
+                        fp.append(f"{frame_lbl}[{bk}c]overlay=0:0:eof_action=pass:enable='between(t,{rel:.3f},{rel + d:.3f})'[{bk}o]")
+                        frame_lbl = f"[{bk}o]"
                 else:
                     canvas(band_bg if base_kind == "band" and band_bg != "none" else "000000", out_w, out_h, frame_lbl)
                 cur_frame = frame_lbl
@@ -1627,7 +1658,12 @@ def main(
                                 fp.append(f"{chain},pad={aw}:{rh}:{px}:{py}:color=black@0[{key}m]")
                             else:
                                 fp.append(f"{chain}[{key}m]")
-                            fp.append(f"[{key}f][{key}m]overlay=0:0{cur_row}")
+                            # Shown whole, a photo or video put in this slot doesn't cover all of it:
+                            # while one shows, the main video isn't drawn here (it would peek around it)
+                            covered = [(it["rel_s"], it["rel_s"] + it["dur_s"]) for it in lane_items(seg, st, slot)
+                                       if not it.get("hidden") and it.get("kind") in ("photo", "video") and (si, it["id"]) in frame_item_in]
+                            off = f":enable='not({'+'.join(f'between(t,{x:.3f},{y:.3f})' for x, y in covered)})'" if covered else ""
+                            fp.append(f"[{key}f][{key}m]overlay=0:0{off}{cur_row}")
                         else:
                             chain = (f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,"
                                      f"{_crop_filter(box, smss)},{_scale_cover(iw, ih)},setsar=1,format=yuv420p")
@@ -2008,9 +2044,11 @@ def main(
             sclbl  = f"[pip{vi}s]"
             olbl   = f"[vpip{vi}]"
             # Trim overlay video to the display window starting at source_offset_ms
+            # (its frames moved to where its bar starts: without that the window showed the video's
+            # first seconds from the clip's start and was used up before its bar came)
             fp.append(
                 f"{vid_lbl}trim=start={off_s:.3f}:duration={pip_dur:.3f},"
-                f"setpts=PTS-STARTPTS{tslbl}"
+                f"setpts=PTS-STARTPTS+{t0:.3f}/TB{tslbl}"
             )
             fp.append(f"{tslbl}scale={vw}:{vh}:flags=lanczos{sclbl}")
             fp.append(

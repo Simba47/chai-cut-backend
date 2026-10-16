@@ -12,3 +12,6 @@ absl-py~=2.3
 flatbuffers~=25.9
 certifi
 matplotlib
+# render.py draws rounded-corner masks, photos and frame images with Pillow (it came in only
+# through matplotlib before: named here so it stays if that changes)
+pillow
