@@ -180,7 +180,11 @@ export async function detectCuts(videoPath: string, startMs: number, endMs: numb
   }
 }
 
-export async function detectFaces(tmp: string, videoPath: string, startMs: number, endMs: number, signal?: AbortSignal, lips = false): Promise<FaceInfo> {
+/**
+ * `allFaces`: every face seen (a person standing still, a picture, people close together) with none of
+ * the filters the automatic crop wants — for listing who is in a clip, not for framing it
+ */
+export async function detectFaces(tmp: string, videoPath: string, startMs: number, endMs: number, signal?: AbortSignal, lips = false, allFaces = false): Promise<FaceInfo> {
   const framesDir = join(tmp, `frames-${startMs}`)
   await mkdir(framesDir, { recursive: true })
   try {
@@ -191,7 +195,7 @@ export async function detectFaces(tmp: string, videoPath: string, startMs: numbe
 
   const result = await new Promise<FaceInfo>((resolve) => {
     const script = join(__dirname, '../../src/python/face_detect.py')
-    const proc = spawn('python3', [script, '--frames-dir', framesDir, ...(lips ? ['--lips'] : [])], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', MPLBACKEND: 'Agg' } })
+    const proc = spawn('python3', [script, '--frames-dir', framesDir, ...(lips ? ['--lips'] : []), ...(allFaces ? ['--all-faces'] : [])], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', MPLBACKEND: 'Agg' } })
     const kill = () => proc.kill('SIGKILL')
     signal?.addEventListener('abort', kill, { once: true })
     let stdout = ''
