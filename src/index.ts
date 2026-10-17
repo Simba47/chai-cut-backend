@@ -55,7 +55,7 @@ async function runMigrations() {
     'frame_title_caption','frame_big_small','frame_photo_story',
     'frame_blur_fill','frame_gameplay','frame_pip','frame_screenshot','frame_comment','frame_letterbox_wide',
     'frame_two_crops','frame_side_by_side','frame_name_tags','frame_brand_card','frame_top_list',
-    'frame_screen_face','frame_audiogram','frame_grid','frame_news'))`
+    'frame_screen_face','frame_audiogram','frame_grid','frame_news','frame_trio_main'))`
   await db`ALTER TABLE segments ADD COLUMN IF NOT EXISTS frame JSONB`
   // Where a segment's video starts when a true INSERT pushed it forward (render.py, audio.py, frames.py).
   // Production got this column by hand; databases built from schema alone (QA) lacked it.
@@ -232,6 +232,22 @@ async function runMigrations() {
     )
   `
   await db`CREATE INDEX IF NOT EXISTS ai_suggestion_events_video_created ON ai_suggestion_events (video_id, created_at)`
+  // Brand kits (editor Brand kit tool): a user's saved looks — colours, logo, @handle, title style —
+  // put on a clip with Apply. data: the kit's settings (frontend lib/shared/brandKit.ts). How many a
+  // user can have depends on their plan (frontend server/services/brandKits.ts)
+  await db`
+    CREATE TABLE IF NOT EXISTS brand_kits (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      name text NOT NULL,
+      data jsonb NOT NULL DEFAULT '{}'::jsonb,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )
+  `
+  await db`CREATE INDEX IF NOT EXISTS brand_kits_user ON brand_kits (user_id, created_at)`
+  // How see-through a photo on the clip is, 0–1 (a brand kit's logo; null = solid)
+  await db`ALTER TABLE overlays ADD COLUMN IF NOT EXISTS opacity REAL`
   console.log('[startup] migrations ok')
 }
 
