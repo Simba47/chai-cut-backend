@@ -55,7 +55,7 @@ async function runMigrations() {
     'frame_title_caption','frame_big_small','frame_photo_story',
     'frame_blur_fill','frame_gameplay','frame_pip','frame_screenshot','frame_comment','frame_letterbox_wide',
     'frame_two_crops','frame_side_by_side','frame_name_tags','frame_brand_card','frame_top_list',
-    'frame_screen_face','frame_audiogram','frame_grid','frame_news'))`
+    'frame_screen_face','frame_audiogram','frame_grid','frame_news','frame_trio_main'))`
   await db`ALTER TABLE segments ADD COLUMN IF NOT EXISTS frame JSONB`
   // Where a segment's video starts when a true INSERT pushed it forward (render.py, audio.py, frames.py).
   // Production got this column by hand; databases built from schema alone (QA) lacked it.

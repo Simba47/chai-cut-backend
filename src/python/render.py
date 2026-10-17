@@ -1418,7 +1418,7 @@ def main(
             if is_frame(seg.get("layout")):
                 # Only slots showing the main video read it; lane items are inputs of their own
                 main_slots = shown_main_slots(frame_state(seg))
-                for a in frame_areas(seg["layout"], out_w, out_h, frame_band_shown(seg), row_heights(seg), row_order(seg)):
+                for a in frame_areas(seg["layout"], out_w, out_h, frame_band_shown(seg), row_heights(seg), row_order(seg), seg.get("frame")):
                     if a["kind"] == "slot" and a["slot"] in main_slots:
                         slot_counts[None] = slot_counts.get(None, 0) + 1
                 # A blurred copy of the main video under the frame (Blur fill) reads it once more
@@ -1488,7 +1488,7 @@ def main(
             if not is_frame(seg.get("layout")):
                 continue
             st = frame_state(seg)
-            for area in frame_areas(seg["layout"], out_w, out_h, frame_band_shown(seg), row_heights(seg), row_order(seg)):
+            for area in frame_areas(seg["layout"], out_w, out_h, frame_band_shown(seg), row_heights(seg), row_order(seg), seg.get("frame")):
                 if area["kind"] != "slot":
                     continue
                 for it in lane_items(seg, st, area["slot"]):
@@ -1679,7 +1679,7 @@ def main(
                     canvas(band_bg if base_kind == "band" and band_bg != "none" else "000000", out_w, out_h, frame_lbl)
                 cur_frame = frame_lbl
 
-                for ri, area in enumerate(frame_areas(layout, out_w, out_h, frame_band_shown(seg), row_heights(seg), row_order(seg))):
+                for ri, area in enumerate(frame_areas(layout, out_w, out_h, frame_band_shown(seg), row_heights(seg), row_order(seg), seg.get("frame"))):
                     kind, aw, rh = area["kind"], area["w"], area["h"]
                     key = f"fr{si}r{ri}"
                     lbl = f"[{key}]"
@@ -1703,7 +1703,7 @@ def main(
                         ts = int(off_ms) / 1000.0
                         iw, ih, px, py, rr, boxed = media_box((st.get("main_corners") or {}).get(str(slot)),
                                                               (st.get("main_rects") or {}).get(str(slot)), aw, rh)
-                        if contain:
+                        if contain and not area.get("main_crop"):
                             # Shown whole (nothing cropped), on the slot's colour or see-through
                             canvas(area.get("fill") or "000000", aw, rh, f"[{key}f]")
                             if main_dims is None:
@@ -1721,9 +1721,20 @@ def main(
                             off = f":enable='not({'+'.join(f'between(t,{x:.3f},{y:.3f})' for x, y in covered)})'" if covered else ""
                             fp.append(f"[{key}f][{key}m]overlay=0:0{off}{cur_row}")
                         else:
+                            # Its own view, cropped (a slot that shows other media whole crops the main
+                            # video when it's put there: main_crop — Screen + face cam's Screen)
                             chain = (f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,"
                                      f"{_crop_filter(box, smss)},{_scale_cover(iw, ih)},setsar=1,format=yuv420p")
-                            fp.append(f"{placed(chain, aw, rh, iw, ih, px, py, rr, boxed, f'{key}m')}{cur_row}")
+                            covered = [(it["rel_s"], it["rel_s"] + it["dur_s"]) for it in lane_items(seg, st, slot)
+                                       if not it.get("hidden") and it.get("kind") in ("photo", "video") and (si, it["id"]) in frame_item_in] if contain else []
+                            if covered:
+                                # A photo or video put here shows whole over it: the slot's colour, not the
+                                # main video, around it while it shows
+                                fp.append(f"{placed(chain, aw, rh, iw, ih, px, py, rr, boxed, f'{key}m')}[{key}mc]")
+                                canvas(area.get("fill") or "000000", aw, rh, f"[{key}cv]")
+                                fp.append(f"[{key}mc][{key}cv]overlay=0:0:enable='{'+'.join(f'between(t,{x:.3f},{y:.3f})' for x, y in covered)}'{cur_row}")
+                            else:
+                                fp.append(f"{placed(chain, aw, rh, iw, ih, px, py, rr, boxed, f'{key}m')}{cur_row}")
                     else:
                         canvas(area.get("fill") or ("000000" if contain else "111111"), aw, rh, cur_row)
 
