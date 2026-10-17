@@ -49,8 +49,10 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
     let renderSpec = baseSpec
     // (videos put in between can't be combined with cut parts yet: the editor allows one or the
     // other; an older save with both renders without the cuts rather than out of step)
-    if (baseSpec.inserts.length && (baseSpec.remove_fillers || baseSpec.trim_ranges.length)) {
-      console.warn('[render] clip has videos put in between: removed parts and pause cuts are not applied')
+    // (a part played faster or slower is the same: its pieces say where the video is)
+    const sped = ((baseSpec as { pieces?: Piece[] }).pieces ?? []).some(p => (p.speed ?? 1) !== 1)
+    if ((baseSpec.inserts.length || sped) && (baseSpec.remove_fillers || baseSpec.trim_ranges.length)) {
+      console.warn('[render] clip has videos put in between or parts at another speed: removed parts and pause cuts are not applied')
     } else if (baseSpec.remove_fillers || baseSpec.trim_ranges.length) {
       const cut = await condenseClip(clip_id, baseSpec, videoSignedUrl, tmp, signal)
       if (cut) { videoInput = cut.path; renderSpec = cut.spec }
@@ -241,7 +243,7 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
   const clipStart = Number(clip.start_ms)
   const trimmed = cleanTrims(clip.trim_ranges, Number(clip.start_ms), Number(clip.end_ms)).length > 0
   const pieces = trimmed ? [] : piecesOfRows(segments as Row[], clip.video_id)
-  const piecesOn = !trimmed && (inserts.length > 0 || pieces.some(p => p.from != null && Math.abs(p.from - p.at) > 1))
+  const piecesOn = !trimmed && (inserts.length > 0 || pieces.some(p => (p.from != null && Math.abs(p.from - p.at) > 1) || (p.speed ?? 1) !== 1))
   const placedSegments = piecesOn
     ? (segments as Row[]).map(s => (isInsertRow(s, clip.video_id)
       ? { ...s, inserted: true }
@@ -252,9 +254,10 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
       const rel = Number(w.start_ms) - clipStart
       if (rel < 0) return [w]
       const mid = (Number(w.start_ms) + Number(w.end_ms)) / 2 - clipStart
-      if (!pieces.some(p => p.from != null && mid >= p.from && mid < p.from + p.ms)) return []
-      const d = timelineAtPieces(pieces, rel) - rel
-      return d ? [{ ...w, start_ms: Number(w.start_ms) + d, end_ms: Number(w.end_ms) + d }] : [w]
+      if (!pieces.some(p => p.from != null && mid >= p.from && mid < p.from + p.ms * (p.speed ?? 1))) return []
+      // (each end: in a part played faster or slower the word is shorter or longer too)
+      const a = timelineAtPieces(pieces, rel), b = Math.max(a + 1, timelineAtPieces(pieces, Number(w.end_ms) - clipStart))
+      return a === rel && b === Number(w.end_ms) - clipStart ? [w] : [{ ...w, start_ms: clipStart + a, end_ms: clipStart + b }]
     })
     : words
   const piecesLen = pieces.length ? pieces[pieces.length - 1].at + pieces[pieces.length - 1].ms : 0
@@ -266,7 +269,7 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
     start_ms: clip.start_ms,
     end_ms: piecesOn ? clipStart + Math.round(piecesLen) : Number(clip.end_ms),
     // How much of the main video (from the clip's start) the pieces read: render.py opens that much
-    ...(piecesOn ? { source_ms: Math.round(Math.max(...pieces.map(p => (p.from ?? 0) + p.ms), piecesLen)), pieces } : {}),
+    ...(piecesOn ? { source_ms: Math.round(Math.max(...pieces.map(p => (p.from ?? 0) + p.ms * (p.speed ?? 1)), piecesLen)), pieces } : {}),
     remove_fillers: clip.remove_fillers === true,
     // Parts of the video removed from the clip in the editor, in source ms (lib/trims.ts)
     trim_ranges: cleanTrims(clip.trim_ranges, Number(clip.start_ms), Number(clip.end_ms)),
@@ -537,7 +540,10 @@ export function insertSpans(segments: Row[], mainVideoId: string): InsertSpan[] 
 }
 
 /** A stretch of the timeline [at, at + ms): the main video from `from` on, or held at `hold` (clip ms) */
-export type Piece = { at: number; ms: number; from?: number; hold?: number }
+/** `speed` (1 when not given): the piece's `ms` of timeline plays `ms · speed` of the main video */
+export type Piece = { at: number; ms: number; from?: number; hold?: number; speed?: number }
+/** A part's speed (the editor's Speed): 0.25 to 4, else 1 */
+export const rowSpeed = (s: Row) => { const v = Number(s.speed); return isFinite(v) && v >= 0.25 && v <= 4 ? v : 1 }
 
 /**
  * The clip's pieces from its saved rows (as the editor's piecesOf): a video put in between holds
@@ -558,9 +564,11 @@ export function piecesOfRows(rows: Row[], mainVideoId: string): Piece[] {
       const main = String(s.layout).startsWith('frame_') || !addedVideo(s, mainVideoId)
         ? ((s.crop_boxes ?? []) as Row[]).find(b => !b.source_video_id && !b.image_path)
         : null
-      const from = (main && main.source_offset_ms != null ? Number(main.source_offset_ms) : videoNow) + (at - s0)
-      out.push({ at, ms, from })
-      videoNow = from + ms
+      // (a part of the main video plays at its own speed; a video on top doesn't change the main video's)
+      const speed = main ? rowSpeed(s) : 1
+      const from = (main && main.source_offset_ms != null ? Number(main.source_offset_ms) : videoNow) + (at - s0) * speed
+      out.push({ at, ms, from, ...(speed !== 1 ? { speed } : {}) })
+      videoNow = from + ms * speed
     }
     cursor = at + ms
   }
@@ -572,12 +580,12 @@ export function videoAtPieces(pieces: Piece[], t: number): number {
   let p = pieces[pieces.length - 1]
   for (const x of pieces) if (t < x.at + x.ms) { p = x; break }
   if (!p) return Math.max(0, t)
-  return p.hold != null ? p.hold : (p.from ?? 0) + Math.min(p.ms, Math.max(0, t - p.at))
+  return p.hold != null ? p.hold : (p.from ?? 0) + Math.min(p.ms, Math.max(0, t - p.at)) * (p.speed ?? 1)
 }
 
 /** Where on the timeline the main video shows its moment `v` (clip ms); a moment cut out lands where the clip goes on after it */
 export function timelineAtPieces(pieces: Piece[], v: number): number {
-  for (const p of pieces) if (p.from != null && v >= p.from && v < p.from + p.ms) return p.at + (v - p.from)
+  for (const p of pieces) if (p.from != null && v >= p.from && v < p.from + p.ms * (p.speed ?? 1)) return p.at + (v - p.from) / (p.speed ?? 1)
   const next = pieces.find(p => p.from != null && p.from > v)
   return next ? next.at : (pieces.length ? pieces[pieces.length - 1].at + pieces[pieces.length - 1].ms : v)
 }
