@@ -49,6 +49,12 @@ FREE_TEMPLATES: dict[str, list[dict]] = {
         {"kind": "slot", "slot": 0, "x": 0, "y": 0, "w": 1, "h": 1},
         {"kind": "band", "lane": "band", "x": 0.07, "y": 0.1, "w": 0.86, "h": 0.13, "radius": 28, "bg": "#ffffff", "color": "#111111", "size": 46},
     ],
+    # Trio with main: the main video over half the frame, two parts side by side in the other half
+    "frame_trio_main": [
+        {"kind": "slot", "slot": 0, "x": 0, "y": 0, "w": 1, "h": 0.5},
+        {"kind": "slot", "slot": 1, "x": 0, "y": 0.5, "w": 0.5, "h": 0.5},
+        {"kind": "slot", "slot": 2, "x": 0.5, "y": 0.5, "w": 0.5, "h": 0.5},
+    ],
     "frame_side_by_side": [
         {"kind": "band", "lane": "band", "x": 0, "y": 0, "w": 1, "h": 0.18},
         {"kind": "slot", "slot": 0, "x": 0, "y": 0.18, "w": 0.5, "h": 0.64},
@@ -72,9 +78,11 @@ FREE_TEMPLATES: dict[str, list[dict]] = {
         {"kind": "band", "lane": "band2", "x": 0.05, "y": 0.19, "w": 0.2, "h": 0.1, "radius": 24, "bg": "#c8ff00", "color": "#000000", "size": 96},
     ],
     "frame_screen_face": [
-        {"kind": "slot", "slot": 0, "x": 0, "y": 0, "w": 1, "h": 0.62, "fit": "contain", "fill": "#000000"},
+        # main_crop: the main video put here (Same video) gets its own view, cropped; other media shows whole
+        {"kind": "slot", "slot": 0, "x": 0, "y": 0, "w": 1, "h": 0.62, "fit": "contain", "fill": "#000000", "main_crop": True},
+        # The caption strip is see-through (the Screen can reach the bottom); the face cam last: on top
+        {"kind": "caption", "x": 0, "y": 0.89, "w": 1, "h": 0.11, "bg": "none"},
         {"kind": "slot", "slot": 1, "x": 0.3, "y": 0.66, "w": 0.4, "h": 0.225, "radius": "circle"},
-        {"kind": "caption", "x": 0, "y": 0.89, "w": 1, "h": 0.11},
     ],
     "frame_audiogram": [
         {"kind": "band", "lane": "band", "x": 0, "y": 0, "w": 1, "h": 0.16},
@@ -124,18 +132,96 @@ def _even(v: float) -> int:
     return int(round(v / 2)) * 2
 
 
+# A free frame's bar: the line between two of its areas, dragged to resize them (editor: the
+# template's `bar`). dir "v": a vertical line (left | right), "h": a horizontal one (top / bottom);
+# at: where the template has it; min / max: how far it can go. frame.split: where it was dragged.
+# swap: it has a swap (frame.flip): the areas on either side trade places — the frame mirrored that way.
+FREE_BARS = {
+    "frame_side_by_side": {"dir": "v", "at": 0.5, "min": 0.2, "max": 0.8},
+    "frame_screen_face": {"dir": "h", "at": 0.62, "min": 0.3, "max": 1.0},  # down to the bottom: the Screen fills the frame
+    "frame_trio_main": {"dir": "h", "at": 0.5, "min": 0.2, "max": 0.8, "swap": True},  # Main / the pair
+}
+# A free frame's second bar (frame.split2; its swap frame.flip2). Editor: the template's `bar2`.
+FREE_BARS2 = {
+    "frame_trio_main": {"dir": "v", "at": 0.5, "min": 0.2, "max": 0.8, "swap": True},  # Left | Right
+}
+# A free frame's area that can be moved and resized anywhere in the frame, keeping its shape (the
+# face cam's circle), even over the others (it's drawn on top). frame.face_box: {x, y, w} once placed;
+# until then it follows the bar, keeping its gap. Editor: the template's `movable`.
+FREE_MOVABLE = {"frame_screen_face": 1}
+MIN_MOVABLE_W = 0.12
+
+
+def _num(v) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f and abs(f) != float("inf") else None
+
+
+def adjust_free_areas(layout: str, areas: list[dict], frame: dict | None) -> list[dict]:
+    """A free frame's areas (shares of the frame) as its bars and moved area set them. Mirrors adjustFreeAreas() in the editor."""
+    frame = frame or {}
+    out = [dict(a) for a in areas]
+    bar, bar2, mv = FREE_BARS.get(layout), FREE_BARS2.get(layout), FREE_MOVABLE.get(layout)
+
+    def shift(b: dict, split: float, moving=None) -> None:
+        s = min(b["max"], max(b["min"], split))
+        at, d = b["at"], s - b["at"]
+        pos, size = ("x", "w") if b["dir"] == "v" else ("y", "h")
+        for a in out:
+            end = a[pos] + a[size]
+            if moving is not None and a["kind"] == "slot" and a.get("slot") == moving:
+                a[pos] = min(1 - a[size], max(0.0, a[pos] + d))   # follows the bar, inside the frame
+            elif abs(end - at) < 1e-6:
+                a[size] = s - a[pos]
+            elif abs(a[pos] - at) < 1e-6:
+                a[pos], a[size] = s, end - s
+
+    split, split2 = _num(frame.get("split")), _num(frame.get("split2"))
+    if bar and split is not None:
+        shift(bar, split, mv)
+    if bar2 and split2 is not None:
+        shift(bar2, split2)
+    # Swapped: the frame mirrored across the bar's way (before the moved area: placed, it stays put)
+    for b, key in ((bar, "flip"), (bar2, "flip2")):
+        if b and b.get("swap") and frame.get(key) is True:
+            for a in out:
+                if b["dir"] == "v":
+                    a["x"] = 1 - a["x"] - a["w"]
+                else:
+                    a["y"] = 1 - a["y"] - a["h"]
+    box = frame.get("face_box")
+    if mv is not None and isinstance(box, dict):
+        for a in out:
+            if a["kind"] != "slot" or a.get("slot") != mv:
+                continue
+            ratio = a["h"] / a["w"]   # its shape: a circle stays a circle
+            w = min(1.0, max(MIN_MOVABLE_W, _num(box.get("w")) or a["w"]))
+            h = w * ratio
+            if h > 1:
+                h, w = 1.0, 1 / ratio
+            x, y = _num(box.get("x")), _num(box.get("y"))
+            a["x"] = min(1 - w, max(0.0, a["x"] if x is None else x))
+            a["y"] = min(1 - h, max(0.0, a["y"] if y is None else y))
+            a["w"], a["h"] = w, h
+    return out
+
+
 def frame_areas(layout: str, out_w: int, out_h: int, show_band: bool = True, custom: list[float] | None = None,
-                order: list[int] | None = None) -> list[dict]:
+                order: list[int] | None = None, frame: dict | None = None) -> list[dict]:
     """
     Every area of a frame in drawing order, in even pixels: {kind, slot / lane, x, y, w, h, r (corner
     radius px), and the area's options}. A stacked frame's rows are full-width areas (their heights
     from frame_rows, so they add up exactly); a free frame's areas are placed where the template says.
-    Mirrors frameAreas() in the editor. `order`: the rows top to bottom when swapped (row_order(seg)).
+    Mirrors frameAreas() in the editor. `order`: the rows top to bottom when swapped (row_order(seg));
+    `frame`: the frame's settings (a free frame's bar and moved area: adjust_free_areas).
     """
     if layout in FREE_TEMPLATES:
         out: list[dict] = []
         k = out_w / 1080
-        for a in FREE_TEMPLATES[layout]:
+        for a in adjust_free_areas(layout, FREE_TEMPLATES[layout], frame):
             if a["kind"] == "band" and not show_band:
                 continue
             x, y = _even(a["x"] * out_w), _even(a["y"] * out_h)
@@ -344,7 +430,7 @@ def caption_band_zones(segments: list[dict], out_h: int) -> list[tuple[int, int,
             continue
         centre = None
         strip = None
-        for a in frame_areas(layout, 1080, out_h, True, row_heights(seg), row_order(seg)):
+        for a in frame_areas(layout, 1080, out_h, True, row_heights(seg), row_order(seg), seg.get("frame")):
             if a["kind"] == "band" and a.get("lane") == "band":
                 centre = a["y"] + a["h"] // 2
             elif a["kind"] == "caption":
