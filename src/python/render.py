@@ -2090,7 +2090,13 @@ def main(
             if rot:
                 rad = f"{rot * 3.141592653589793 / 180:.6f}"
                 turn = f",format=rgba,rotate={rad}:c=none:ow=rotw({rad}):oh=roth({rad})"
-            fp.append(f"{img_lbl}scale={iw}:{ih}:flags=lanczos,setsar=1{turn}{slbl}")
+            # See-through (a brand kit's logo): its alpha scaled, as the preview's CSS opacity
+            try:
+                op = float(ov.get("opacity") if ov.get("opacity") is not None else 1)
+            except (TypeError, ValueError):
+                op = 1.0
+            fade = f",format=rgba,colorchannelmixer=aa={max(0.0, min(1.0, op)):.3f}" if op < 0.999 else ""
+            fp.append(f"{img_lbl}scale={iw}:{ih}:flags=lanczos,setsar=1{fade}{turn}{slbl}")
             fp.append(
                 f"{cur}{slbl}overlay=x={ix + iw / 2:.1f}-overlay_w/2:y={iy + ih / 2:.1f}-overlay_h/2"
                 f":enable='between(t,{t0:.3f},{t1:.3f})'{olbl}"
