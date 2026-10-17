@@ -441,6 +441,8 @@ const MAX_ANGLES = 12
 const ANGLE_MOTION_X = 0.15
 const ANGLE_MOTION_Y = 0.15
 const ANGLE_MOTION_SIZE = 2.2
+/** A frame this close to a camera cut may already show the next shot: a short stretch is judged without it when it has others */
+const SHORT_EDGE_MS = 150
 
 export interface Angle {
   /** How many people it shows; 0: the other shots (no faces, or too short to be an angle) */
@@ -505,6 +507,41 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
     for (let e = 0; e < id; e++) if (into[e] === e && sameAngle(found[e], a)) { into[id] = e; break }
   })
   stretches.forEach(st => { if (st.angle >= 0) st.angle = into[st.angle] })
+
+  // A stretch too short to be an angle of its own (or whose shot couldn't be told) joins the angle its
+  // picture shows — the marked faces where they are, about their size, the same people — instead of
+  // the other shots: most of its frames must show that angle. Frames right on a cut are left out
+  // when there are others (the picture may already be the next shot's).
+  const fits = (faces: CropBox[], ref: CropBox[]) => {
+    if (!ref.length || faces.length < ref.length) return false
+    const used = new Set<number>()
+    const apart: number[] = []
+    for (const r of ref) {
+      let best = -1, bestD = Infinity
+      faces.forEach((f, k) => {
+        if (used.has(k)) return
+        const dx = Math.abs(f.x + f.w / 2 - (r.x + r.w / 2)), dy = Math.abs(f.y + f.h / 2 - (r.y + r.h / 2))
+        if (dx > SHOT_REACH_X || dy > SHOT_REACH_Y || Math.max(f.w / r.w, r.w / f.w) > SHOT_SIZE_RATIO) return
+        if (dx + dy < bestD) { bestD = dx + dy; best = k }
+      })
+      if (best < 0) return false
+      used.add(best)
+      if (faces[best].sig?.length && r.sig?.length) apart.push(l1(faces[best].sig!, r.sig!))
+    }
+    return !apart.length || apart.reduce((x, y) => x + y, 0) / apart.length < SHOT_SAME_PEOPLE
+  }
+  for (const st of stretches) {
+    if (st.angle >= 0) continue
+    const inside = fr.map((f, fi) => ({ faces: f.faces, t: timeOf(fi) })).filter(x => x.t >= st.a && x.t < st.b)
+    // (the clip's own start and end aren't cuts: a frame there shows this stretch)
+    const away = inside.filter(x => (st.a <= 0 || x.t - st.a >= SHORT_EDGE_MS) && (st.b >= durationMs || st.b - x.t >= SHORT_EDGE_MS))
+    const use = away.length ? away : inside
+    const votes = new Map<number, number>()
+    // Only the angles left after the light-motion join above
+    for (const x of use) found.forEach((a, id) => { if (into[id] === id && fits(x.faces, a.faces)) votes.set(id, (votes.get(id) ?? 0) + 1) })
+    const best = [...votes].sort((p, q) => q[1] - p[1])[0]
+    if (best && best[1] * 2 >= use.length) st.angle = best[0]
+  }
 
   // Past the most there can be, the least shown go with the other shots
   const total = (id: number) => stretches.filter(s => s.angle === id).reduce((n, s) => n + s.b - s.a, 0)
