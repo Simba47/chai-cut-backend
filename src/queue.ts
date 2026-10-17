@@ -87,7 +87,10 @@ async function tick() {
       WHERE status = 'queued' AND type = ANY(${types})
       ${isRailway ? db`AND NOT (type = 'transcribe' AND payload @> '{"requires_ytdlp":true}'::jsonb)` : db``}
       AND NOT (type = 'proxy' AND EXISTS (SELECT 1 FROM jobs p WHERE p.type = 'proxy' AND p.status = 'processing'))
-      ORDER BY (type = 'proxy') ASC, created_at ASC LIMIT 1
+      -- A whole-video reading (AI edit: many minutes for a long video) waits for the quick jobs that
+      -- came after it — a clip's own captions (manual edit), renders, uploads — so they never queue
+      -- behind it (COALESCE: a job without the field must sort as false, not as NULL, which goes last)
+      ORDER BY (type = 'proxy') ASC, (type = 'transcribe' AND COALESCE(payload->>'transcribe_full', '') = 'true') ASC, created_at ASC LIMIT 1
       FOR UPDATE SKIP LOCKED
     ), claimed AS (
       UPDATE jobs j SET status = 'processing' FROM next WHERE j.id = next.id AND j.status = 'queued' RETURNING j.*

@@ -241,9 +241,29 @@ registerHandler('ai_edit', handleAiEditJob)
 registerHandler('proxy', handleProxyJob)
 registerHandler('track_subjects', handleTrackSubjectsJob)
 
-runMigrations()
-  .then(() => startQueue())
-  .catch(err => {
-    console.error('[worker] Fatal error:', err)
-    process.exit(1)
-  })
+/**
+ * Whether this worker may change the database and take jobs. A worker on a PC whose database isn't
+ * on that PC (a local .env pointing at QA's) doesn't, unless LOCAL_WORKER=on: it took QA's jobs
+ * before Railway's worker did — with code not deployed yet and the PC's own AI settings (2026-10-17:
+ * a QA transcript ran on a PC, through its Vertex project, and never showed on Railway) — and ran
+ * its migrations on QA. A worker on Railway (QA or live) always does.
+ */
+function mayTakeJobs(): boolean {
+  if (process.env.RAILWAY_PROJECT_ID || process.env.RAILWAY_SERVICE_ID) return true
+  if (process.env.LOCAL_WORKER === 'on') return true
+  let host = ''
+  try { host = new URL(process.env.DATABASE_URL ?? '').hostname } catch { /* no database set: nothing to take */ }
+  return ['localhost', '127.0.0.1', '::1', '[::1]'].includes(host)
+}
+
+if (!mayTakeJobs()) {
+  console.log('[worker] Not taking jobs: this PC\'s database is somewhere else (QA\'s?), so Railway\'s worker does them. '
+    + 'Set LOCAL_WORKER=on in .env to run this worker on it anyway.')
+} else {
+  runMigrations()
+    .then(() => startQueue())
+    .catch(err => {
+      console.error('[worker] Fatal error:', err)
+      process.exit(1)
+    })
+}

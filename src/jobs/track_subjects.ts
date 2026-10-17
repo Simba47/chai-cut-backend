@@ -9,6 +9,7 @@ import type { TransactionSql } from 'postgres'
 import type { Job, TrackSubjectsJobPayload } from '../types.js'
 import { detectFaces, detectCuts, trackFaces, probeSize, FRAME_INTERVAL_MS, type FrameDetection, type CropBox, type SpokenWord } from './ai_edit.js'
 import { autoDirectChanges, followChanges, buildKeyframes, type SubjectPoint } from './subject_framing.js'
+import { snapSectionBoundaries } from '../lib/snapSections.js'
 
 // ── Subjects: people the user marked in a clip, followed through it ────────────
 // In the editor the user pauses on a person and clicks them (a "subject"). This job looks at the
@@ -294,10 +295,8 @@ const SHOT_SAME_PEOPLE = 0.5
 const SHOT_JOIN_MS = 1000
 /** A face smaller than this share of the marked shot's smallest face is background (a poster, a face far behind) */
 const SHOT_BACKGROUND = 0.5
-/** Frames where a face isn't read (someone turns away) don't end the shot for this long */
-const SHOT_HOLD_MS = 2000
-/** The shot's edges snap to a camera cut this close */
-const SHOT_SNAP_MS = 750
+/** Inside one camera shot, something else for this long is another shot (shorter: the face reader's misreads) */
+const SHOT_CHANGE_MS = 2000
 /** A stretch of the shot shorter than this isn't one */
 const SHOT_MIN_MS = 800
 
@@ -373,34 +372,47 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
     return { s: 'match', box: { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y } }
   })
 
-  // The stretches: from a matching frame to the last one, within one camera shot; faces not read
-  // for a moment carry it on, someone else in the picture (two frames running) ends it
+  // The stretches. A camera shot (cut to cut) is one shot: when most of its frames are the marked
+  // shot, all of it is — the face reader misses or misreads a face now and then, mostly as a shot
+  // starts or ends (it used to leave a second of the shot unmarked there). Only something else for
+  // SHOT_CHANGE_MS or longer (someone walks in, the camera turns to others) splits a camera shot.
   const spans: Turn[] = []
-  const path: PathPoint[] = []
-  let run: { start: number; last: number; k: number } | null = null
-  let others = 0
-  const close = () => {
-    if (!run) return
-    const lo = bounds[run.k], hi = bounds[run.k + 1]
-    let a = run.start - FRAME_INTERVAL_MS / 2, b = run.last + FRAME_INTERVAL_MS / 2
-    if (a - lo <= SHOT_SNAP_MS) a = lo
-    if (hi - b <= SHOT_SNAP_MS) b = hi
-    a = Math.max(lo, a); b = Math.min(hi, b)
-    if (b - a >= SHOT_MIN_MS) spans.push([Math.round(a), Math.round(b)])
-    run = null
+  const half = FRAME_INTERVAL_MS / 2
+  for (let k = 0; k < bounds.length - 1; k++) {
+    const lo = bounds[k], hi = bounds[k + 1]
+    const idx = fr.map((_, fi) => fi).filter(fi => stretchOf(timeOf(fi)) === k)
+    let from = lo
+    let piece: number[] = []
+    const flush = (to: number) => {
+      const match = piece.filter(fi => states[fi].s === 'match').length
+      const other = piece.filter(fi => states[fi].s === 'other').length
+      if (match && match >= other && to - from >= SHOT_MIN_MS) spans.push([Math.round(from), Math.round(to)])
+      piece = []
+    }
+    let i = 0
+    while (i < idx.length) {
+      if (states[idx[i]].s !== 'other') { piece.push(idx[i++]); continue }
+      let j = i
+      while (j < idx.length && states[idx[j]].s === 'other') j++
+      if (timeOf(idx[j - 1]) - timeOf(idx[i]) + FRAME_INTERVAL_MS >= SHOT_CHANGE_MS) {
+        // Another shot for a while: what came before ends here, what comes after starts after it
+        flush(Math.max(from, timeOf(idx[i]) - half))
+        from = Math.min(hi, timeOf(idx[j - 1]) + half)
+      } else {
+        piece.push(...idx.slice(i, j))
+      }
+      i = j
+    }
+    flush(hi)
   }
+  // The people's box, frame by frame, where the shot is
+  const path: PathPoint[] = []
   fr.forEach((_, fi) => {
-    const t = timeOf(fi), k = stretchOf(t), st = states[fi]
-    if (run && (k !== run.k || t - run.last > SHOT_HOLD_MS)) close()
-    if (st.s === 'other') { if (++others >= 2) close(); return }
-    others = 0
-    if (st.s !== 'match') return
-    if (!run) run = { start: t, last: t, k }
-    run.last = t
-    const b = st.box!
-    path.push([t, round4(b.x), round4(b.y), round4(b.w), round4(b.h), 0])
+    const t = timeOf(fi), st = states[fi]
+    if (st.s !== 'match' || !spans.some(([x, y]) => t >= x && t <= y)) return
+    const bx = st.box!
+    path.push([t, round4(bx.x), round4(bx.y), round4(bx.w), round4(bx.h), 0])
   })
-  close()
   // Joined where two stretches meet (the same shot either side of a cut that isn't one), or are a
   // moment apart inside one camera shot
   const joined: Turn[] = []
@@ -419,6 +431,18 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
 
 /** At most this many angles are listed; the least shown beyond that go with the other shots */
 const MAX_ANGLES = 12
+/**
+ * Someone leaning, shifting or moving a little is not another angle. Two shots with the same number
+ * of people, each in about the same place and size, are listed as one: a face this close (fractions
+ * of the frame; wider than a shot's own match, which gives group formats their exact places) and
+ * within this size ratio, and the same people by their signatures. Another camera (people in other
+ * places) or other people in the same places still list apart.
+ */
+const ANGLE_MOTION_X = 0.15
+const ANGLE_MOTION_Y = 0.15
+const ANGLE_MOTION_SIZE = 2.2
+/** A frame this close to a camera cut may already show the next shot: a short stretch is judged without it when it has others */
+const SHORT_EDGE_MS = 150
 
 export interface Angle {
   /** How many people it shows; 0: the other shots (no faces, or too short to be an angle) */
@@ -466,9 +490,62 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
     })
   })
 
+  // Light motion isn't another angle: an angle that is only the same people moved a little goes into the earlier one
+  const sameAngle = (p: { faces: CropBox[] }, q: { faces: CropBox[] }) => {
+    if (p.faces.length !== q.faces.length) return false
+    const apart: number[] = []
+    for (let i = 0; i < p.faces.length; i++) {
+      const f = p.faces[i], g = q.faces[i]
+      const dx = Math.abs(f.x + f.w / 2 - (g.x + g.w / 2)), dy = Math.abs(f.y + f.h / 2 - (g.y + g.h / 2))
+      if (dx > ANGLE_MOTION_X || dy > ANGLE_MOTION_Y || Math.max(f.w / g.w, g.w / f.w) > ANGLE_MOTION_SIZE) return false
+      if (f.sig?.length && g.sig?.length) apart.push(l1(f.sig, g.sig))
+    }
+    return !apart.length || apart.reduce((a, b) => a + b, 0) / apart.length < SHOT_SAME_PEOPLE
+  }
+  const into = found.map((_, id) => id)
+  found.forEach((a, id) => {
+    for (let e = 0; e < id; e++) if (into[e] === e && sameAngle(found[e], a)) { into[id] = e; break }
+  })
+  stretches.forEach(st => { if (st.angle >= 0) st.angle = into[st.angle] })
+
+  // A stretch too short to be an angle of its own (or whose shot couldn't be told) joins the angle its
+  // picture shows — the marked faces where they are, about their size, the same people — instead of
+  // the other shots: most of its frames must show that angle. Frames right on a cut are left out
+  // when there are others (the picture may already be the next shot's).
+  const fits = (faces: CropBox[], ref: CropBox[]) => {
+    if (!ref.length || faces.length < ref.length) return false
+    const used = new Set<number>()
+    const apart: number[] = []
+    for (const r of ref) {
+      let best = -1, bestD = Infinity
+      faces.forEach((f, k) => {
+        if (used.has(k)) return
+        const dx = Math.abs(f.x + f.w / 2 - (r.x + r.w / 2)), dy = Math.abs(f.y + f.h / 2 - (r.y + r.h / 2))
+        if (dx > SHOT_REACH_X || dy > SHOT_REACH_Y || Math.max(f.w / r.w, r.w / f.w) > SHOT_SIZE_RATIO) return
+        if (dx + dy < bestD) { bestD = dx + dy; best = k }
+      })
+      if (best < 0) return false
+      used.add(best)
+      if (faces[best].sig?.length && r.sig?.length) apart.push(l1(faces[best].sig!, r.sig!))
+    }
+    return !apart.length || apart.reduce((x, y) => x + y, 0) / apart.length < SHOT_SAME_PEOPLE
+  }
+  for (const st of stretches) {
+    if (st.angle >= 0) continue
+    const inside = fr.map((f, fi) => ({ faces: f.faces, t: timeOf(fi) })).filter(x => x.t >= st.a && x.t < st.b)
+    // (the clip's own start and end aren't cuts: a frame there shows this stretch)
+    const away = inside.filter(x => (st.a <= 0 || x.t - st.a >= SHORT_EDGE_MS) && (st.b >= durationMs || st.b - x.t >= SHORT_EDGE_MS))
+    const use = away.length ? away : inside
+    const votes = new Map<number, number>()
+    // Only the angles left after the light-motion join above
+    for (const x of use) found.forEach((a, id) => { if (into[id] === id && fits(x.faces, a.faces)) votes.set(id, (votes.get(id) ?? 0) + 1) })
+    const best = [...votes].sort((p, q) => q[1] - p[1])[0]
+    if (best && best[1] * 2 >= use.length) st.angle = best[0]
+  }
+
   // Past the most there can be, the least shown go with the other shots
   const total = (id: number) => stretches.filter(s => s.angle === id).reduce((n, s) => n + s.b - s.a, 0)
-  const kept = new Set(found.map((_, id) => id).sort((p, q) => total(q) - total(p)).slice(0, MAX_ANGLES))
+  const kept = new Set(found.map((_, id) => id).filter(id => into[id] === id).sort((p, q) => total(q) - total(p)).slice(0, MAX_ANGLES))
   const spansOf = (pick: (s: { angle: number }) => boolean) => {
     const out: Turn[] = []
     for (const s of stretches) {
@@ -649,7 +726,8 @@ async function scanAngles(clipId: string, from: number, to: number, signal?: Abo
     const videoPath = await clipVideo(clip, tmp, signal)
     await db`UPDATE clip_angles SET progress = 25, updated_at = now() WHERE clip_id = ${clipId}`
     const [info, cuts] = await Promise.all([
-      detectFaces(tmp, videoPath, from, to, signal),
+      // Every face in the clip, not the ones a crop would follow: the list is who is in it
+      detectFaces(tmp, videoPath, from, to, signal, false, true),
       detectCuts(videoPath, from, to, signal),
     ])
     signal?.throwIfAborted()
@@ -858,6 +936,23 @@ async function frameClip(
     const kfs = await tx<{ box_id: string; t_ms: number; w: number; h: number }[]>`
       SELECT box_id, t_ms, w, h FROM box_keyframes WHERE box_id = ANY(${boxes.map(b => b.id)}) ORDER BY t_ms
     `
+    // A layout should change where the camera cuts: a section boundary a little before or after a
+    // cut would leave the old layout on the new picture, so it moves onto the cut (lib/snapSections.ts)
+    const mainOnly = (segId: string) => boxes.filter(b => b.segment_id === segId).every(b => !b.image_path && !b.source_video_id)
+    const snapped = snapSectionBoundaries(
+      segs.map(s => ({
+        id: s.id, start_ms: Number(s.start_ms), end_ms: Number(s.end_ms),
+        movable: !s.locked && s.layout !== 'horizontal' && !s.layout.startsWith('frame_') && mainOnly(s.id),
+      })),
+      cuts.map(c => c - clipStart),
+    )
+    for (const m of snapped) {
+      await tx`UPDATE segments SET start_ms = ${m.start_ms}, end_ms = ${m.end_ms} WHERE id = ${m.id}`
+      const seg = segs.find(x => x.id === m.id)!
+      seg.start_ms = m.start_ms
+      seg.end_ms = m.end_ms
+    }
+    if (snapped.length) console.log(`[track_subjects] clip ${clipId}: ${snapped.length} section(s) moved onto the camera cuts`)
     let framed = 0
     for (const seg of segs) {
       const start = Number(seg.start_ms), end = Number(seg.end_ms)
@@ -880,7 +975,7 @@ async function frameClip(
         framed++
       }
     }
-    if (framed) await tx`UPDATE clips SET status = 'draft', output_url = NULL WHERE id = ${clipId}`
+    if (framed || snapped.length) await tx`UPDATE clips SET status = 'draft', output_url = NULL WHERE id = ${clipId}`
     return framed
   })
 }
