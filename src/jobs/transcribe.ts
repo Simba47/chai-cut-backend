@@ -16,6 +16,7 @@ import { runawayReason, trimRunaway } from '../lib/transcriptGuard.js'
 import { convertWordForWord } from '../lib/wordConvert.js'
 import db from '../db.js'
 import type { Job, TranscribeJobPayload } from '../types.js'
+import { fixSpellings, ownerGlossary } from '../lib/glossary.js'
 import { queueProxy } from './proxy.js'
 
 async function r2Download(key: string): Promise<Buffer> {
@@ -292,6 +293,7 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
     // one transcript per video (the newest), so a clip job must never start a separate one —
     // that hid every other clip's captions. created_at is bumped so the editor's "since" poll
     // picks up the new words.
+    const glossary = await ownerGlossary(payload.video_id)
     await db.begin(async tx => {
       const [existing] = isClipJob
         ? await tx`
@@ -326,8 +328,11 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
         speaker_id:  e.speaker ?? null,
         confidence:  e.confidence ?? null,
       }))
-      for (let i = 0; i < words.length; i += 500) {
-        await tx`INSERT INTO transcript_words ${tx(words.slice(i, i + 500))}`
+      // The owner's brand names spelled as their brand kits' glossary has them (lib/glossary.ts)
+      const spelled = fixSpellings(words, glossary)
+      if (spelled.fixed) console.log(`[transcribe] glossary: ${spelled.fixed} word(s) spelled as the brand kit has them`)
+      for (let i = 0; i < spelled.rows.length; i += 500) {
+        await tx`INSERT INTO transcript_words ${tx(spelled.rows.slice(i, i + 500))}`
       }
     })
 

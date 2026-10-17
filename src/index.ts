@@ -248,6 +248,23 @@ async function runMigrations() {
   await db`CREATE INDEX IF NOT EXISTS brand_kits_user ON brand_kits (user_id, created_at)`
   // How see-through a photo on the clip is, 0–1 (a brand kit's logo; null = solid)
   await db`ALTER TABLE overlays ADD COLUMN IF NOT EXISTS opacity REAL`
+  // A bar along the top or bottom edge filling up as the clip plays (a brand kit's progress bar):
+  // { color, height (px on a 1080 × 1920 frame), position: 'top' | 'bottom' }; null = none
+  await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS progress_bar JSONB`
+  // Where the captions are centred left to right (0–1 of the frame's width, dragged in the editor's
+  // preview like text); null = the middle
+  await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS position_x REAL`
+  // A brand kit shared with other accounts (its owner's team): they can use it on their clips, not
+  // change it; with the kit's brand lock on, their editor offers only its colours and fonts
+  await db`
+    CREATE TABLE IF NOT EXISTS brand_kit_shares (
+      kit_id uuid NOT NULL REFERENCES brand_kits(id) ON DELETE CASCADE,
+      user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (kit_id, user_id)
+    )
+  `
+  await db`CREATE INDEX IF NOT EXISTS brand_kit_shares_user ON brand_kit_shares (user_id)`
   console.log('[startup] migrations ok')
 }
 

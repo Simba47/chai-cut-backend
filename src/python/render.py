@@ -59,8 +59,28 @@ _FONT_NAMES = {
 }
 
 
+# Fonts the editor offers by their family name that are bundled here (the editor loads them from
+# Google Fonts at the weight it draws: these are the nearest bundled files). Without this a text or
+# caption in, say, Bebas Neue came out in Roboto.
+_FAMILY_FILES = {
+    "Roboto":     "Roboto-Regular.ttf",
+    "Montserrat": "Montserrat-Bold.ttf",
+    "Poppins":    "Poppins-ExtraBold.ttf",
+    "Oswald":     "Oswald-Bold.ttf",
+    "Bebas Neue": "BebasNeue-Regular.ttf",
+    "Anton":      "Anton-Regular.ttf",
+    "Pacifico":   "Pacifico-Regular.ttf",
+}
+# A brand kit's own fonts (uploaded TTF / OTF): "BrandFont-<id>" → the file the render job fetched
+# for this export (--fonts). Set by main().
+_CUSTOM_FONTS: dict[str, str] = {}
+_ASS_NAMES: dict[str, str] = {}
+
+
 def _find_font_path(font_id: str) -> str:
-    filename = _FONT_FILES.get(font_id, _FONT_FILES["roboto"])
+    if font_id in _CUSTOM_FONTS and os.path.exists(_CUSTOM_FONTS[font_id]):
+        return _CUSTOM_FONTS[font_id]
+    filename = _FONT_FILES.get(font_id) or _FAMILY_FILES.get(font_id) or _FONT_FILES["roboto"]
     for d in [os.environ.get("FONTS_DIR", ""), _FONTS_DIR, "/usr/share/fonts", "/System/Library/Fonts"]:
         if not d:
             continue
@@ -71,6 +91,25 @@ def _find_font_path(font_id: str) -> str:
 
 
 # ── ASS subtitle generation ────────────────────────────────────────────────────
+
+def _ass_font_name(font_id: str) -> str:
+    """The family name a subtitle style asks for (libass finds the file by it in the fonts folder):
+    a bundled id's own name, else the name inside the font's file (a brand font, a bundled family)."""
+    if font_id in _FONT_NAMES:
+        return _FONT_NAMES[font_id]
+    if font_id in _ASS_NAMES:
+        return _ASS_NAMES[font_id]
+    name = "Roboto"
+    if font_id in _CUSTOM_FONTS or font_id in _FAMILY_FILES:
+        path = _find_font_path(font_id)
+        try:
+            from PIL import ImageFont
+            name = ImageFont.truetype(path, 20).getname()[0] or name
+        except Exception:
+            pass
+    _ASS_NAMES[font_id] = name
+    return name
+
 
 def _hex_to_ass(hex_color: str, alpha: int = 0) -> str:
     """#RRGGBB → ASS &HAABBGGRR  (alpha 0 = fully opaque)."""
@@ -146,7 +185,7 @@ def _write_ass(
     band_zones: list[tuple[int, int, int]] | None = None,
 ) -> None:
     font_id   = style.get("font") or "noto-sans-telugu"
-    font_name = _FONT_NAMES.get(font_id, "Roboto")
+    font_name = _ass_font_name(font_id)
     font_size = int(style.get("size") or 52)
     color_hex = style.get("color") or "#ffffff"
     pos_y_frac = float(style.get("position_y") or 0.84)
@@ -167,7 +206,7 @@ def _write_ass(
         for w in words
     ]
 
-    pos_x = out_w // 2
+    pos_x = _caption_x(style, out_w)
     pos_y = int(pos_y_frac * out_h)
 
     lines = [
@@ -214,7 +253,7 @@ def _write_ass(
         # Alignment=5 (center of screen); \pos pins the anchor to exact coordinates. Where a
         # frame shows captions in its text band, that part of the line is centred in the band.
         for a, b, y in _split_by_zones(start_ms, end_ms, band_zones or [], pos_y):
-            tag = f"{{\\pos({pos_x},{y})}}"
+            tag = f"{{\\pos({_x_in_piece(a, b, band_zones or [], pos_x, out_w)},{y})}}"
             body = text
             if karaoke:
                 runs = []
@@ -434,7 +473,7 @@ def _preset_events(words: list[dict], style: dict, out_w: int, out_h: int, zones
     per_line = 1 if anim == "word" else int(style.get("words_per_line") or tpl.get("perLine") or (3 if anim in ("highlight", "hormozi") else _MAX_PHRASE_WORDS))
     pos_y_frac = style.get("position_y")
     pos_y = int(float(pos_y_frac if pos_y_frac is not None else (0.5 if anim == "word" else 0.84)) * out_h)
-    pos_x = out_w // 2
+    pos_x = _caption_x(style, out_w)
     base_scale = _WORD_SCALE if anim == "word" else 100
 
     events: list[str] = []
@@ -521,11 +560,12 @@ def _preset_events(words: list[dict], style: dict, out_w: int, out_h: int, zones
                     # (last, so nothing above replaces it; this piece is cut to the word's own time)
                     tags = f"\\fn{live_font[0]}\\b{live_font[1]}\\i{live_font[2]}" + tags
                 text_runs.append(f"{{{tags}}}{_esc(t)}")
+            px = _x_in_piece(a, b, zones, pos_x, out_w)
             if anim == "bounce" and a == start_ms:
                 dy = round(out_h * 0.02)
-                head = f"{{\\move({pos_x},{y + dy},{pos_x},{y},0,{_BOUNCE_MS})\\fad(80,0)}}"
+                head = f"{{\\move({px},{y + dy},{px},{y},0,{_BOUNCE_MS})\\fad(80,0)}}"
             else:
-                head = f"{{\\pos({pos_x},{y})}}"
+                head = f"{{\\pos({px},{y})}}"
             if anim == "box" or (tpl.get("box") and not tpl.get("stack")):
                 plain = " ".join(_esc(t) for _, t in shown)
                 events.append(f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},PresetLine,,0,0,0,,{head}{plain}")
@@ -533,6 +573,21 @@ def _preset_events(words: list[dict], style: dict, out_w: int, out_h: int, zones
                 events.append(f"Dialogue: 0,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},PresetBox,,0,0,0,,{head}{joiner.join(box_runs)}")
             events.append(f"Dialogue: 1,{_ms_to_ass_ts(a)},{_ms_to_ass_ts(b)},Preset,,0,0,0,,{head}{joiner.join(text_runs)}")
     return events
+
+
+def _caption_x(style: dict, out_w: int) -> int:
+    """Where the captions are centred left to right: where they were dragged (position_x), else the middle"""
+    v = style.get("position_x")
+    try:
+        return int(min(1.0, max(0.0, float(v))) * out_w) if v is not None else out_w // 2
+    except (TypeError, ValueError):
+        return out_w // 2
+
+
+def _x_in_piece(a: int, b: int, zones: list[tuple[int, int, int]], free_x: int, out_w: int) -> int:
+    """A caption piece's x: in a frame's text band it is centred in the band (the middle), else where dragged"""
+    mid = (a + b) / 2
+    return out_w // 2 if any(za <= mid < zb for za, zb, _ in zones) else free_x
 
 
 def _split_by_zones(start_ms: int, end_ms: int, zones: list[tuple[int, int, int]], default_y: int) -> list[tuple[int, int, int]]:
@@ -904,6 +959,23 @@ def _corner_mask(tmp: str, w: int, h: int, m: int, r: int) -> str:
     if res.returncode != 0 or not os.path.exists(path):
         raise RuntimeError(f"corner mask failed: {res.stderr[-400:]}")
     return path
+
+
+def _subtitle_fonts_dir(tmp: str) -> str:
+    """The folder libass reads fonts from: the bundled one, or — with brand fonts in this export —
+    a folder holding both (libass takes one folder)."""
+    if not _CUSTOM_FONTS:
+        return _FONTS_DIR
+    d = os.path.join(tmp, "subtitle_fonts")
+    os.makedirs(d, exist_ok=True)
+    import shutil
+    for name in os.listdir(_FONTS_DIR):
+        if name.lower().endswith((".ttf", ".otf")) and not os.path.exists(os.path.join(d, name)):
+            shutil.copyfile(os.path.join(_FONTS_DIR, name), os.path.join(d, name))
+    for fam, path in _CUSTOM_FONTS.items():
+        if os.path.exists(path):
+            shutil.copyfile(path, os.path.join(d, fam + (".otf" if path.lower().endswith(".otf") else ".ttf")))
+    return d
 
 
 def _frame_text_font(text: str) -> str:
@@ -2178,7 +2250,7 @@ def main(
             def _esc_path(p: str) -> str:
                 return "'" + p.replace("\\", "/").replace(":", "\\:").replace("'", "") + "'"
             esc_ass   = _esc_path(ass_path)
-            esc_fonts = _esc_path(_FONTS_DIR)
+            esc_fonts = _esc_path(_subtitle_fonts_dir(tmp))
             fp.append(f"{cur}subtitles=filename={esc_ass}:fontsdir={esc_fonts}[vcap]")
             cur = "[vcap]"
 
@@ -2362,6 +2434,23 @@ def main(
             )
             cur = olbl
 
+        # ── Progress bar (a brand kit's) ───────────────────────────────────────
+        # A strip along the top or bottom edge that fills from the left as the clip plays: a full-width
+        # strip of the colour slid in from off the left edge (x = -W + W·t/length; drawbox can't change
+        # its width over time). Its thickness is px on a 1080 × 1920 frame, scaled to the export's size.
+        # The editor draws the same (components/editor/VideoPreview.tsx ProgressBar).
+        pb = spec.get("progress_bar")
+        if isinstance(pb, dict) and clip_dur_ms > 0:
+            pb_color = str(pb.get("color", "#ffffff"))
+            if not re.fullmatch(r"#[0-9a-fA-F]{6}", pb_color):
+                pb_color = "#ffffff"
+            pb_h = max(2, int(round(min(40, max(4, float(pb.get("height", 12)))) * out_h / 1920)))
+            pb_y = 0 if pb.get("position") == "top" else out_h - pb_h
+            dur_s = clip_dur_ms / 1000.0
+            fp.append(f"color=c=0x{pb_color[1:]}:s={out_w}x{pb_h}:r=30:d={dur_s + 1:.3f}[vpbs]")
+            fp.append(f"{cur}[vpbs]overlay=x='-W+W*t/{dur_s:.3f}':y={pb_y}:eval=frame:shortest=1[vpb]")
+            cur = "[vpb]"
+
         # ── Watermark (free plan only) ─────────────────────────────────────────
         # The Shortcut badge (assets/watermark.png), over everything else. Its size and place are
         # shares of the frame, so every quality and shape gets the same mark. It slides up and fades
@@ -2447,7 +2536,9 @@ if __name__ == "__main__":
     parser.add_argument("--overlay-videos",   default="{}", help="JSON: source_video_id → local_path")
     parser.add_argument("--watermark",        action="store_true", help="Burn in the Shortcut watermark (Free plan)")
     parser.add_argument("--frame-images",     default="{}", help="JSON: frame slot image_path → local_path")
+    parser.add_argument("--fonts",            default="{}", help="JSON: brand font family (BrandFont-<id>) → local_path")
     args = parser.parse_args()
+    _CUSTOM_FONTS.update({k: v for k, v in json.loads(args.fonts).items() if isinstance(k, str) and isinstance(v, str)})
     main(
         args.video, args.spec, args.output,
         secondary_videos=json.loads(args.secondary_videos),

@@ -11,6 +11,7 @@ import { findClips, type FoundClip } from '../lib/clipFinder.js'
 import { askGemini } from '../lib/gemini.js'
 import { findLoops } from '../lib/transcriptGuard.js'
 import { generateClipText, fontForText, type ClipText, type ClipTextLanguage } from '../lib/clipText.js'
+import { loadClipBrand, logoSpan, brandCaptionRow, type ClipBrand } from '../lib/brandKit.js'
 import { brollEnabled, pickBrollMoments, searchStock, downloadStock, withBroll } from '../lib/broll.js'
 import { findVisuals, describeVisuals, pickVisualMoments, detectPanels, refinePanels, type Visual, type VisualMoment, type Panel } from '../lib/visuals.js'
 import { r2UploadFile } from '../r2.js'
@@ -1605,6 +1606,8 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       WHERE v.id = ${video_id}
     `
     if (!video?.storage_path) throw new Error('Video not found or missing storage path')
+    // The brand kit the clips get (the account's default, the one picked on the clip board, or none)
+    const brand = await loadClipBrand(video.user_id as string, payload.brand_kit)
 
     // 2. Ensure a whole-video transcript — transcribe inline if there isn't one.
     //    Always from storage (R2), never yt-dlp, so this also runs on Railway.
@@ -1680,7 +1683,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       await new Promise(r => setTimeout(r, (i % 4) * 250)) // spread the calls a little
       try {
         const said = words.filter(w => w.start_ms >= h.start_ms && w.start_ms < h.end_ms)
-        return await generateClipText(said, video.title ?? null, prompt => askGemini(prompt), titleLanguageFor(payload.title_language, said))
+        return await generateClipText(said, video.title ?? null, prompt => askGemini(prompt), titleLanguageFor(payload.title_language, said), brand?.voice ?? null)
       } catch (e) {
         console.warn(`[ai_edit] clip text failed for ${h.start_ms}-${h.end_ms}:`, e instanceof Error ? e.message : e)
         return null
@@ -1739,7 +1742,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         const clipWords = words.filter(w => w.start_ms >= highlight.start_ms && w.start_ms < highlight.end_ms)
         const caption = captionFontFor(clipWords, payload.caption_language)
 
-        const clip_id = await saveClip(video_id, ai_edit_job_id, highlight, segments, withCaptions ? caption : null, texts[hi], withTitle)
+        const clip_id = await saveClip(video_id, ai_edit_job_id, highlight, segments, withCaptions ? caption : null, texts[hi], withTitle, brand)
 
         const layoutSummary = segments.map(s =>
           `${s.layout}(${s.start_ms / 1000}s–${s.end_ms / 1000}s,${s.slotKfs[0]?.length ?? 0}kf)`
@@ -1836,6 +1839,8 @@ async function saveClip(
   text: ClipText | null,
   /** The hook as an on-screen title over the first 3 seconds */
   withTitle = true,
+  /** The brand kit the clip gets (lib/brandKit.ts): its logo, its title style on the hook, its caption style */
+  brand: ClipBrand | null = null,
 ): Promise<string> {
   return db.begin(async tx => {
     const [clipRow] = await tx`
@@ -1850,10 +1855,25 @@ async function saveClip(
 
     // The hook, over the first 3 seconds near the top (x null = centred), like any text overlay
     if (withTitle && text?.hook) {
+      // In the brand kit's title style when it has one (its font only for English letters: a brand
+      // font usually has no Telugu or Hindi letters)
+      const scriptFont = fontForText(text.hook)
+      const font = brand?.title.font && scriptFont === 'montserrat-bold' ? brand.title.font : scriptFont
       await tx`
         INSERT INTO text_overlays (clip_id, text, start_ms, end_ms, x, y, font, size, color)
         VALUES (${clipId}, ${text.hook}, 0, ${Math.min(3000, highlight.end_ms - highlight.start_ms)}, NULL, 0.15,
-          ${fontForText(text.hook)}, 76, '#FFFFFF')
+          ${font}, ${brand ? brand.title.size : 76}, ${brand ? brand.title.color : '#FFFFFF'})
+      `
+    }
+    // The brand kit's progress bar
+    if (brand?.progress) await tx`UPDATE clips SET progress_bar = ${tx.json(brand.progress as never)} WHERE id = ${clipId}`
+    // The brand kit's logo, where and when the kit says
+    if (brand?.logo) {
+      const [from, to] = logoSpan(brand.logo, highlight.end_ms - highlight.start_ms)
+      const lg = brand.logo
+      await tx`
+        INSERT INTO overlays (clip_id, type, storage_path, source_offset_ms, x, y, w, h, start_ms, end_ms, z_index, opacity)
+        VALUES (${clipId}, 'image', ${lg.path}, 0, ${lg.x}, ${lg.y}, ${lg.w}, ${lg.h}, ${from}, ${to}, 1, ${lg.opacity < 0.999 ? lg.opacity : null})
       `
     }
 
@@ -1885,7 +1905,10 @@ async function saveClip(
     // Postgres allows 65,535 parameters per statement: 6 per keyframe
     for (let i = 0; i < kfRows.length; i += 5000) await tx`INSERT INTO box_keyframes ${tx(kfRows.slice(i, i + 5000))}`
 
-    if (caption) {
+    if (caption && brand?.captions) {
+      // In the brand kit's caption style
+      await tx`INSERT INTO caption_styles ${tx({ clip_id: clipId, ...brandCaptionRow(brand.captions, caption) })}`
+    } else if (caption) {
       await tx`
         INSERT INTO caption_styles (clip_id, font, size, color, position, animation, language)
         VALUES (${clipId}, ${caption.font}, 52, '#FFFFFF', 'bottom-center', 'karaoke', ${caption.language})

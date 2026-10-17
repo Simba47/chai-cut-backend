@@ -83,6 +83,8 @@ export interface AiEditJobPayload {
   title_language?: 'roman' | 'english' | 'native'
   /** The user said yes to making fewer clips than asked for: the moments already found (ai_edit_jobs.found) are used */
   confirmed?: boolean
+  /** The brand kit the clips get: 'default' (the account's default kit, if any; also when missing), 'none', or a kit's id (lib/brandKit.ts) */
+  brand_kit?: string
 }
 
 export const JOB_POLL_INTERVAL_MS = 2000

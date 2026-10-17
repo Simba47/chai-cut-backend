@@ -12,6 +12,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { computeCutRanges, keptRanges, makeTimeMap, reactionRanges, removedMs, type Range } from '../lib/cuts.js'
 import { cleanTrims } from '../lib/trims.js'
+import { cleanProgressBar } from '../lib/brandKit.js'
 import { aiProvider, askGemini } from '../lib/gemini.js'
 
 const execFileAsync = promisify(execFile)
@@ -112,6 +113,32 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
       } catch (e) { console.warn(`[render] Failed to download frame photo:`, e) }
     }
 
+    // A brand kit's own fonts (BrandFont-<id>) on the clip's text and captions: fetched from the
+    // owner's brand/<user>/fonts/<id> (the editor uploads them there) for the renderer (--fonts)
+    const brandFonts: Record<string, string> = {}
+    const fontNames = new Set<string>([
+      ...((renderSpec.caption_styles ?? []) as Row[]).map(c => String(c.font ?? '')),
+      ...((renderSpec.text_overlays ?? []) as Row[]).map(t => String(t.font ?? '')),
+    ])
+    for (const fam of fontNames) {
+      const m = /^BrandFont-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(fam)
+      if (!m || !owner?.user_id) continue
+      const localPath = join(tmp, `${fam}.ttf`)
+      try {
+        await r2DownloadToFile(`brand/${owner.user_id}/fonts/${m[1].toLowerCase()}`, localPath, signal)
+        brandFonts[fam] = localPath
+      } catch {
+        // A font from a kit someone shared with the clip's owner: it is kept under the kit owner's folder
+        try {
+          const [kit] = await db<{ user_id: string }[]>`
+            SELECT user_id FROM brand_kits WHERE data->'fonts' @> ${db.json([{ family: fam }] as never)} AND user_id <> ${owner.user_id} LIMIT 1`
+          if (!kit) throw new Error('no kit has it')
+          await r2DownloadToFile(`brand/${kit.user_id}/fonts/${m[1].toLowerCase()}`, localPath, signal)
+          brandFonts[fam] = localPath
+        } catch (e) { console.warn(`[render] Failed to download brand font ${fam}:`, e) }
+      }
+    }
+
     const overlayVideos: Record<string, string> = {}
     const seenOverlayVideoIds = new Set<string>()
     for (const ov of (renderSpec.overlays ?? []) as Array<{ type?: string; source_video_id?: string }>) {
@@ -160,6 +187,7 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
       '--overlay-images', JSON.stringify(overlayImages),
       '--overlay-videos', JSON.stringify(overlayVideos),
       '--frame-images', JSON.stringify(frameImages),
+      '--fonts', JSON.stringify(brandFonts),
     ]
     if (payload.watermark) pythonArgs.push('--watermark')
     const tPy = Date.now()
@@ -292,6 +320,8 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
     // the music keeps playing
     mute_ranges: muteRanges(placedSegments, clip.video_id),
     transitions, overlays: (overlays as Row[]).filter(o => !o.hidden), words: placedWords,
+    // A bar filling up along the top or bottom edge as the clip plays (a brand kit's); null = none
+    progress_bar: cleanProgressBar(clip.progress_bar),
     output_width: dims.w, output_height: dims.h,
   }
 }
