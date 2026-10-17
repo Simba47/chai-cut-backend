@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges, heard_speech_ranges
 import emoji as emoji_art   # colour emoji (Twemoji 17), drawn locally
-from frames import is_frame, row_heights, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base, BLUR_SOURCE_SLOT
+from frames import is_frame, row_heights, row_order, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base, BLUR_SOURCE_SLOT, shown_main_slots
 
 # ── Quality presets (identical to previous version) ───────────────────────────
 _QUALITY: dict[int, dict] = {
@@ -629,6 +629,36 @@ def _transition_joins(segments: list[dict], transitions: list[dict]) -> list[tup
 def _hex6(v: str | None, fallback: str) -> str:
     h = (v or "").lstrip("#")
     return h[:6] if len(h) >= 6 and all(c in "0123456789abcdefABCDEF" for c in h[:6]) else fallback
+
+
+def _display_size(path: str) -> tuple[int, int] | None:
+    """A video's or picture's size as FFmpeg decodes it (turned as its rotation says, with its pixel
+    shape): the shape media shown whole is fitted to, so its rounded corners sit on its own edges.
+    None when it can't be read."""
+    try:
+        res = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                              "stream=width,height,sample_aspect_ratio:stream_side_data=rotation:stream_tags=rotate",
+                              "-of", "json", path], capture_output=True, text=True, timeout=30)
+        st = (json.loads(res.stdout or "{}").get("streams") or [{}])[0]
+        w, h = int(st.get("width") or 0), int(st.get("height") or 0)
+        if not w or not h:
+            return None
+        sar = st.get("sample_aspect_ratio") or "1:1"
+        try:
+            n, d = (int(v) for v in sar.split(":"))
+            if n > 0 and d > 0:
+                w = int(round(w * n / d))
+        except ValueError:
+            pass
+        rot = (st.get("tags") or {}).get("rotate")
+        for sd in st.get("side_data_list") or []:
+            if "rotation" in sd:
+                rot = sd["rotation"]
+        if rot is not None and abs(int(float(rot))) % 180 == 90:
+            w, h = h, w
+        return w, h
+    except Exception:
+        return None
 
 
 def _filter_path(p: str) -> str:
@@ -1387,8 +1417,8 @@ def main(
             boxes   = sorted(seg.get("crop_boxes", []), key=lambda b: b.get("slot_index", 0))
             if is_frame(seg.get("layout")):
                 # Only slots showing the main video read it; lane items are inputs of their own
-                main_slots = set(frame_state(seg).get("main_slots") or [])
-                for a in frame_areas(seg["layout"], out_w, out_h, frame_band_shown(seg), row_heights(seg)):
+                main_slots = shown_main_slots(frame_state(seg))
+                for a in frame_areas(seg["layout"], out_w, out_h, frame_band_shown(seg), row_heights(seg), row_order(seg)):
                     if a["kind"] == "slot" and a["slot"] in main_slots:
                         slot_counts[None] = slot_counts.get(None, 0) + 1
                 # A blurred copy of the main video under the frame (Blur fill) reads it once more
@@ -1453,11 +1483,12 @@ def main(
         # starts, so nothing has to be buffered until the item appears
         next_input = vid_base + len(valid_vid)
         frame_item_in: dict[tuple[int, str], str] = {}
+        frame_item_dims: dict[tuple[int, str], tuple[int, int] | None] = {}
         for si, seg in enumerate(segments):
             if not is_frame(seg.get("layout")):
                 continue
             st = frame_state(seg)
-            for area in frame_areas(seg["layout"], out_w, out_h, frame_band_shown(seg), row_heights(seg)):
+            for area in frame_areas(seg["layout"], out_w, out_h, frame_band_shown(seg), row_heights(seg), row_order(seg)):
                 if area["kind"] != "slot":
                     continue
                 for it in lane_items(seg, st, area["slot"]):
@@ -1474,9 +1505,12 @@ def main(
                         # ("Failed to inject frame into filter network: Resource temporarily unavailable")
                         inputs += ["-thread_queue_size", "1024", "-stream_loop", "-1", "-ss", f"{off:.3f}", "-i", path]
                     elif it.get("kind") == "photo" and os.path.exists(frame_images.get(it.get("image_path") or "", "")):
-                        inputs += ["-thread_queue_size", "1024", "-loop", "1", "-framerate", "30", "-t", f"{it['dur_s']:.3f}", "-i", frame_images[it["image_path"]]]
+                        path = frame_images[it["image_path"]]
+                        inputs += ["-thread_queue_size", "1024", "-loop", "1", "-framerate", "30", "-t", f"{it['dur_s']:.3f}", "-i", path]
                     else:
                         continue
+                    # (its shape: shown whole in a slot, its rounded corners follow its own edges)
+                    frame_item_dims[(si, it["id"])] = _display_size(path)
                     frame_item_in[(si, it["id"])] = f"[{next_input}:v]"
                     next_input += 1
 
@@ -1525,6 +1559,9 @@ def main(
         def pop_src(vid_id: str | None) -> str:
             return src_pool[vid_id].pop(0)
 
+        # The main video's shape, read once when a frame shows it whole (shown_whole)
+        main_dims: tuple[int, int] | None = None
+
         # ── Segment filters ────────────────────────────────────────────────────
         seg_labels: list[str] = []
 
@@ -1571,6 +1608,23 @@ def main(
                     iw, ih = max(2, bw - 2 * m), max(2, bh - 2 * m)
                     return iw, ih, bx + m, by + m, min(r, iw // 2, ih // 2), bool(m or px_box)
 
+                def shown_whole(prefix: str, dims: tuple[int, int] | None, iw: int, ih: int, r: int, key: str) -> str:
+                    """
+                    Media shown whole inside iw×ih: fitted, centred, see-through around it. With rounded
+                    corners (r) they sit on the picture's own edges, its shape from `dims` (editor:
+                    inSlot with the media's size). Without them, or when its shape isn't known: as before.
+                    `prefix`: the chain so far (an input label, or filters ending in a comma).
+                    """
+                    if not r or not dims:
+                        return f"{prefix}{_scale_contain(iw, ih)}"
+                    sw, sh = dims
+                    k = min(iw / sw, ih / sh)
+                    fw, fh = min(iw, _even(sw * k)), min(ih, _even(sh * k))
+                    mask = _round_alpha_png(tmp, fw, fh, min(r, fw // 2, fh // 2))
+                    fp.append(f"{prefix}scale={fw}:{fh}:flags=lanczos,setsar=1,format=rgba[{key}w0]")
+                    fp.append(f"movie=filename={_filter_path(mask)},format=gray[{key}wk]")
+                    return f"[{key}w0][{key}wk]alphamerge,pad={iw}:{ih}:{(iw - fw) // 2}:{(ih - fh) // 2}:color=black@0"
+
                 def placed(chain: str, aw: int, rh: int, iw: int, ih: int, px: int, py: int, r: int, boxed: bool, key: str) -> str:
                     """Media (already iw×ih) set at its place in the slot on black, with rounded corners when it has them."""
                     if not boxed:
@@ -1589,7 +1643,7 @@ def main(
                     else:
                         fp.append(f"color=c=0x{_hex6(colour, '000000')}:s={aw}x{ah}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{lbl}")
 
-                main_slots = set(st.get("main_slots") or [])
+                main_slots = shown_main_slots(st)
                 band = st.get("band") or {}
                 band_bg = "none" if band.get("bg") == "none" else _hex6(band.get("bg"), "000000")
                 # Where the main video starts in this format
@@ -1625,7 +1679,7 @@ def main(
                     canvas(band_bg if base_kind == "band" and band_bg != "none" else "000000", out_w, out_h, frame_lbl)
                 cur_frame = frame_lbl
 
-                for ri, area in enumerate(frame_areas(layout, out_w, out_h, frame_band_shown(seg), row_heights(seg))):
+                for ri, area in enumerate(frame_areas(layout, out_w, out_h, frame_band_shown(seg), row_heights(seg), row_order(seg))):
                     kind, aw, rh = area["kind"], area["w"], area["h"]
                     key = f"fr{si}r{ri}"
                     lbl = f"[{key}]"
@@ -1652,8 +1706,10 @@ def main(
                         if contain:
                             # Shown whole (nothing cropped), on the slot's colour or see-through
                             canvas(area.get("fill") or "000000", aw, rh, f"[{key}f]")
-                            chain = (f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,"
-                                     f"{_scale_contain(iw, ih)}")
+                            if main_dims is None:
+                                main_dims = _display_size(video_path) or (0, 0)
+                            chain = shown_whole(f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,",
+                                                main_dims if main_dims[0] else None, iw, ih, rr, f"{key}m")
                             if boxed:
                                 fp.append(f"{chain},pad={aw}:{rh}:{px}:{py}:color=black@0[{key}m]")
                             else:
@@ -1699,7 +1755,7 @@ def main(
                             iw, ih, px, py, rr, boxed = media_box(it.get("corners"), it.get("rect"), aw, rh)
                             zp = "" if contain else photo_motion_filter(it.get("motion") or "none", iw, ih, d)
                             if contain:
-                                chain = f"{src}{_scale_contain(iw, ih)},trim=duration={d:.3f},setpts=PTS-STARTPTS"
+                                chain = f"{shown_whole(src, frame_item_dims.get((si, it['id'])), iw, ih, rr, f'{key}i{ii}')},trim=duration={d:.3f},setpts=PTS-STARTPTS"
                                 if boxed:
                                     chain = f"{chain},pad={aw}:{rh}:{px}:{py}:color=black@0"
                             elif zp:
@@ -1713,7 +1769,7 @@ def main(
                             src = frame_item_in[(si, it["id"])]
                             iw, ih, px, py, rr, boxed = media_box(it.get("corners"), it.get("rect"), aw, rh)
                             if contain:
-                                chain = f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{_scale_contain(iw, ih)}"
+                                chain = shown_whole(f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},", frame_item_dims.get((si, it["id"])), iw, ih, rr, f"{key}i{ii}")
                                 if boxed:
                                     chain = f"{chain},pad={aw}:{rh}:{px}:{py}:color=black@0"
                             else:

@@ -103,7 +103,7 @@ MOTIONS = {"none", "zoom_in", "zoom_out", "pan_left", "pan_right"}
 # Rounded corners on frame media from the editor's Corners slider (0-100), in px at 1080 wide at
 # 100%: (black border around the media, corner radius). Mirrors cornerGeometry() in
 # chai-cut-frontend/src/modules/editor/frames.ts ('s'/'m'/'l' from the first version map onto it).
-CORNER_MAX = (44, 96)
+CORNER_MAX = (44, 140)  # (inset, radius) px at 1080 wide: as the editor's CORNER_MAX (radius 96 until 2026-10-17)
 
 
 def corner_geometry(v) -> tuple[float, float] | None:
@@ -124,12 +124,13 @@ def _even(v: float) -> int:
     return int(round(v / 2)) * 2
 
 
-def frame_areas(layout: str, out_w: int, out_h: int, show_band: bool = True, custom: list[float] | None = None) -> list[dict]:
+def frame_areas(layout: str, out_w: int, out_h: int, show_band: bool = True, custom: list[float] | None = None,
+                order: list[int] | None = None) -> list[dict]:
     """
     Every area of a frame in drawing order, in even pixels: {kind, slot / lane, x, y, w, h, r (corner
     radius px), and the area's options}. A stacked frame's rows are full-width areas (their heights
     from frame_rows, so they add up exactly); a free frame's areas are placed where the template says.
-    Mirrors frameAreas() in the editor.
+    Mirrors frameAreas() in the editor. `order`: the rows top to bottom when swapped (row_order(seg)).
     """
     if layout in FREE_TEMPLATES:
         out: list[dict] = []
@@ -146,10 +147,11 @@ def frame_areas(layout: str, out_w: int, out_h: int, show_band: bool = True, cus
         return out
     looks = ROW_LOOKS.get(layout, {})
     tpl_rows = FRAME_TEMPLATES[layout]
-    # The rows that are shown, with the index each has in the template (for its options)
-    shown = [i for i, (kind, _, _) in enumerate(tpl_rows) if show_band or kind != "band"]
+    # The rows that are shown, top to bottom, with the index each has in the template (for its options)
+    seq = order if order and sorted(order) == list(range(len(tpl_rows))) else list(range(len(tpl_rows)))
+    shown = [i for i in seq if show_band or tpl_rows[i][0] != "band"]
     out, y = [], 0
-    for i, (kind, slot, h) in zip(shown, frame_rows(layout, out_h, show_band, custom)):
+    for i, (kind, slot, h) in zip(shown, frame_rows(layout, out_h, show_band, custom, order)):
         area = {**looks.get(i, {}), "kind": kind, "x": 0, "y": y, "w": out_w, "h": h, "r": 0}
         if kind == "slot":
             area["slot"] = slot
@@ -163,6 +165,13 @@ def frame_areas(layout: str, out_w: int, out_h: int, show_band: bool = True, cus
 def frame_base(layout: str | None) -> str | None:
     """What's under a frame's areas: 'blur' (a blurred copy of the main video), 'band' (the band's colour) or None (black)."""
     return FRAME_BASE.get(layout or "")
+
+
+def shown_main_slots(state: dict) -> set:
+    """The slots the main video is drawn in: its slots, less the ones its lane hid (main_hidden; the
+    editor's lane eye). A hidden slot shows what's under it; its sound is still heard unless muted."""
+    hidden = state.get("main_hidden") or {}
+    return {s for s in (state.get("main_slots") or []) if not hidden.get(str(s))}
 
 
 # The slot whose picture, blurred, fills a 'blur' frame's background: the main video, or a photo /
@@ -185,15 +194,33 @@ def row_heights(seg: dict) -> list[float] | None:
     return hs if all(h >= 0.03 for h in hs) else None
 
 
-def frame_rows(layout: str, out_h: int, show_band: bool = True, custom: list[float] | None = None) -> list[tuple[str, int | None, int]]:
+def row_order(seg: dict) -> list[int] | None:
+    """A stacked frame's rows top to bottom when swapped (frame.row_order: template row numbers, each
+    once), if it fits the template; else None. Mirrors validRowOrder() in the editor."""
+    order = (seg.get("frame") or {}).get("row_order")
+    tpl = FRAME_TEMPLATES.get(seg.get("layout") or "")
+    if (seg.get("layout") or "") in FREE_TEMPLATES or not tpl or not isinstance(order, list) or len(order) != len(tpl):
+        return None
+    try:
+        out = [int(i) for i in order]
+    except (TypeError, ValueError):
+        return None
+    return out if sorted(out) == list(range(len(tpl))) and out != list(range(len(tpl))) else None
+
+
+def frame_rows(layout: str, out_h: int, show_band: bool = True, custom: list[float] | None = None,
+               order: list[int] | None = None) -> list[tuple[str, int | None, int]]:
     """
     Rows with integer, even pixel heights (yuv420p) that add up to exactly out_h. The text band
     only exists once the frame has text on it (show_band); without it the slots share the height.
     `custom`: the frame's resized row heights (row_heights(seg)), one per template row.
+    `order`: the rows top to bottom when swapped with the editor's bar (row_order(seg)); each keeps its height.
     """
     tpl = FRAME_TEMPLATES[layout]
     if custom and len(custom) == len(tpl):
         tpl = [(kind, slot, h) for (kind, slot, _), h in zip(tpl, custom)]
+    if order and sorted(order) == list(range(len(tpl))):
+        tpl = [tpl[i] for i in order]
     rows = [r for r in tpl if show_band or r[0] != "band"]
     total = sum(share for _, _, share in rows) or 1.0
     heights: list[int] = []
@@ -317,7 +344,7 @@ def caption_band_zones(segments: list[dict], out_h: int) -> list[tuple[int, int,
             continue
         centre = None
         strip = None
-        for a in frame_areas(layout, 1080, out_h, True, row_heights(seg)):
+        for a in frame_areas(layout, 1080, out_h, True, row_heights(seg), row_order(seg)):
             if a["kind"] == "band" and a.get("lane") == "band":
                 centre = a["y"] + a["h"] // 2
             elif a["kind"] == "caption":
