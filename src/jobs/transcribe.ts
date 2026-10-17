@@ -100,6 +100,13 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal, onRead
   // The video is marked ready first — clipping never waits on this background transcription.
   const isFullJob = !!payload.transcribe_full && !isClipJob && !isRetranscribe
   let videoReady = false
+  // A whole-video reading (AI edit) says how far it has got, in its job (read_pct): the clip board
+  // shows it while Best moments and Ask AI wait for the words
+  const report: ReadProgress | undefined = onRead ?? (isFullJob
+    ? async (done, total) => {
+      await db`UPDATE jobs SET payload = payload || ${db.json({ read_pct: Math.round((100 * done) / Math.max(1, total)) })} WHERE id = ${job.id}`
+    }
+    : undefined)
 
   // Plain upload jobs (already in storage, no clip): mark ready. Without transcribe_full
   // (older jobs) transcription is deferred to clip creation.
@@ -231,7 +238,7 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal, onRead
       load: async () => JSON.parse((await r2Download(readingKey)).toString('utf8')) as Reading,
       save: reading => r2Upload(readingKey, Buffer.from(JSON.stringify(reading)), 'application/json'),
     } : undefined
-    const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, languageCode, signal, kept, onRead)
+    const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, languageCode, signal, kept, report)
     signal?.throwIfAborted()
 
     // The slow part first — in the transcript's script and in Roman letters takes minutes for a long
