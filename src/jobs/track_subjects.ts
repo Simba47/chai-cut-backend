@@ -9,6 +9,7 @@ import type { TransactionSql } from 'postgres'
 import type { Job, TrackSubjectsJobPayload } from '../types.js'
 import { detectFaces, detectCuts, trackFaces, probeSize, FRAME_INTERVAL_MS, type FrameDetection, type CropBox, type SpokenWord } from './ai_edit.js'
 import { autoDirectChanges, followChanges, buildKeyframes, type SubjectPoint } from './subject_framing.js'
+import { snapSectionBoundaries } from '../lib/snapSections.js'
 
 // ── Subjects: people the user marked in a clip, followed through it ────────────
 // In the editor the user pauses on a person and clicks them (a "subject"). This job looks at the
@@ -898,6 +899,23 @@ async function frameClip(
     const kfs = await tx<{ box_id: string; t_ms: number; w: number; h: number }[]>`
       SELECT box_id, t_ms, w, h FROM box_keyframes WHERE box_id = ANY(${boxes.map(b => b.id)}) ORDER BY t_ms
     `
+    // A layout should change where the camera cuts: a section boundary a little before or after a
+    // cut would leave the old layout on the new picture, so it moves onto the cut (lib/snapSections.ts)
+    const mainOnly = (segId: string) => boxes.filter(b => b.segment_id === segId).every(b => !b.image_path && !b.source_video_id)
+    const snapped = snapSectionBoundaries(
+      segs.map(s => ({
+        id: s.id, start_ms: Number(s.start_ms), end_ms: Number(s.end_ms),
+        movable: !s.locked && s.layout !== 'horizontal' && !s.layout.startsWith('frame_') && mainOnly(s.id),
+      })),
+      cuts.map(c => c - clipStart),
+    )
+    for (const m of snapped) {
+      await tx`UPDATE segments SET start_ms = ${m.start_ms}, end_ms = ${m.end_ms} WHERE id = ${m.id}`
+      const seg = segs.find(x => x.id === m.id)!
+      seg.start_ms = m.start_ms
+      seg.end_ms = m.end_ms
+    }
+    if (snapped.length) console.log(`[track_subjects] clip ${clipId}: ${snapped.length} section(s) moved onto the camera cuts`)
     let framed = 0
     for (const seg of segs) {
       const start = Number(seg.start_ms), end = Number(seg.end_ms)
@@ -920,7 +938,7 @@ async function frameClip(
         framed++
       }
     }
-    if (framed) await tx`UPDATE clips SET status = 'draft', output_url = NULL WHERE id = ${clipId}`
+    if (framed || snapped.length) await tx`UPDATE clips SET status = 'draft', output_url = NULL WHERE id = ${clipId}`
     return framed
   })
 }
