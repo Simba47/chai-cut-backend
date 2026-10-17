@@ -30,6 +30,8 @@ Output: JSON to stdout:
   "sig" is a colour signature of the face and the clothes below it (24 numbers): shots of the
   same person look alike, which tells apart who each one-person camera shot shows.
 """
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -167,6 +169,13 @@ def _merge_faces(mp_boxes, yn_boxes):
     out.sort(key=lambda b: -b["area"])
     # Round a table, the person nearest the camera can look 2–3× bigger than those across it
     return _filter_by_size(out, min_rel=0.25)
+
+
+def _inside_share(small, big):
+    """How much of the smaller box lies inside the bigger one (0–1)"""
+    w = min(small["x"] + small["w"], big["x"] + big["w"]) - max(small["x"], big["x"])
+    h = min(small["y"] + small["h"], big["y"] + big["h"]) - max(small["y"], big["y"])
+    return max(0.0, w) * max(0.0, h) / max(1e-9, small["w"] * small["h"])
 
 
 class _Lips:
@@ -326,7 +335,7 @@ def track_faces(frames: list[list[dict]], iou=0.3, resets: set[int] | None = Non
     return ids
 
 
-def detect_subjects(frames_dir: str, lips: bool = False) -> dict:
+def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False) -> dict:
     import cv2
 
     cascade = None
@@ -424,7 +433,9 @@ def detect_subjects(frames_dir: str, lips: bool = False) -> dict:
             scores.setdefault(tid, []).append(f["score"])
     static = set()
     for tid, d in changes.items():
-        if len(d) < STATIC_MIN_FRAMES:
+        # all_faces (listing who is in a clip): a still face is a person standing still, or a picture,
+        # and both are in the clip
+        if all_faces or len(d) < STATIC_MIN_FRAMES:
             continue
         ratio, score = float(np.median(d)), float(np.median(scores[tid]))
         if ratio < STATIC_RATIO or (ratio < STATIC_RATIO_UNSURE and score < UNSURE_SCORE):
@@ -472,18 +483,27 @@ def detect_subjects(frames_dir: str, lips: bool = False) -> dict:
         # Prominence filter: if one subject is 2× larger than all others the
         # camera is on a close-up of the speaker; others are background. Only for a close-up-sized
         # face: in a wide group shot everyone is small, and the nearest person just looks bigger.
-        if len(subjects) >= 2:
+        if len(subjects) >= 2 and not all_faces:
             by_area = sorted(subjects, key=lambda s: -s["area"])
             if by_area[0]["area"] >= CLOSE_UP_AREA and by_area[0]["area"] >= 2.0 * by_area[1]["area"]:
                 subjects = [by_area[0]]
 
         # Proximity filter: if the 2 closest detected faces are within 15% of
         # frame width they can't be split into meaningful individual crops.
-        if len(subjects) >= 2:
+        if len(subjects) >= 2 and not all_faces:
             by_cx = sorted(subjects, key=lambda s: s["cx"])
             min_gap = min(by_cx[i+1]["cx"] - by_cx[i]["cx"] for i in range(len(by_cx)-1))
             if min_gap < 0.15:
                 subjects = [max(subjects, key=lambda s: s["area"])]
+
+        # all_faces keeps every face, so one face found twice (a small box inside a bigger one) must
+        # count once: the crop filters above used to hide it
+        if all_faces and len(subjects) >= 2:
+            kept = []
+            for s in sorted(subjects, key=lambda s: -s["area"]):
+                if not any(_inside_share(s, k) > 0.6 for k in kept):
+                    kept.append(s)
+            subjects = kept
 
         # Sort left → right
         subjects.sort(key=lambda b: b["cx"])
@@ -532,9 +552,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--frames-dir", required=True)
     parser.add_argument("--lips", action="store_true", help="also measure mouth opening (speaker tracking)")
+    parser.add_argument("--all-faces", action="store_true",
+                        help="every face seen, with none of the crop filters (still faces, a close-up's bystanders, faces too close to split)")
     args = parser.parse_args()
     try:
-        result = detect_subjects(args.frames_dir, lips=args.lips)
+        result = detect_subjects(args.frames_dir, lips=args.lips, all_faces=args.all_faces)
     except Exception as e:
         print(f"[face_detect] Error: {e}", file=sys.stderr)
         result = {"face_count": 0, "face_boxes": [], "frames": []}
