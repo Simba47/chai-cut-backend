@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -573,7 +574,15 @@ def _probe(path: str) -> tuple[float, bool]:
         dur = float((info.get("format") or {}).get("duration") or 0)
         has_audio = any(st.get("codec_type") == "audio" for st in info.get("streams") or [])
     except Exception:
-        pass
+        # (no ffprobe on this machine: ffmpeg itself says the length and whether there is sound)
+        try:
+            r = subprocess.run(["ffmpeg", "-hide_banner", "-i", path], capture_output=True, text=True, timeout=30)
+            m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", r.stderr or "")
+            if m:
+                dur = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
+                has_audio = "Audio:" in (r.stderr or "")
+        except Exception:
+            pass
     _probe_cache[path] = (dur, has_audio)
     return _probe_cache[path]
 
@@ -589,7 +598,14 @@ def _probe_fps(path: str) -> float:
         fps = float(num) / float(den or 1)
         return min(60.0, max(15.0, fps)) if fps > 0 else 30.0
     except Exception:
-        return 30.0
+        # (no ffprobe on this machine: ffmpeg itself says the frame rate)
+        try:
+            r = subprocess.run(["ffmpeg", "-hide_banner", "-i", path], capture_output=True, text=True, timeout=30)
+            m = re.search(r"Video:.*?([\d.]+) fps", r.stderr or "")
+            fps = float(m[1]) if m else 0.0
+            return min(60.0, max(15.0, fps)) if fps > 0 else 30.0
+        except Exception:
+            return 30.0
 
 
 # ── Transitions between sections (the editor's Transitions tool, table transitions) ──────────
