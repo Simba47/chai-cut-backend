@@ -90,7 +90,41 @@ async function fillMissingDuration(videoId: string, storagePath: string, signal?
 /** How far a reading has got: `done` of `total` chunks (Make my clips shows it while it reads a video) */
 export type ReadProgress = (done: number, total: number) => void | Promise<void>
 
+/** What the clip board's Stop writes on a whole-video reading (the frontend's stopVideoTranscript) */
+export const READING_STOPPED = 'Stopped by the user'
+
+/**
+ * A transcription job. A whole-video reading (the transcript the edit tools need) can be stopped
+ * from the clip board: its job row says so, checked every 2 s, and everything running (FFmpeg, the
+ * AI calls) is stopped. The parts already read are kept (the reading store), so a later Unlock
+ * carries on from there.
+ */
 export async function handleTranscribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgress) {
+  const raw = job.payload
+  const p = (typeof raw === 'string' ? JSON.parse(raw) : raw) as TranscribeJobPayload
+  const stoppable = !!p.transcribe_full && !p.clip_id && !p.is_retranscribe && /^[0-9a-f-]{36}$/i.test(job.id)
+  if (!stoppable) return transcribeJob(job, signal, onRead)
+  const stop = new AbortController()
+  const watch = setInterval(async () => {
+    try {
+      const [row] = await db<{ status: string; error: string | null }[]>`SELECT status, error FROM jobs WHERE id = ${job.id}`
+      if (row && row.status === 'failed' && row.error === READING_STOPPED) stop.abort(new Error(READING_STOPPED))
+    } catch { /* the next check */ }
+  }, 2000)
+  try {
+    return await transcribeJob(job, signal ? AbortSignal.any([signal, stop.signal]) : stop.signal, onRead)
+  } catch (e) {
+    if (stop.signal.aborted) {
+      console.log(`[transcribe] reading of video ${p.video_id} stopped by the user (the parts read are kept)`)
+      throw new Error(READING_STOPPED)
+    }
+    throw e
+  } finally {
+    clearInterval(watch)
+  }
+}
+
+async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgress) {
   const raw = job.payload
   const payload = (typeof raw === 'string' ? JSON.parse(raw) : raw) as TranscribeJobPayload
   const isLinkJob = !payload.storage_path
