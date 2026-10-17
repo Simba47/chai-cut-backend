@@ -140,6 +140,32 @@ def _between(ranges_ms) -> str:
     return "+".join(f"between(t,{a / 1000:.3f},{b / 1000:.3f})" for a, b in ranges_ms)
 
 
+def _part_speed(seg: dict) -> float:
+    """A part's speed (the editor's Speed): 0.25 to 4, else 1 — only a part of the main video has one."""
+    box = (seg.get("crop_boxes") or [{}])[0] or {}
+    if seg.get("inserted") or box.get("source_video_id") or str(seg.get("layout", "")).startswith("frame_"):
+        return 1.0
+    try:
+        v = float(seg.get("speed") or 1)
+    except (TypeError, ValueError):
+        return 1.0
+    return v if 0.25 <= v <= 4 else 1.0
+
+
+def _atempo_chain(speed: float) -> str:
+    """ffmpeg's atempo takes 0.5–2 at a time: 4× is 2 · 2, 0.25× is 0.5 · 0.5 (the voice's pitch is kept)"""
+    parts: list[str] = []
+    s = speed
+    while s > 2.0 + 1e-9:
+        parts.append("atempo=2.0")
+        s /= 2.0
+    while s < 0.5 - 1e-9:
+        parts.append("atempo=0.5")
+        s /= 0.5
+    parts.append(f"atempo={s:.6f}")
+    return ",".join(parts)
+
+
 def build_segment_audio_args(
     source_video: str,
     clip_start_ms: int,
@@ -196,13 +222,17 @@ def build_segment_audio_args(
     # (parts that say where the main video is — a clip of pieces: cut parts skip video — are
     # played part by part too)
     has_positions = any(s.get("video_offset_ms") is not None for s in sorted_segs)
-    if not sorted_segs or (not has_broll_audio and not has_frames and not has_positions):
+    # (a part played faster or slower needs its own piece of sound too)
+    has_speed = any(_part_speed(s) != 1 for s in sorted_segs)
+    if not sorted_segs or (not has_broll_audio and not has_frames and not has_positions and not has_speed):
         # ── Bed, simple case: the main video's sound for the clip ──
         inputs: list[str] = ["ffmpeg", "-y", "-ss", f"{clip_start_s:.3f}", "-t", f"{clip_len_s:.3f}", "-i", source_video]
         fp.append(f"[0:a]asetpts=PTS-STARTPTS,{fmt},volume={main_vol:.3f}[speech]")
     else:
         # ── Bed, per section (B-roll shots and frames): atrim on one pre-seeked input is sample-accurate ──
         plans: list[list[tuple[str | None, float, float, float, float]]] = []
+        # The parts of the main video played at another speed: (speed, pitch follows it), by index
+        sped: dict[int, tuple[float, bool]] = {}
         for seg in sorted_segs:
             seg_dur = (int(seg["end_ms"]) - int(seg["start_ms"])) / 1000.0
             if is_frame(seg.get("layout")):
@@ -226,6 +256,8 @@ def build_segment_audio_args(
             else:
                 _cb_off = box.get("source_offset_ms") if box else None
                 vid_off_ms = int(seg["video_offset_ms"]) if seg.get("video_offset_ms") is not None else (int(_cb_off) if _cb_off is not None else int(seg["start_ms"]))
+                if _part_speed(seg) != 1:
+                    sped[len(plans)] = (_part_speed(seg), bool(seg.get("pitch")))
                 plans.append([(None, vid_off_ms / 1000.0, main_vol, 0.0, seg_dur)])
 
         broll_uses: dict[str, int] = {}
@@ -278,6 +310,16 @@ def build_segment_audio_args(
                 vol_f = f",volume={vol:.3f}" if abs(vol - 1.0) > 1e-3 else ""
                 delay_f = f",adelay=delays={int(round(delay_s * 1000))}:all=1" if delay_s > 0.0005 else ""
                 # Each piece to stereo 48 kHz (B-roll may be 44.1 kHz)
+                if not vid_id and i in sped:
+                    # Faster or slower: dur × speed of the main video's sound played in dur — the
+                    # voice natural (atempo), or higher / lower with the speed (pitch) — and exactly
+                    # the part's length, so nothing after it drifts
+                    sp, pitch = sped[i]
+                    tempo = f"asetrate={48000 * sp:.0f},aresample=48000" if pitch else _atempo_chain(sp)
+                    fp.append(f"{src}atrim=start={off_s:.3f}:end={off_s + piece_s * sp:.3f},asetpts=PTS-STARTPTS{vol_f},{fmt},{tempo},"
+                              f"apad=whole_dur={piece_s:.3f},atrim=duration={piece_s:.3f}{delay_f}{lbl}")
+                    pieces.append(lbl)
+                    continue
                 fp.append(f"{src}atrim=start={off_s:.3f}:end={off_s + piece_s:.3f},asetpts=PTS-STARTPTS{vol_f},{fmt}{delay_f}{lbl}")
                 pieces.append(lbl)
             if is_frame(seg.get("layout")):

@@ -607,6 +607,23 @@ _XFADE = {
 _MIN_TRANSITION_MS = 80
 
 
+_SMOOTH_FPS: list = []
+
+
+def _smooth_fps() -> str:
+    """The frame rate smooth slow motion fills in to: the clip's own (set by the render), else 30."""
+    return _SMOOTH_FPS[0] if _SMOOTH_FPS else "30"
+
+
+def _seg_speed(seg: dict) -> float:
+    """A part's speed (the editor's Speed): 0.25 to 4, else 1. Only parts of the main video have one."""
+    try:
+        v = float(seg.get("speed") or 1)
+    except (TypeError, ValueError):
+        return 1.0
+    return v if 0.25 <= v <= 4 else 1.0
+
+
 def _transition_joins(segments: list[dict], transitions: list[dict]) -> list[tuple[str, float] | None]:
     """
     For each join between two parts in a row (part i and i + 1): (xfade name, length in s) when
@@ -1268,10 +1285,12 @@ def main(
             delta = _next_start - _s["start_ms"]
             print(f"[render] TRIM overlapping seg: start={_s['start_ms']}ms → {_next_start}ms (end={_s['end_ms']}ms)", flush=True)
             _s = {**_s, "start_ms": _next_start}
+            # (a part of the main video at another speed plays delta × speed of its video meanwhile)
+            _sp = 1.0 if _s.get("inserted") else _seg_speed(_s)
             if _s.get("video_offset_ms") is not None:
-                _s["video_offset_ms"] = int(_s["video_offset_ms"]) + delta
+                _s["video_offset_ms"] = int(_s["video_offset_ms"]) + int(round(delta * _sp))
             _s["crop_boxes"] = [
-                {**b, "source_offset_ms": int(b["source_offset_ms"]) + delta} if b.get("source_offset_ms") is not None else b
+                {**b, "source_offset_ms": int(b["source_offset_ms"]) + int(round(delta * (1.0 if b.get("source_video_id") else _sp)))} if b.get("source_offset_ms") is not None else b
                 for b in (_s.get("crop_boxes") or [])
             ]
         _filtered.append(_s)
@@ -1284,6 +1303,8 @@ def main(
     # (videos put in between: the main video waits during each, so after one it is behind the
     # clip's own time — render.ts sets each part's video_offset_ms; a filled part gets it here)
     _inserts = spec.get("pieces") or []
+    # (smooth slow motion fills in to the clip's own frame rate)
+    _SMOOTH_FPS[:] = [f"{_probe_fps(video_path):.3f}"] if any(_s.get("smooth") and _seg_speed(_s) < 1 for _s in segments) else []
 
     def _video_at(t: int) -> int:
         # (render.ts's pieces: each a stretch of the timeline, the main video from `from`, or held at `hold`)
@@ -1291,7 +1312,7 @@ def main(
             if t < _p["at"] + _p["ms"]:
                 if _p.get("hold") is not None:
                     return int(_p["hold"])
-                return int((_p.get("from") or 0) + max(0, t - _p["at"]))
+                return int((_p.get("from") or 0) + max(0, t - _p["at"]) * float(_p.get("speed") or 1))
         return int(t)
 
     _filled: list[dict] = []
@@ -1548,8 +1569,12 @@ def main(
                 vid_start_ms = int(_primary_box["source_offset_ms"])
             else:
                 vid_start_ms = smss
+            # A part of the main video played faster or slower: it reads dur × speed of the video and
+            # plays it in dur (setpts below); slowed and smooth: new in-between frames (minterpolate)
+            seg_speed = _seg_speed(seg) if (_is_main_video and not seg.get("inserted") and not is_frame(layout)) else 1.0
+            seg_smooth = bool(seg.get("smooth")) and seg_speed < 1
             start_s = vid_start_ms / 1000.0
-            end_s   = (vid_start_ms + dur_ms) / 1000.0
+            end_s   = (vid_start_ms + dur_ms * seg_speed) / 1000.0
             out_lbl = f"[seg{si}]"
 
             if is_frame(layout):
@@ -1779,13 +1804,25 @@ def main(
                     # Primary: trim clip-relative segment window
                     src    = pop_src(None)
                     ts, te = start_s, end_s
+                primary_src_tag = src if not (vid_id and vid_id in secondary_videos) else None
 
                 # Keyframes are stored at composite currentTimeMs (smss-relative for each segment),
                 # so use smss as the base — not vid_start_ms, which differs for Part B segments.
                 crop  = _crop_filter(box, smss)
                 scale = _scale_fit(dst_w, dst_h) if fit else _scale_cover(dst_w, dst_h)
+                # The main video at the part's speed (before the crop: its keyframes are in the
+                # part's own timeline time), cut to exactly the part's length on the timeline
+                speed_f = ""
+                if seg_speed != 1 and src == primary_src_tag:
+                    speed_f = f"setpts=PTS/{seg_speed:.6f},"
+                    if seg_smooth:
+                        speed_f += f"minterpolate=fps={_smooth_fps()}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,setpts=PTS-STARTPTS,"
+                    speed_f += f"trim=duration={dur_ms / 1000.0:.3f},setpts=PTS-STARTPTS,"
+                # (smooth slow motion reads a little past the part's end: the in-between frames
+                # would otherwise end a few frames short of its length)
+                te_read = te + 0.3 if seg_speed != 1 and seg_smooth and src == primary_src_tag else te
                 fp.append(
-                    f"{src}trim=start={ts:.3f}:end={te:.3f},setpts=PTS-STARTPTS,"
+                    f"{src}trim=start={ts:.3f}:end={te_read:.3f},setpts=PTS-STARTPTS,{speed_f}"
                     f"{crop},{scale},setsar=1{lbl}"
                 )
 
