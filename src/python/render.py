@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -573,7 +574,15 @@ def _probe(path: str) -> tuple[float, bool]:
         dur = float((info.get("format") or {}).get("duration") or 0)
         has_audio = any(st.get("codec_type") == "audio" for st in info.get("streams") or [])
     except Exception:
-        pass
+        # (no ffprobe on this machine: ffmpeg itself says the length and whether there is sound)
+        try:
+            r = subprocess.run(["ffmpeg", "-hide_banner", "-i", path], capture_output=True, text=True, timeout=30)
+            m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", r.stderr or "")
+            if m:
+                dur = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
+                has_audio = "Audio:" in (r.stderr or "")
+        except Exception:
+            pass
     _probe_cache[path] = (dur, has_audio)
     return _probe_cache[path]
 
@@ -589,7 +598,14 @@ def _probe_fps(path: str) -> float:
         fps = float(num) / float(den or 1)
         return min(60.0, max(15.0, fps)) if fps > 0 else 30.0
     except Exception:
-        return 30.0
+        # (no ffprobe on this machine: ffmpeg itself says the frame rate)
+        try:
+            r = subprocess.run(["ffmpeg", "-hide_banner", "-i", path], capture_output=True, text=True, timeout=30)
+            m = re.search(r"Video:.*?([\d.]+) fps", r.stderr or "")
+            fps = float(m[1]) if m else 0.0
+            return min(60.0, max(15.0, fps)) if fps > 0 else 30.0
+        except Exception:
+            return 30.0
 
 
 # ── Transitions between sections (the editor's Transitions tool, table transitions) ──────────
@@ -605,6 +621,147 @@ _XFADE = {
     "radial": "radial", "pixelize": "pixelize",
 }
 _MIN_TRANSITION_MS = 80
+
+# Slides, Whip and Wipe move eased (they start and stop gently, as in CapCut / VN): a cubic ease
+# in-out of ffmpeg's own movement. Zoom is eased by ffmpeg already; the dissolves and dips stay
+# even. The editor's preview uses the same curve (VideoPreview drawTransition, easeInOutCubic).
+# Built from the transition's own frames only (the outgoing part's last and the incoming part's
+# first `d` seconds placed on a canvas): far faster than a per-pixel xfade formula.
+_EASED = ("slideleft", "slideright", "slideup", "slidedown", "wipeleft")
+
+
+def _ext_room(seg: dict, secondary_videos: dict, main_len_s: float, main_video_id: str | None) -> tuple[float, float]:
+    """
+    How much more of its own video a part can show before its start and after its end (s of the
+    timeline) for a transition: the main video from the clip's start (main_len_s: how much of it
+    there is from there), another video from its own start to its end. A frame layout, a borrowed
+    slot or a photo: none (it holds its edge frame instead).
+    """
+    layout = seg.get("layout", "vertical")
+    if is_frame(layout):
+        return (0.0, 0.0)
+    boxes = sorted(seg.get("crop_boxes", []), key=lambda b: b.get("slot_index", 0))
+    if not boxes:
+        return (0.0, 0.0)
+    dur = (int(seg["end_ms"]) - int(seg["start_ms"])) / 1000.0
+    n_slots = {"split": 2, "trio": 3}.get(layout, 1)
+    primary = boxes[0]
+    head, tail = float("inf"), float("inf")
+    for i in range(n_slots):
+        box = boxes[i] if i < len(boxes) else None
+        if box is None or box.get("image_path"):
+            return (0.0, 0.0)
+        vid = box.get("source_video_id")
+        if vid and vid == main_video_id and vid in secondary_videos:
+            return (0.0, 0.0)   # a borrowed slot (the clip's own video from another moment)
+        if not (vid and vid in secondary_videos) and i > 0 and primary.get("source_video_id") in secondary_videos:
+            box, vid = primary, primary.get("source_video_id")   # (an empty slot shows the primary's video)
+        if vid and vid in secondary_videos:
+            off = int(box.get("source_offset_ms") or 0) / 1000.0
+            length = _probe(secondary_videos[vid])[0]
+            head = min(head, off)
+            tail = min(tail, max(0.0, length - (off + dur)) if length > 0 else 0.0)
+        else:
+            # The main video: where this part starts in it (as the segment loop works it out)
+            speed = _seg_speed(seg) if not seg.get("inserted") else 1.0
+            if seg.get("video_offset_ms") is not None:
+                start = int(seg["video_offset_ms"]) / 1000.0
+            elif primary.get("source_offset_ms") is not None and not (primary.get("source_video_id") in secondary_videos):
+                start = int(primary["source_offset_ms"]) / 1000.0
+            else:
+                start = int(seg["start_ms"]) / 1000.0
+            head = min(head, max(0.0, start) / speed)
+            tail = min(tail, max(0.0, main_len_s - (start + dur * speed)) / speed if main_len_s > 0 else 0.0)
+    return (max(0.0, head if head != float("inf") else 0.0), max(0.0, tail if tail != float("inf") else 0.0))
+
+
+def _eased_join(fp: list[str], a_lbl: str, b_lbl: str, tag: str, name: str, d: float, off: float,
+                fps: float, w: int, h: int, whip: bool, out: str) -> None:
+    """
+    The clip so far (`a_lbl`, at least `off + d` long) and the incoming part (`b_lbl`, whose first
+    `d` seconds are what blends in) joined with the eased `name` over [off, off + d]. The join
+    itself is ffmpeg's own (xfade, so its frames and timing are exactly every other transition's);
+    over its `d` seconds the eased picture is laid, made from those same frames.
+    """
+    # (the ease, unescaped: each place it goes into is escaped once)
+    e = f"if(lt(clip(t/{d:.6f},0,1),0.5),4*pow(clip(t/{d:.6f},0,1),3),1-pow(2-2*clip(t/{d:.6f},0,1),3)/2)"
+    # (the transition's frames, by number: every stream here is on one frame grid)
+    f_off, f_d = int(round(off * fps)), max(1, int(round(d * fps)))
+    # (every stream of the eased picture on one clock, in microseconds, before its frames are timed:
+    # frames from different clocks would round differently and pair one frame apart)
+    grid = f"settb=AVTB,setpts=N/({fps:.6f}*TB)"
+    fp.append(f"{a_lbl}split=2[{tag}ax][{tag}aq]")
+    fp.append(f"[{tag}aq]trim=start_frame={f_off}:end_frame={f_off + f_d},{grid}[{tag}a]")
+    fp.append(f"{b_lbl}split=2[{tag}bx][{tag}bq]")
+    fp.append(f"[{tag}bq]trim=end_frame={f_d},{grid}[{tag}b]")
+    # The join: a plain dissolve (its picture is covered below; its frames and length are the clip's)
+    fp.append(f"[{tag}ax][{tag}bx]xfade=transition=fade:duration={d:.3f}:offset={off:.3f}[{tag}j]")
+    canvas = f"color=c=black:s={w}x{h}:r={fps:.3f}:d={d + 1:.6f},trim=end_frame={f_d},format=yuv420p,setsar=1,{grid}"
+    if name == "wipeleft":
+        # The incoming part shows through from the right as a mask's edge moves left
+        fp.append(f"{canvas}[{tag}m0]")
+        fp.append(f"color=c=white:s={w}x{h}:r={fps:.3f}:d={d + 1:.6f},trim=end_frame={f_d},format=yuv420p,setsar=1,{grid}[{tag}m1]")
+        fp.append(f"[{tag}m0][{tag}m1]overlay=x='{_esc_expr(f'{w}*(1-({e}))')}':y=0:eval=frame,format=gray,{grid}[{tag}mk]")
+        fp.append(f"[{tag}b]format=yuva420p[{tag}ba]")
+        fp.append(f"[{tag}ba][{tag}mk]alphamerge[{tag}bm]")
+        fp.append(f"[{tag}a][{tag}bm]overlay=x=0:y=0:eof_action=pass,format=yuv420p,setsar=1[{tag}t]")
+    else:
+        # Both pictures slide: the outgoing one out, the incoming one in after it
+        ax = {"slideleft": f"-{w}*({e})", "slideright": f"{w}*({e})"}.get(name, "0")
+        bx = {"slideleft": f"{w}*(1-({e}))", "slideright": f"-{w}*(1-({e}))"}.get(name, "0")
+        ay = {"slideup": f"-{h}*({e})", "slidedown": f"{h}*({e})"}.get(name, "0")
+        by = {"slideup": f"{h}*(1-({e}))", "slidedown": f"-{h}*(1-({e}))"}.get(name, "0")
+        fp.append(f"{canvas}[{tag}c]")
+        fp.append(f"[{tag}c][{tag}a]overlay=x='{_esc_expr(ax)}':y='{_esc_expr(ay)}':eval=frame:eof_action=pass[{tag}c1]")
+        fp.append(f"[{tag}c1][{tag}b]overlay=x='{_esc_expr(bx)}':y='{_esc_expr(by)}':eval=frame:eof_action=pass,format=yuv420p,setsar=1[{tag}t]")
+    t_lbl = f"[{tag}t]"
+    if whip:
+        # Whip: smeared sideways through its middle 60%
+        fp.append(f"[{tag}t]avgblur=sizeX=28:sizeY=1:enable='between(t,{d * 0.2:.3f},{d * 0.8:.3f})'[{tag}tw]")
+        t_lbl = f"[{tag}tw]"
+    # Laid over the join for exactly its frames (from `off`): before and after, the join shows. The
+    # join keeps its own timing; each eased frame is timed a quarter frame (in microseconds) before the join's frame it
+    # covers, so the two always pair up, whatever the frame times round to
+    fp.append(f"{t_lbl}settb=AVTB,setpts=(N+{f_off}-0.25)/({fps:.6f}*TB)[{tag}tt]")
+    fp.append(f"[{tag}j][{tag}tt]overlay=x=0:y=0:eof_action=pass:repeatlast=0,format=yuv420p,setsar=1{out}")
+
+
+_SMOOTH_FPS: list = []
+
+
+def _smooth_fps() -> str:
+    """The frame rate smooth slow motion fills in to: the clip's own (set by the render), else 30."""
+    return _SMOOTH_FPS[0] if _SMOOTH_FPS else "30"
+
+
+# The Free-plan watermark (the Shortcut logo + name, no background): its width, the gap from the right edge and from the
+# bottom, as shares of the frame, and its opacity. The bottom gap lifts it above where captions sit
+# (their middle is at 84% of the height) and the platforms' own caption area. The editor's preview
+# uses the same numbers (components/editor/watermark.ts).
+WATERMARK_PNG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "watermark.png")
+WATERMARK_WIDTH = 0.24
+WATERMARK_RIGHT = 0.04
+WATERMARK_BOTTOM = 0.22
+WATERMARK_OPACITY = 0.75
+# Its motion: in the first INTRO_S it rises by INTRO_RISE of its height and fades in; from
+# SHINE_FIRST_S on, every SHINE_EVERY_S a light (BAND of its width each side, GAIN brightness) takes
+# SHINE_S to sweep across it
+WATERMARK_INTRO_S = 0.6
+WATERMARK_INTRO_RISE = 0.35
+WATERMARK_SHINE_FIRST_S = 1.0
+WATERMARK_SHINE_EVERY_S = 5.0
+WATERMARK_SHINE_S = 0.9
+WATERMARK_SHINE_BAND = 0.12
+WATERMARK_SHINE_GAIN = 70
+
+
+def _seg_speed(seg: dict) -> float:
+    """A part's speed (the editor's Speed): 0.25 to 4, else 1. Only parts of the main video have one."""
+    try:
+        v = float(seg.get("speed") or 1)
+    except (TypeError, ValueError):
+        return 1.0
+    return v if 0.25 <= v <= 4 else 1.0
 
 
 def _transition_joins(segments: list[dict], transitions: list[dict]) -> list[tuple[str, float] | None]:
@@ -1298,10 +1455,12 @@ def main(
             delta = _next_start - _s["start_ms"]
             print(f"[render] TRIM overlapping seg: start={_s['start_ms']}ms → {_next_start}ms (end={_s['end_ms']}ms)", flush=True)
             _s = {**_s, "start_ms": _next_start}
+            # (a part of the main video at another speed plays delta × speed of its video meanwhile)
+            _sp = 1.0 if _s.get("inserted") else _seg_speed(_s)
             if _s.get("video_offset_ms") is not None:
-                _s["video_offset_ms"] = int(_s["video_offset_ms"]) + delta
+                _s["video_offset_ms"] = int(_s["video_offset_ms"]) + int(round(delta * _sp))
             _s["crop_boxes"] = [
-                {**b, "source_offset_ms": int(b["source_offset_ms"]) + delta} if b.get("source_offset_ms") is not None else b
+                {**b, "source_offset_ms": int(b["source_offset_ms"]) + int(round(delta * (1.0 if b.get("source_video_id") else _sp)))} if b.get("source_offset_ms") is not None else b
                 for b in (_s.get("crop_boxes") or [])
             ]
         _filtered.append(_s)
@@ -1314,6 +1473,8 @@ def main(
     # (videos put in between: the main video waits during each, so after one it is behind the
     # clip's own time — render.ts sets each part's video_offset_ms; a filled part gets it here)
     _inserts = spec.get("pieces") or []
+    # (smooth slow motion fills in to the clip's own frame rate)
+    _SMOOTH_FPS[:] = [f"{_probe_fps(video_path):.3f}"] if any(_s.get("smooth") and _seg_speed(_s) < 1 for _s in segments) else []
 
     def _video_at(t: int) -> int:
         # (render.ts's pieces: each a stretch of the timeline, the main video from `from`, or held at `hold`)
@@ -1321,7 +1482,7 @@ def main(
             if t < _p["at"] + _p["ms"]:
                 if _p.get("hold") is not None:
                     return int(_p["hold"])
-                return int((_p.get("from") or 0) + max(0, t - _p["at"]))
+                return int((_p.get("from") or 0) + max(0, t - _p["at"]) * float(_p.get("speed") or 1))
         return int(t)
 
     _filled: list[dict] = []
@@ -1378,12 +1539,16 @@ def main(
             segments, secondary_videos, mute_ranges, audio_tracks,
             bool(spec.get("main_detached")), float(spec.get("main_volume", 1.0)),
         )
+        # (the transitions, for the sound to cross-fade where it jumps: where each cut is, half its length)
+        _xj = _transition_joins(segments, spec.get("transitions", [])) if len(segments) > 1 else []
+        crossfades = [(int(segments[i]["end_ms"]), j[1] / 2) for i, j in enumerate(_xj) if j]
         ar = subprocess.run(
             build_segment_audio_args(
                 video_path, clip_start_ms, clip_end_ms,
                 segments, secondary_videos, audio_tracks, speech_ranges, audio_path,
                 mute_ranges=mute_ranges, main_detached=bool(spec.get("main_detached")),
                 main_volume=float(spec.get("main_volume", 1.0)),
+                crossfades=crossfades,
             ),
             capture_output=True,
         )
@@ -1442,12 +1607,35 @@ def main(
                 else:
                     slot_counts[None] = slot_counts.get(None, 0) + 1
 
+        # ── Transitions: both pictures keep moving ─────────────────────────────
+        # Across a transition the outgoing part plays on past its end and the incoming part starts
+        # before its start, half the transition each (as CapCut / VN do): each part reads that much
+        # more of its own video (ext_head / ext_tail, s), framed as at its edge. Only footage that
+        # isn't there (before the clip's start, past a video's end; a frame layout, a borrowed slot)
+        # is held on its nearest frame instead.
+        pre_joins = _transition_joins(segments, spec.get("transitions", [])) if len(segments) > 1 else []
+        n_seg = len(segments)
+        ext_head = [0.0] * n_seg
+        ext_tail = [0.0] * n_seg
+        main_len_s = max(0.0, _probe(video_path)[0] - clip_start_ms / 1000.0)
+        for _si, _seg in enumerate(segments):
+            want_h = pre_joins[_si - 1][1] / 2 if _si > 0 and pre_joins[_si - 1] else 0.0
+            want_t = pre_joins[_si][1] / 2 if _si < n_seg - 1 and pre_joins[_si] else 0.0
+            if want_h <= 0 and want_t <= 0:
+                continue
+            room = _ext_room(_seg, secondary_videos, main_len_s, main_video_id)
+            ext_head[_si] = max(0.0, min(want_h, room[0]))
+            ext_tail[_si] = max(0.0, min(want_t, room[1]))
+        if any(ext_head) or any(ext_tail):
+            print(f"[render] transitions read past the parts' edges: heads {[round(x, 2) for x in ext_head]} tails {[round(x, 2) for x in ext_tail]}", flush=True)
+
         # ── FFmpeg inputs ──────────────────────────────────────────────────────
         clip_start_s = clip_start_ms / 1000.0
         clip_dur_s   = clip_dur_ms   / 1000.0
         # (a clip of pieces can read further into the main video than it is long: a part cut from
-        # its edge skips video — render.ts says how far, source_ms)
-        read_s = max(clip_dur_s, float(spec.get("source_ms") or 0) / 1000.0)
+        # its edge skips video — render.ts says how far, source_ms; a transition reads a little
+        # past the last part's end)
+        read_s = max(clip_dur_s, float(spec.get("source_ms") or 0) / 1000.0) + (4 * max(ext_tail) + 0.5 if any(ext_tail) else 0.0)
         inputs = [
             "ffmpeg", "-y",
             "-ss", f"{clip_start_s:.3f}",
@@ -1585,8 +1773,14 @@ def main(
                 vid_start_ms = int(_primary_box["source_offset_ms"])
             else:
                 vid_start_ms = smss
+            # A part of the main video played faster or slower: it reads dur × speed of the video and
+            # plays it in dur (setpts below); slowed and smooth: new in-between frames (minterpolate)
+            seg_speed = _seg_speed(seg) if (_is_main_video and not seg.get("inserted") and not is_frame(layout)) else 1.0
+            seg_smooth = bool(seg.get("smooth")) and seg_speed < 1
             start_s = vid_start_ms / 1000.0
-            end_s   = (vid_start_ms + dur_ms) / 1000.0
+            end_s   = (vid_start_ms + dur_ms * seg_speed) / 1000.0
+            # (past its edges for a transition: see ext_head / ext_tail)
+            x_h, x_t = ext_head[si], ext_tail[si]
             out_lbl = f"[seg{si}]"
 
             if is_frame(layout):
@@ -1841,18 +2035,32 @@ def main(
                     # Secondary: trim from source_offset_ms for segment duration
                     off_ms = int(box.get("source_offset_ms", 0))
                     src    = pop_src(vid_id)
-                    ts, te = off_ms / 1000.0, (off_ms + dur_ms) / 1000.0
+                    ts, te = off_ms / 1000.0 - x_h, (off_ms + dur_ms) / 1000.0 + x_t
                 else:
                     # Primary: trim clip-relative segment window
                     src    = pop_src(None)
-                    ts, te = start_s, end_s
+                    ts, te = start_s - x_h * seg_speed, end_s + x_t * seg_speed
+                primary_src_tag = src if not (vid_id and vid_id in secondary_videos) else None
 
                 # Keyframes are stored at composite currentTimeMs (smss-relative for each segment),
                 # so use smss as the base — not vid_start_ms, which differs for Part B segments.
-                crop  = _crop_filter(box, smss)
+                # (read from earlier for a transition: its clock starts that much earlier; before
+                # the first view and after the last the crop holds them)
+                crop  = _crop_filter(box, smss - int(round(x_h * 1000)))
                 scale = _scale_fit(dst_w, dst_h) if fit else _scale_cover(dst_w, dst_h)
+                # The main video at the part's speed (before the crop: its keyframes are in the
+                # part's own timeline time), cut to exactly the part's length on the timeline
+                speed_f = ""
+                if seg_speed != 1 and src == primary_src_tag:
+                    speed_f = f"setpts=PTS/{seg_speed:.6f},"
+                    if seg_smooth:
+                        speed_f += f"minterpolate=fps={_smooth_fps()}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,setpts=PTS-STARTPTS,"
+                    speed_f += f"trim=duration={dur_ms / 1000.0 + x_h + x_t:.3f},setpts=PTS-STARTPTS,"
+                # (smooth slow motion reads a little past the part's end: the in-between frames
+                # would otherwise end a few frames short of its length)
+                te_read = te + 0.3 if seg_speed != 1 and seg_smooth and src == primary_src_tag else te
                 fp.append(
-                    f"{src}trim=start={ts:.3f}:end={te:.3f},setpts=PTS-STARTPTS,"
+                    f"{src}trim=start={ts:.3f}:end={te_read:.3f},setpts=PTS-STARTPTS,{speed_f}"
                     f"{crop},{scale},setsar=1{lbl}"
                 )
 
@@ -1878,6 +2086,26 @@ def main(
 
         # ── Concatenate segments ───────────────────────────────────────────────
         joins = _transition_joins(segments, spec.get("transitions", [])) if len(seg_labels) > 1 else []
+        # Hidden main video (black there): with transitions, each part is blacked out in its own
+        # picture before the parts are joined, so a transition into or out of a hidden part blends
+        # with the black (as the editor's preview does). Black laid over the joined clip afterwards
+        # would cover the half of each such transition that falls inside the hidden part.
+        blank_ranges = [(int(r["start_ms"]), int(r["end_ms"])) for r in spec.get("blank_ranges", [])
+                        if int(r["end_ms"]) > int(r["start_ms"])]
+        blank_in_parts = bool(blank_ranges) and len(seg_labels) > 1 and any(joins)
+        if blank_in_parts:
+            for si, lbl in enumerate(seg_labels):
+                s0, s1 = int(segments[si]["start_ms"]), int(segments[si]["end_ms"])
+                # (in the part's own picture, which starts ext_head before it: a hidden stretch at its
+                # edge covers its extra footage there too)
+                hh, ht = int(round(ext_head[si] * 1000)), int(round(ext_tail[si] * 1000))
+                hits = [((max(a, s0) - s0 + hh) if a > s0 else 0, (min(b, s1) - s0 + hh) if b < s1 else (s1 - s0 + hh + ht))
+                        for a, b in blank_ranges if min(b, s1) > max(a, s0)]
+                if not hits:
+                    continue
+                expr = "+".join(f"between(t,{a / 1000:.3f},{b / 1000:.3f})" for a, b in hits)
+                fp.append(f"{lbl}drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:enable='{expr}'[vhid{si}]")
+                seg_labels[si] = f"[vhid{si}]"
         if len(seg_labels) == 1:
             cur = seg_labels[0]
         elif not any(joins):
@@ -1906,11 +2134,16 @@ def main(
                 else:
                     name, d = j
                     h = d / 2
-                    fp.append(f"{cur}tpad=stop_mode=clone:stop_duration={h + 0.05:.3f}[ta{si}]")
-                    fp.append(f"{norm[si]}tpad=start_mode=clone:start_duration={h:.3f}[tb{si}]")
+                    # Each side already carries its own footage past the cut (ext_*): only what
+                    # is missing is held on the nearest frame
+                    fp.append(f"{cur}tpad=stop_mode=clone:stop_duration={max(0.0, h - ext_tail[si - 1]) + 0.05:.3f}[ta{si}]")
+                    fp.append(f"{norm[si]}tpad=start_mode=clone:start_duration={max(0.0, h - ext_head[si]):.3f}[tb{si}]")
                     off = max(0.0, cum - h)
-                    if segments[si - 1].get("id") and any(t.get("type") == "smoothleft" and t.get("after_segment_id") == segments[si - 1].get("id") for t in spec.get("transitions", []) or []):
-                        # Whip: the slide, then a sideways blur over its middle 60%
+                    whip = bool(segments[si - 1].get("id")) and any(t.get("type") == "smoothleft" and t.get("after_segment_id") == segments[si - 1].get("id") for t in spec.get("transitions", []) or [])
+                    if name in _EASED:
+                        _eased_join(fp, f"[ta{si}]", f"[tb{si}]", f"ej{si}", name, d, off, fps, out_w, out_h, whip, out)
+                    elif whip:
+                        # (Whip is always an eased slide; kept for safety)
                         fp.append(f"[ta{si}][tb{si}]xfade=transition={name}:duration={d:.3f}:offset={off:.3f}[tw{si}]")
                         fp.append(f"[tw{si}]avgblur=sizeX=28:sizeY=1:enable='between(t,{off + d * 0.2:.3f},{off + d * 0.8:.3f})'{out}")
                     else:
@@ -1920,9 +2153,8 @@ def main(
                 cum += dur
 
         # ── Hidden main video: black there (captions, text and photos still go on top) ──
-        blank_ranges = [(int(r["start_ms"]), int(r["end_ms"])) for r in spec.get("blank_ranges", [])
-                        if int(r["end_ms"]) > int(r["start_ms"])]
-        if blank_ranges:
+        # (with transitions it was done in each part, above)
+        if blank_ranges and not blank_in_parts:
             expr = "+".join(f"between(t,{a / 1000:.3f},{b / 1000:.3f})" for a, b in blank_ranges)
             fp.append(f"{cur}drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:enable='{expr}'[vblank]")
             cur = "[vblank]"
@@ -2131,17 +2363,38 @@ def main(
             cur = olbl
 
         # ── Watermark (free plan only) ─────────────────────────────────────────
+        # The Shortcut badge (assets/watermark.png), over everything else. Its size and place are
+        # shares of the frame, so every quality and shape gets the same mark. It slides up and fades
+        # in at the start, then a light sweeps across it every few seconds (WATERMARK_* — the editor's
+        # preview plays the same: components/editor/watermark.ts). A Free export is never delivered
+        # without it: if the image is missing the render stops with an error.
         if watermark:
-            wm_font = _find_font_path("roboto")
-            wm_text = _escape_drawtext("Chai Cut")
-            if wm_font:
-                fp.append(
-                    f"{cur}drawtext=fontfile={_filter_path(wm_font)}:text='{wm_text}'"
-                    f":fontsize={max(24, out_w // 36)}:fontcolor=white@0.55"
-                    f":x=w-tw-{max(16, out_w // 60)}:y=h-th-{max(16, out_h // 120)}"
-                    f":shadowx=1:shadowy=1:shadowcolor=black@0.5[vwm]"
-                )
-                cur = "[vwm]"
+            if not os.path.isfile(WATERMARK_PNG):
+                raise RuntimeError(f"The Free-plan watermark image is missing: {WATERMARK_PNG}")
+            inputs += ["-loop", "1", "-framerate", "30", "-i", WATERMARK_PNG]
+            wm_w = max(2, int(round(out_w * WATERMARK_WIDTH)) // 2 * 2)
+            wm_x = out_w - wm_w - int(round(out_w * WATERMARK_RIGHT))
+            wm_b = int(round(out_h * WATERMARK_BOTTOM))
+            intro = f"(1-pow(1-clip(T/{WATERMARK_INTRO_S},0,1),3))"          # eased 0 -> 1
+            # the light: a soft diagonal band crossing the badge (X - 0.35*Y = its centre line)
+            band = WATERMARK_SHINE_BAND
+            phase = f"mod(T-{WATERMARK_SHINE_FIRST_S},{WATERMARK_SHINE_EVERY_S})"
+            centre = f"(-{band}*W+(W*(1+2*{band})+0.35*H)*{phase}/{WATERMARK_SHINE_S})"
+            # f: how much of the light is on this pixel (0..1). It brightens the colour (seen on the
+            # lime logo) and lifts the mark to fully solid (seen on the white word, which can't get
+            # brighter): a glint running along the mark. Weighted by the mark's own alpha, so its soft
+            # shadow stays as it is.
+            f = (f"gte(T,{WATERMARK_SHINE_FIRST_S})*lt({phase},{WATERMARK_SHINE_S})"
+                 f"*max(0,1-abs(X-0.35*Y-{centre})/({band}*W))*alpha(X,Y)/255")
+            lit = lambda ch: _esc_expr(f"min(255,{ch}(X,Y)+{f}*{WATERMARK_SHINE_GAIN}*alpha(X,Y)/255)")
+            op = f"({WATERMARK_OPACITY}*{intro})"
+            alpha = _esc_expr(f"alpha(X,Y)*({op}+(1-{op})*{f})")
+            fp.append(f"[{next_input}:v]scale={wm_w}:-2:flags=lanczos,format=rgba,"
+                      f"geq=r='{lit('r')}':g='{lit('g')}':b='{lit('b')}':a='{alpha}'[vwmk]")
+            next_input += 1
+            slide = _esc_expr(f"H-h-{wm_b}+h*{WATERMARK_INTRO_RISE}*pow(1-clip(t/{WATERMARK_INTRO_S},0,1),3)")
+            fp.append(f"{cur}[vwmk]overlay=x={wm_x}:y='{slide}':eval=frame:shortest=1:format=auto[vwm]")
+            cur = "[vwm]"
 
         # Rename final label to [vout]
         fp.append(f"{cur}copy[vout]")
@@ -2192,7 +2445,7 @@ if __name__ == "__main__":
     parser.add_argument("--secondary-videos", default="{}", help="JSON: video_id → local_path")
     parser.add_argument("--overlay-images",   default="{}", help="JSON: storage_path → local_path")
     parser.add_argument("--overlay-videos",   default="{}", help="JSON: source_video_id → local_path")
-    parser.add_argument("--watermark",        action="store_true", help="Burn in Chai Cut watermark")
+    parser.add_argument("--watermark",        action="store_true", help="Burn in the Shortcut watermark (Free plan)")
     parser.add_argument("--frame-images",     default="{}", help="JSON: frame slot image_path → local_path")
     args = parser.parse_args()
     main(

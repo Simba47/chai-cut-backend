@@ -140,6 +140,32 @@ def _between(ranges_ms) -> str:
     return "+".join(f"between(t,{a / 1000:.3f},{b / 1000:.3f})" for a, b in ranges_ms)
 
 
+def _part_speed(seg: dict) -> float:
+    """A part's speed (the editor's Speed): 0.25 to 4, else 1 — only a part of the main video has one."""
+    box = (seg.get("crop_boxes") or [{}])[0] or {}
+    if seg.get("inserted") or box.get("source_video_id") or str(seg.get("layout", "")).startswith("frame_"):
+        return 1.0
+    try:
+        v = float(seg.get("speed") or 1)
+    except (TypeError, ValueError):
+        return 1.0
+    return v if 0.25 <= v <= 4 else 1.0
+
+
+def _atempo_chain(speed: float) -> str:
+    """ffmpeg's atempo takes 0.5–2 at a time: 4× is 2 · 2, 0.25× is 0.5 · 0.5 (the voice's pitch is kept)"""
+    parts: list[str] = []
+    s = speed
+    while s > 2.0 + 1e-9:
+        parts.append("atempo=2.0")
+        s /= 2.0
+    while s < 0.5 - 1e-9:
+        parts.append("atempo=0.5")
+        s /= 0.5
+    parts.append(f"atempo={s:.6f}")
+    return ",".join(parts)
+
+
 def build_segment_audio_args(
     source_video: str,
     clip_start_ms: int,
@@ -153,6 +179,7 @@ def build_segment_audio_args(
     main_detached: bool = False,
     loudness: bool = True,
     main_volume: float = 1.0,
+    crossfades: list[tuple[int, float]] | None = None,
 ) -> list[str]:
     """
     The clip's whole soundtrack, in one FFmpeg run:
@@ -168,6 +195,11 @@ def build_segment_audio_args(
          video's sound from `offset_ms` (source time), placed the same way.
       4. Everything is mixed WITHOUT lowering each input (normalize=0, so the voice stays at 100%)
          and levelled to -14 LUFS for social apps (loudness=False skips that, for tests).
+
+    crossfades: the clip's transitions, (where the cut is: clip ms, half its length: s). Where the
+    sound jumps there (another video, another moment, another speed), the outgoing sound fades out
+    as the incoming one fades in across the transition (equal power), each reading its own sound
+    past the cut — as the picture does (render.py). Where it carries straight on it is left alone.
     """
     clip_len_s = (clip_end_ms - clip_start_ms) / 1000.0
     clip_start_s = clip_start_ms / 1000.0
@@ -196,13 +228,17 @@ def build_segment_audio_args(
     # (parts that say where the main video is — a clip of pieces: cut parts skip video — are
     # played part by part too)
     has_positions = any(s.get("video_offset_ms") is not None for s in sorted_segs)
-    if not sorted_segs or (not has_broll_audio and not has_frames and not has_positions):
+    # (a part played faster or slower needs its own piece of sound too)
+    has_speed = any(_part_speed(s) != 1 for s in sorted_segs)
+    if not sorted_segs or (not has_broll_audio and not has_frames and not has_positions and not has_speed):
         # ── Bed, simple case: the main video's sound for the clip ──
         inputs: list[str] = ["ffmpeg", "-y", "-ss", f"{clip_start_s:.3f}", "-t", f"{clip_len_s:.3f}", "-i", source_video]
         fp.append(f"[0:a]asetpts=PTS-STARTPTS,{fmt},volume={main_vol:.3f}[speech]")
     else:
         # ── Bed, per section (B-roll shots and frames): atrim on one pre-seeked input is sample-accurate ──
         plans: list[list[tuple[str | None, float, float, float, float]]] = []
+        # The parts of the main video played at another speed: (speed, pitch follows it), by index
+        sped: dict[int, tuple[float, bool]] = {}
         for seg in sorted_segs:
             seg_dur = (int(seg["end_ms"]) - int(seg["start_ms"])) / 1000.0
             if is_frame(seg.get("layout")):
@@ -226,7 +262,46 @@ def build_segment_audio_args(
             else:
                 _cb_off = box.get("source_offset_ms") if box else None
                 vid_off_ms = int(seg["video_offset_ms"]) if seg.get("video_offset_ms") is not None else (int(_cb_off) if _cb_off is not None else int(seg["start_ms"]))
+                if _part_speed(seg) != 1:
+                    sped[len(plans)] = (_part_speed(seg), bool(seg.get("pitch")))
                 plans.append([(None, vid_off_ms / 1000.0, main_vol, 0.0, seg_dur)])
+
+        # ── Transitions: which cuts cross-fade, and how much sound each part reads past its edges ──
+        xf_at: dict[int, float] = {}        # index of the part before the cut -> half the transition (s)
+        if crossfades:
+            for i in range(len(sorted_segs) - 1):
+                a, b = sorted_segs[i], sorted_segs[i + 1]
+                cut = int(a["end_ms"])
+                if abs(int(b["start_ms"]) - cut) > 1 or is_frame(a.get("layout")) or is_frame(b.get("layout")):
+                    continue
+                if len(plans[i]) != 1 or len(plans[i + 1]) != 1:
+                    continue
+                h = next((hh for at, hh in crossfades if abs(at - cut) <= 1), 0.0)
+                if h <= 0:
+                    continue
+                (va, oa, _, _, da), (vb, ob, _, _, _) = plans[i][0], plans[i + 1][0]
+                spa = sped.get(i, (1.0, False))[0]
+                spb = sped.get(i + 1, (1.0, False))[0]
+                # (the same sound carrying straight on: nothing to blend)
+                if va == vb and abs(spa - spb) < 1e-6 and abs(oa + da * spa - ob) < 0.03:
+                    continue
+                xf_at[i] = h
+        x_head: dict[int, tuple[float, float]] = {}   # part -> (fade-in half, real sound before it, s)
+        x_tail: dict[int, tuple[float, float]] = {}   # part -> (fade-out half, real sound after it, s)
+        for i, h in xf_at.items():
+            for j, side in ((i, "tail"), (i + 1, "head")):
+                vid, off, _, _, dur = plans[j][0]
+                sp = sped.get(j, (1.0, False))[0]
+                if side == "head":
+                    have = max(0.0, off) / sp
+                    x_head[j] = (h, min(h, have))
+                else:
+                    if vid:
+                        L = _media_len(secondary_videos[vid])
+                        have = max(0.0, (L or 0.0) - (off + dur))
+                    else:
+                        have = h   # (the main video's own sound; past its end it is padded with silence)
+                    x_tail[j] = (h, min(h, have / sp))
 
         broll_uses: dict[str, int] = {}
         main_uses = 0
@@ -272,12 +347,38 @@ def build_segment_audio_args(
             dur_s = (int(seg["end_ms"]) - int(seg["start_ms"])) / 1000.0
             norm_lbl = f"[san{i}]"
             pieces: list[str] = []
+            if i in x_head or i in x_tail:
+                # A part beside a cross-faded cut: its sound from before its start and past its end
+                # too (half the transition each side), silence for any it doesn't have
+                (vid_id, off_s, vol, _, piece_s), = plan
+                src = next(broll_its[vid_id]) if vid_id else next(main_it)
+                hh, hh_have = x_head.get(i, (0.0, 0.0))
+                tt, tt_have = x_tail.get(i, (0.0, 0.0))
+                sp, pitch = sped.get(i, (1.0, False))
+                total = hh + piece_s + tt
+                vol_f = f",volume={vol:.3f}" if abs(vol - 1.0) > 1e-3 else ""
+                tempo = (("," + (f"asetrate={48000 * sp:.0f},aresample=48000" if pitch else _atempo_chain(sp))) if sp != 1 else "")
+                pad_f = f",adelay=delays={int(round((hh - hh_have) * 1000))}:all=1" if hh - hh_have > 0.0005 else ""
+                fp.append(f"{src}atrim=start={off_s - hh_have * sp:.3f}:end={off_s + (piece_s + tt_have) * sp:.3f},asetpts=PTS-STARTPTS{vol_f},{fmt}{tempo}"
+                          f"{pad_f},apad=whole_dur={total:.3f},atrim=duration={total:.3f},asetpts=PTS-STARTPTS{norm_lbl}")
+                norm_labels.append(norm_lbl)
+                continue
             for j, (vid_id, off_s, vol, delay_s, piece_s) in enumerate(plan):
                 src = next(broll_its[vid_id]) if vid_id else next(main_it)
                 lbl = f"[sa{i}_{j}]"
                 vol_f = f",volume={vol:.3f}" if abs(vol - 1.0) > 1e-3 else ""
                 delay_f = f",adelay=delays={int(round(delay_s * 1000))}:all=1" if delay_s > 0.0005 else ""
                 # Each piece to stereo 48 kHz (B-roll may be 44.1 kHz)
+                if not vid_id and i in sped:
+                    # Faster or slower: dur × speed of the main video's sound played in dur — the
+                    # voice natural (atempo), or higher / lower with the speed (pitch) — and exactly
+                    # the part's length, so nothing after it drifts
+                    sp, pitch = sped[i]
+                    tempo = f"asetrate={48000 * sp:.0f},aresample=48000" if pitch else _atempo_chain(sp)
+                    fp.append(f"{src}atrim=start={off_s:.3f}:end={off_s + piece_s * sp:.3f},asetpts=PTS-STARTPTS{vol_f},{fmt},{tempo},"
+                              f"apad=whole_dur={piece_s:.3f},atrim=duration={piece_s:.3f}{delay_f}{lbl}")
+                    pieces.append(lbl)
+                    continue
                 fp.append(f"{src}atrim=start={off_s:.3f}:end={off_s + piece_s:.3f},asetpts=PTS-STARTPTS{vol_f},{fmt}{delay_f}{lbl}")
                 pieces.append(lbl)
             if is_frame(seg.get("layout")):
@@ -291,7 +392,20 @@ def build_segment_audio_args(
             else:
                 fp.append(f"{pieces[0]}anull{norm_lbl}")
             norm_labels.append(norm_lbl)
-        fp.append(f"{''.join(norm_labels)}concat=n={len(sorted_segs)}:v=0:a=1[speech]")
+        if not xf_at:
+            fp.append(f"{''.join(norm_labels)}concat=n={len(sorted_segs)}:v=0:a=1[speech]")
+        else:
+            # One after another; at a cross-faded cut the two overlap by the transition's length
+            # (each carries half of it past the cut), so the clip keeps its length
+            cur = norm_labels[0]
+            for i in range(1, len(norm_labels)):
+                out = "[speech]" if i == len(norm_labels) - 1 else f"[sj{i}]"
+                h = xf_at.get(i - 1)
+                if h:
+                    fp.append(f"{cur}{norm_labels[i]}acrossfade=d={2 * h:.3f}:c1=qsin:c2=qsin{out}")
+                else:
+                    fp.append(f"{cur}{norm_labels[i]}concat=n=2:v=0:a=1{out}")
+                cur = out
 
     # ── Muted sections silence the bed (the picture's own sound), never the music ──
     if mute_ranges:

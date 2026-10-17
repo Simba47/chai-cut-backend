@@ -60,6 +60,11 @@ async function runMigrations() {
   // Where a segment's video starts when a true INSERT pushed it forward (render.py, audio.py, frames.py).
   // Production got this column by hand; databases built from schema alone (QA) lacked it.
   await db`ALTER TABLE segments ADD COLUMN IF NOT EXISTS video_offset_ms INTEGER`
+  // A part played faster or slower (the editor's Speed): its speed, smooth slow-mo, and whether
+  // its sound's pitch follows the speed (else the voice stays natural)
+  await db`ALTER TABLE segments ADD COLUMN IF NOT EXISTS speed REAL NOT NULL DEFAULT 1`
+  await db`ALTER TABLE segments ADD COLUMN IF NOT EXISTS smooth BOOLEAN NOT NULL DEFAULT false`
+  await db`ALTER TABLE segments ADD COLUMN IF NOT EXISTS pitch BOOLEAN NOT NULL DEFAULT false`
   await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS image_path TEXT`
   await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS image_motion TEXT`
   await db`ALTER TABLE crop_boxes ADD COLUMN IF NOT EXISTS volume REAL NOT NULL DEFAULT 1`
