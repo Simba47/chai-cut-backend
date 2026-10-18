@@ -630,6 +630,44 @@ _MIN_TRANSITION_MS = 80
 _EASED = ("slideleft", "slideright", "slideup", "slidedown", "wipeleft")
 
 
+def _edge_source(seg: dict, secondary_videos: dict) -> tuple[str | None, float, float] | None:
+    """
+    Which video a part plays (None: the main video), where it starts in it (s) and how fast: as the
+    segment loop works it out. None for a frame layout or a part without a box.
+    """
+    if is_frame(seg.get("layout", "vertical")):
+        return None
+    boxes = sorted(seg.get("crop_boxes", []), key=lambda b: b.get("slot_index", 0))
+    if not boxes:
+        return None
+    primary = boxes[0]
+    vid = primary.get("source_video_id")
+    if vid and vid in secondary_videos:
+        return (vid, int(primary.get("source_offset_ms") or 0) / 1000.0, 1.0)
+    speed = _seg_speed(seg) if not seg.get("inserted") else 1.0
+    if seg.get("video_offset_ms") is not None:
+        start = int(seg["video_offset_ms"]) / 1000.0
+    elif primary.get("source_offset_ms") is not None:
+        start = int(primary["source_offset_ms"]) / 1000.0
+    else:
+        start = int(seg["start_ms"]) / 1000.0
+    return (None, start, speed)
+
+
+def _carries_on(a: dict, b: dict, secondary_videos: dict) -> bool:
+    """
+    The video carries straight on from part `a` into part `b`: the same video, at the same speed,
+    `b` starting in it where `a` ends. Across such a cut the footage past either edge is the other
+    part's own: a transition there holds each side's edge frame instead (or it would blend the
+    picture with itself and show nothing).
+    """
+    ea, eb = _edge_source(a, secondary_videos), _edge_source(b, secondary_videos)
+    if not ea or not eb or ea[0] != eb[0] or abs(ea[2] - eb[2]) > 1e-6:
+        return False
+    dur_a = (int(a["end_ms"]) - int(a["start_ms"])) / 1000.0
+    return abs(ea[1] + dur_a * ea[2] - eb[1]) < 0.03
+
+
 def _ext_room(seg: dict, secondary_videos: dict, main_len_s: float, main_video_id: str | None) -> tuple[float, float]:
     """
     How much more of its own video a part can show before its start and after its end (s of the
@@ -1618,9 +1656,12 @@ def main(
         ext_head = [0.0] * n_seg
         ext_tail = [0.0] * n_seg
         main_len_s = max(0.0, _probe(video_path)[0] - clip_start_ms / 1000.0)
+        # (only where the video jumps: where it carries straight on, the footage past each edge is
+        # the other side's own, and each side holds its edge frame instead — see _carries_on)
+        moving = [bool(j) and not _carries_on(segments[i], segments[i + 1], secondary_videos) for i, j in enumerate(pre_joins)]
         for _si, _seg in enumerate(segments):
-            want_h = pre_joins[_si - 1][1] / 2 if _si > 0 and pre_joins[_si - 1] else 0.0
-            want_t = pre_joins[_si][1] / 2 if _si < n_seg - 1 and pre_joins[_si] else 0.0
+            want_h = pre_joins[_si - 1][1] / 2 if _si > 0 and moving[_si - 1] else 0.0
+            want_t = pre_joins[_si][1] / 2 if _si < n_seg - 1 and moving[_si] else 0.0
             if want_h <= 0 and want_t <= 0:
                 continue
             room = _ext_room(_seg, secondary_videos, main_len_s, main_video_id)
