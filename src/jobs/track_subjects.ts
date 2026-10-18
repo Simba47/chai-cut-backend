@@ -280,17 +280,29 @@ export function followSubjects(frames: FrameDetection[], cuts: number[], marks: 
 // other people sitting in the same places), the editor gives it that format and those views.
 
 /** A face is the marked shot's face when its middle is this close (fractions of the frame) and its size about the same */
+/**
+ * A face is where the marked one was: its middle at most this far from it (fractions of the frame),
+ * or SHOT_REACH_FACE of the marked face's width when that is more. Someone sitting still still leans
+ * and turns: a seated man in a close-up moved 7% of the frame's width inside one camera shot
+ * (measured 2026-10-17), which a fixed 6% read as another shot — his group's format stopped 2 s
+ * before the cut. A bigger face moves more.
+ */
 const SHOT_REACH_X = 0.06
 const SHOT_REACH_Y = 0.08
+const SHOT_REACH_FACE = 0.9
 const SHOT_SIZE_RATIO = 1.45
 /**
- * The same people: the faces' signatures, on average over the shot's faces, this close to the marked
- * ones (L1; each sums to 1). Two interviews are often shot alike — three people sitting left, middle
- * and right — so the places alone can't tell them apart. Measured 2026-10-13 on such a clip: the
- * same people 0.13–0.28 a frame (never over 0.45), other people 0.7–0.9. One face alone is too noisy
- * to judge (a turned head reads 0.5 and more), the average of the shot's faces isn't.
+ * The same people: the faces' signatures (colours of face and clothes; L1, each sums to 1), on
+ * average over the shot's faces, against the marked ones — judged once for a whole stretch of a
+ * camera shot (its median), never frame by frame. Measured: the same people 0.13–0.28 a frame (never
+ * over 0.45), other people 0.7–0.9 — but two different men both in black read 0.47–0.67 (2026-10-17),
+ * and a frame-by-frame line at 0.5 flipped in the middle of that shot, so a group's format started
+ * 2 s after the cut on the wrong person. A stretch is the marked people when its median is under
+ * SHOT_SAME_PEOPLE; a frame at SHOT_OTHER_PEOPLE or more is surely someone else (counted like a
+ * face that isn't there: enough of those in a row splits the camera shot).
  */
-const SHOT_SAME_PEOPLE = 0.5
+const SHOT_SAME_PEOPLE = 0.38
+const SHOT_OTHER_PEOPLE = 0.65
 /** A break in the shot shorter than this, inside one camera shot, isn't one (someone leaned out of place for a moment) */
 const SHOT_JOIN_MS = 1000
 /** A face smaller than this share of the marked shot's smallest face is background (a poster, a face far behind) */
@@ -302,6 +314,9 @@ const SHOT_MIN_MS = 800
 
 export interface ShotResult {
   spans: Turn[]; path: PathPoint[]; error?: string
+  /** The stretches before they are joined, each with how far its people's colours are from the marked
+   *  ones (its median; null: not known) — so two groups claiming one stretch can be settled (settleGroups) */
+  parts?: Array<{ span: Turn; apart: number | null }>
   /** The marked shot itself: the frame it was read from (ms from the start of the scan) and its faces */
   ref?: { t: number; faces: CropBox[] }
 }
@@ -332,20 +347,25 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
   const near = (face: CropBox, r: CropBox) => {
     const [x, y] = mid(face), [rx, ry] = mid(r)
     const ratio = Math.max(face.w / r.w, r.w / face.w)
-    return Math.abs(x - rx) <= SHOT_REACH_X && Math.abs(y - ry) <= SHOT_REACH_Y && ratio <= SHOT_SIZE_RATIO
+    const reachX = Math.max(SHOT_REACH_X, SHOT_REACH_FACE * r.w), reachY = Math.max(SHOT_REACH_Y, SHOT_REACH_FACE * r.w)
+    return Math.abs(x - rx) <= reachX && Math.abs(y - ry) <= reachY && ratio <= SHOT_SIZE_RATIO
       ? Math.abs(x - rx) + Math.abs(y - ry) : null
   }
-  // Whose faces they are: each marked face's signature, averaged over the second around the mark
+  // Whose faces they are: each marked face's signature, averaged over the whole marked camera shot
+  // (not just the second around the mark: then it doesn't matter where in the shot it was marked, and
+  // a moment of odd light at the mark doesn't make the people read as someone else elsewhere)
+  const homeFrames = fr.map((f, fi) => ({ f, t: timeOf(fi) })).filter(x => stretchOf(x.t) === home && x.f.faces.length === want)
   const refSigs = refFaces.map(r => {
-    const sigs = around.filter(x => x.f.faces.length === want)
+    const sigs = homeFrames
       .flatMap(x => x.f.faces.filter(face => near(face, r) !== null && face.sig?.length).slice(0, 1).map(face => face.sig!))
     return sigs.length ? meanOf(sigs) : r.sig?.length ? r.sig : null
   })
 
   // Each frame: the marked shot (every face where it was, nobody else), part of it (some faces not
-  // read, nobody else), another shot, or no faces read
+  // read, nobody else), another shot, or no faces read. `apart`: how far its faces' colours are from
+  // the marked people's (their average), judged later over a whole stretch
   type State = 'match' | 'part' | 'other' | 'none'
-  const states = fr.map((f): { s: State; box?: CropBox } => {
+  const states = fr.map((f): { s: State; box?: CropBox; apart?: number } => {
     const faces = f.faces.filter(face => face.w >= SHOT_BACKGROUND * smallest)
     if (!faces.length) return { s: 'none' }
     const used = new Set<number>()
@@ -364,19 +384,25 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
       if (sig?.length && refSig) apart.push(l1(sig, refSig))
     })
     if (used.size < faces.length) return { s: 'other' }     // someone who isn't in the marked shot
-    // The same places, other people (another interview shot the same way)
-    if (apart.length && apart.reduce((a, b) => a + b, 0) / apart.length >= SHOT_SAME_PEOPLE) return { s: 'other' }
-    if (found < refFaces.length) return { s: 'part' }
+    const far = apart.length ? apart.reduce((a, b) => a + b, 0) / apart.length : undefined
+    // The same places, surely other people (another interview shot the same way)
+    if (far !== undefined && far >= SHOT_OTHER_PEOPLE) return { s: 'other', apart: far }
+    if (found < refFaces.length) return { s: 'part', apart: far }
     const xs = faces.flatMap(face => [face.x, face.x + face.w]), ys = faces.flatMap(face => [face.y, face.y + face.h])
     const x = Math.min(...xs), y = Math.min(...ys)
-    return { s: 'match', box: { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y } }
+    return { s: 'match', box: { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y }, apart: far }
   })
+  /** Whether a stretch shows the marked people: its frames' colour distances, judged together (their median) */
+  const apartOf = (piece: number[]) => {
+    const d = piece.map(fi => states[fi].apart).filter((v): v is number => v !== undefined).sort((a, b) => a - b)
+    return d.length ? d[Math.floor(d.length / 2)] : null
+  }
 
   // The stretches. A camera shot (cut to cut) is one shot: when most of its frames are the marked
   // shot, all of it is — the face reader misses or misreads a face now and then, mostly as a shot
   // starts or ends (it used to leave a second of the shot unmarked there). Only something else for
   // SHOT_CHANGE_MS or longer (someone walks in, the camera turns to others) splits a camera shot.
-  const spans: Turn[] = []
+  const parts: Array<{ span: Turn; apart: number | null }> = []
   const half = FRAME_INTERVAL_MS / 2
   for (let k = 0; k < bounds.length - 1; k++) {
     const lo = bounds[k], hi = bounds[k + 1]
@@ -386,7 +412,10 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
     const flush = (to: number) => {
       const match = piece.filter(fi => states[fi].s === 'match').length
       const other = piece.filter(fi => states[fi].s === 'other').length
-      if (match && match >= other && to - from >= SHOT_MIN_MS) spans.push([Math.round(from), Math.round(to)])
+      const apart = apartOf(piece)
+      if (match && match >= other && to - from >= SHOT_MIN_MS && (apart === null || apart < SHOT_SAME_PEOPLE)) {
+        parts.push({ span: [Math.round(from), Math.round(to)], apart })
+      }
       piece = []
     }
     let i = 0
@@ -405,6 +434,7 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
     }
     flush(hi)
   }
+  const spans = parts.map(x => x.span)
   // The people's box, frame by frame, where the shot is
   const path: PathPoint[] = []
   fr.forEach((_, fi) => {
@@ -413,15 +443,55 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
     const bx = st.box!
     path.push([t, round4(bx.x), round4(bx.y), round4(bx.w), round4(bx.h), 0])
   })
-  // Joined where two stretches meet (the same shot either side of a cut that isn't one), or are a
-  // moment apart inside one camera shot
+  return { spans: joinSpans(spans, cuts, durationMs), path, parts, ref: { t: ref.t, faces: refFaces } }
+}
+
+/**
+ * Stretches joined where they meet (the same shot either side of a cut that isn't one), or are a
+ * moment apart inside one camera shot
+ */
+function joinSpans(spans: Turn[], cuts: number[], durationMs: number): Turn[] {
+  const bounds = [0, ...cuts.filter(c => c > 0 && c < durationMs), durationMs]
+  const stretchOf = (t: number) => { let k = 0; while (k < bounds.length - 2 && t >= bounds[k + 1]) k++; return k }
   const joined: Turn[] = []
-  for (const s of spans) {
+  for (const s of [...spans].sort((a, b) => a[0] - b[0])) {
     const last = joined[joined.length - 1]
-    if (last && (s[0] - last[1] <= 1 || (s[0] - last[1] <= SHOT_JOIN_MS && stretchOf(last[1] - 1) === stretchOf(s[0])))) last[1] = s[1]
+    if (last && (s[0] - last[1] <= 1 || (s[0] - last[1] <= SHOT_JOIN_MS && stretchOf(last[1] - 1) === stretchOf(s[0])))) last[1] = Math.max(last[1], s[1])
     else joined.push([s[0], s[1]])
   }
-  return { spans: joined, path, ref: { t: ref.t, faces: refFaces } }
+  return joined
+}
+
+/**
+ * Groups found together (shotSpans for each) where two of them claim the same stretch: it goes to the
+ * group whose people it is closest to. Two people who look alike in their own close-ups — both in
+ * black, sitting in the same place — can each read under SHOT_SAME_PEOPLE against the other's mark
+ * as the light changes through a video (0.30 to his own, 0.37–0.43 to the other man's, measured
+ * 2026-10-17); the nearer one is always the right one. A stretch whose closeness isn't known stays
+ * with both, as before.
+ */
+export function settleGroups(results: ShotResult[], cuts: number[], durationMs: number): ShotResult[] {
+  const minus = ([a, b]: Turn, [c, d]: Turn): Turn[] => (d <= a || c >= b ? [[a, b]] : [...(c > a ? [[a, c] as Turn] : []), ...(d < b ? [[d, b] as Turn] : [])])
+  return results.map((r, i) => {
+    if (!r.parts?.length) return r
+    const kept: Turn[] = []
+    for (const p of r.parts) {
+      let left: Turn[] = [p.span]
+      if (p.apart !== null) {
+        results.forEach((o, j) => {
+          if (j === i) return
+          for (const q of o.parts ?? []) {
+            // (the same closeness: the group listed first keeps it)
+            if (q.apart === null || q.apart > p.apart! || (q.apart === p.apart && j > i)) continue
+            left = left.flatMap(x => minus(x, q.span))
+          }
+        })
+      }
+      kept.push(...left.filter(([a, b]) => b - a >= SHOT_MIN_MS))
+    }
+    const spans = joinSpans(kept, cuts, durationMs)
+    return { ...r, spans, path: r.path.filter(([t]) => spans.some(([a, b]) => t >= a && t <= b)) }
+  })
 }
 
 // ── Camera angles ──────────────────────────────────────────────────────────────
@@ -678,7 +748,9 @@ export async function handleTrackSubjectsJob(job: Job, signal?: AbortSignal) {
       : []
     // The camera cuts, in the source video's time (exact to the frame: the editor switches on them)
     const sourceCuts = cuts.map(c => Math.round(c + from))
-    for (const s of shots) await saveShot(s.id, shotSpans(info.frames, cuts, s.mark_ms - from, to - from), from, to, sourceCuts)
+    // (found together: a stretch two groups claim goes to the nearer one)
+    const found = settleGroups(shots.map(s => shotSpans(info.frames, cuts, s.mark_ms - from, to - from)), cuts, to - from)
+    for (const [k, s] of shots.entries()) await saveShot(s.id, found[k], from, to, sourceCuts)
     for (const r of results) {
       if (r.error) {
         await db`UPDATE clip_subjects SET status = 'failed', error = ${r.error}, progress = 100, path = NULL WHERE id = ${r.id}`
@@ -857,7 +929,8 @@ async function subEditSteps(clipId: string, signal: AbortSignal, onCreated: (ids
     // They become the clip's subjects (the Subjects tool shows them), replacing the people marked
     // before. Group subjects (marked shots) stay — the user's own choice — found again in this clip
     const groups = await db<{ id: string; mark_ms: number }[]>`SELECT id, mark_ms FROM clip_subjects WHERE clip_id = ${clipId} AND shot IS NOT NULL`
-    for (const g of groups) await saveShot(g.id, shotSpans(info.frames, cuts, Number(g.mark_ms) - from, to - from), from, to, cuts.map(c => Math.round(c + from)))
+    const settled = settleGroups(groups.map(g => shotSpans(info.frames, cuts, Number(g.mark_ms) - from, to - from)), cuts, to - from)
+    for (const [k, g] of groups.entries()) await saveShot(g.id, settled[k], from, to, cuts.map(c => Math.round(c + from)))
     const marks = await db.begin(async tx => {
       await tx`DELETE FROM clip_subjects WHERE clip_id = ${clipId} AND shot IS NULL`
       const rows = await tx<{ id: string }[]>`
