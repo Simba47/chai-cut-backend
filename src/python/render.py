@@ -776,21 +776,35 @@ def _smooth_fps() -> str:
 # bottom, as shares of the frame, and its opacity. The bottom gap lifts it above where captions sit
 # (their middle is at 84% of the height) and the platforms' own caption area. The editor's preview
 # uses the same numbers (components/editor/watermark.ts).
-WATERMARK_PNG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "watermark.png")
-WATERMARK_WIDTH = 0.24
+_ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+# Two layers of the mark (each the whole mark's size, transparent elsewhere): the S logo, the word
+WATERMARK_LOGO_PNG = os.path.join(_ASSETS, "watermark_logo.png")
+WATERMARK_TEXT_PNG = os.path.join(_ASSETS, "watermark_text.png")
+# The Free plan's end card: OUTRO_S s after the clip, the mark large in the middle (OUTRO_WIDTH of
+# the frame) with "MADE WITH" above it, on the brand's near-black
+OUTRO_MADE_PNG = os.path.join(_ASSETS, "outro_made.png")
+OUTRO_S = 3.0
+OUTRO_WIDTH = 0.62
+OUTRO_BG = "0x0b0b0c"
+WATERMARK_WIDTH = 0.28
 WATERMARK_RIGHT = 0.04
 WATERMARK_BOTTOM = 0.22
-WATERMARK_OPACITY = 0.75
-# Its motion: in the first INTRO_S it rises by INTRO_RISE of its height and fades in; from
-# SHINE_FIRST_S on, every SHINE_EVERY_S a light (BAND of its width each side, GAIN brightness) takes
-# SHINE_S to sweep across it
-WATERMARK_INTRO_S = 0.6
-WATERMARK_INTRO_RISE = 0.35
-WATERMARK_SHINE_FIRST_S = 1.0
-WATERMARK_SHINE_EVERY_S = 5.0
+WATERMARK_OPACITY = 0.9
+# Its entrance: the S fades in at the mark's middle (LOGO_IN s), then over MOVE_S the S moves left
+# to its place while the word slides out to the right from behind it, fading in; then it holds.
+# Shifts are shares of the mark's width (where each starts, from where it ends)
+WATERMARK_LOGO_IN = 0.35
+WATERMARK_MOVE_AT = 0.35
+WATERMARK_MOVE_S = 0.6
+WATERMARK_TEXT_AT = 0.6
+WATERMARK_TEXT_S = 0.35
+WATERMARK_LOGO_SHIFT = 0.3503
+WATERMARK_TEXT_SHIFT = -0.0953
+# Then, from SHINE_AT s, every SHINE_EVERY s a lime light sweeps across it (left to right, SHINE_S s):
+# the white letters light up lime as it passes, the S brightens
+WATERMARK_SHINE_AT = 1.2
+WATERMARK_SHINE_EVERY = 3.0
 WATERMARK_SHINE_S = 0.9
-WATERMARK_SHINE_BAND = 0.12
-WATERMARK_SHINE_GAIN = 70
 
 
 def _seg_speed(seg: dict) -> float:
@@ -2410,32 +2424,77 @@ def main(
         # preview plays the same: components/editor/watermark.ts). A Free export is never delivered
         # without it: if the image is missing the render stops with an error.
         if watermark:
-            if not os.path.isfile(WATERMARK_PNG):
-                raise RuntimeError(f"The Free-plan watermark image is missing: {WATERMARK_PNG}")
-            inputs += ["-loop", "1", "-framerate", "30", "-i", WATERMARK_PNG]
+            for _p in (WATERMARK_LOGO_PNG, WATERMARK_TEXT_PNG):
+                if not os.path.isfile(_p):
+                    raise RuntimeError(f"The Free-plan watermark image is missing: {_p}")
             wm_w = max(2, int(round(out_w * WATERMARK_WIDTH)) // 2 * 2)
             wm_x = out_w - wm_w - int(round(out_w * WATERMARK_RIGHT))
             wm_b = int(round(out_h * WATERMARK_BOTTOM))
-            intro = f"(1-pow(1-clip(T/{WATERMARK_INTRO_S},0,1),3))"          # eased 0 -> 1
-            # the light: a soft diagonal band crossing the badge (X - 0.35*Y = its centre line)
-            band = WATERMARK_SHINE_BAND
-            phase = f"mod(T-{WATERMARK_SHINE_FIRST_S},{WATERMARK_SHINE_EVERY_S})"
-            centre = f"(-{band}*W+(W*(1+2*{band})+0.35*H)*{phase}/{WATERMARK_SHINE_S})"
-            # f: how much of the light is on this pixel (0..1). It brightens the colour (seen on the
-            # lime logo) and lifts the mark to fully solid (seen on the white word, which can't get
-            # brighter): a glint running along the mark. Weighted by the mark's own alpha, so its soft
-            # shadow stays as it is.
-            f = (f"gte(T,{WATERMARK_SHINE_FIRST_S})*lt({phase},{WATERMARK_SHINE_S})"
-                 f"*max(0,1-abs(X-0.35*Y-{centre})/({band}*W))*alpha(X,Y)/255")
-            lit = lambda ch: _esc_expr(f"min(255,{ch}(X,Y)+{f}*{WATERMARK_SHINE_GAIN}*alpha(X,Y)/255)")
-            op = f"({WATERMARK_OPACITY}*{intro})"
-            alpha = _esc_expr(f"alpha(X,Y)*({op}+(1-{op})*{f})")
-            fp.append(f"[{next_input}:v]scale={wm_w}:-2:flags=lanczos,format=rgba,"
-                      f"geq=r='{lit('r')}':g='{lit('g')}':b='{lit('b')}':a='{alpha}'[vwmk]")
-            next_input += 1
-            slide = _esc_expr(f"H-h-{wm_b}+h*{WATERMARK_INTRO_RISE}*pow(1-clip(t/{WATERMARK_INTRO_S},0,1),3)")
-            fp.append(f"{cur}[vwmk]overlay=x={wm_x}:y='{slide}':eval=frame:shortest=1:format=auto[vwm]")
-            cur = "[vwm]"
+            q = f"clip((t-{WATERMARK_MOVE_AT})/{WATERMARK_MOVE_S},0,1)"
+            rest = f"(1-if(lt({q},0.5),4*pow({q},3),1-pow(2-2*{q},3)/2))"   # 1 -> 0, eased
+            layers = [
+                # (the word under the S: it comes out from behind it)
+                (WATERMARK_TEXT_PNG, WATERMARK_TEXT_SHIFT, WATERMARK_TEXT_AT, WATERMARK_TEXT_S),
+                (WATERMARK_LOGO_PNG, WATERMARK_LOGO_SHIFT, 0.0, WATERMARK_LOGO_IN),
+            ]
+            # The light (a soft diagonal band, X - 0.25*Y its centre line), on each layer's own pixels
+            ph = f"mod(T-{WATERMARK_SHINE_AT},{WATERMARK_SHINE_EVERY})"
+            band = (f"gte(T,{WATERMARK_SHINE_AT})*lt({ph},{WATERMARK_SHINE_S})"
+                    f"*max(0,1-abs(X-0.25*Y-(-0.25+1.5*{ph}/{WATERMARK_SHINE_S})*W)/(0.22*W))")
+            tint = ":".join(f"{ch}='{_esc_expr(f'{ch}(X,Y)+({to}-{ch}(X,Y))*{band}')}'" for ch, to in (("r", 200), ("g", 255), ("b", 30)))
+            for li, (png, shift, fade_at, fade_s) in enumerate(layers):
+                inputs += ["-loop", "1", "-framerate", "30", "-i", png]
+                fp.append(f"[{next_input}:v]scale={wm_w}:-2:flags=lanczos,format=rgba,colorchannelmixer=aa={WATERMARK_OPACITY},"
+                          f"fade=t=in:st={fade_at:.3f}:d={fade_s:.3f}:alpha=1,geq={tint}:a='alpha(X,Y)'[vwml{li}]")
+                next_input += 1
+                x = _esc_expr(f"{wm_x}+{shift}*{wm_w}*{rest}")
+                fp.append(f"{cur}[vwml{li}]overlay=x='{x}':y=H-h-{wm_b}:eval=frame:shortest=1:format=auto[vwm{li}]")
+                cur = f"[vwm{li}]"
+
+        # ── Free plan: a 3 s end card after the clip ───────────────────────────
+        # "MADE WITH" fades in, the S appears in the middle and moves left as "Shortcut" slides out
+        # to the right, a lime light sweeps across, and it all fades out. The sound is padded with
+        # silence to match (so -shortest keeps the card)
+        audio_map = "1:a"
+        if watermark:
+            if not os.path.isfile(OUTRO_MADE_PNG):
+                raise RuntimeError(f"The Free-plan end card image is missing: {OUTRO_MADE_PNG}")
+            ofps = _probe_fps(video_path)
+            ow = max(2, int(round(out_w * OUTRO_WIDTH)) // 2 * 2)
+            mark_h = int(round(ow * 216 / 641)) // 2 * 2          # (the mark's layers are 641 x 216)
+            ox, oy = (out_w - ow) // 2, int(out_h * 0.5) - mark_h // 2
+            made_y = oy - int(round(ow * 120 / 641 * 0.75))
+            fade_out = OUTRO_S - 0.45
+            fp.append(f"color=c={OUTRO_BG}:s={out_w}x{out_h}:r={ofps:.3f}:d={OUTRO_S},format=yuv420p,setsar=1[ob0]")
+            q = "clip((t-0.6)/0.6,0,1)"
+            rest = f"(1-if(lt({q},0.5),4*pow({q},3),1-pow(2-2*{q},3)/2))"
+            ph = "(T-1.5)"
+            band = f"between(T,1.5,2.4)*max(0,1-abs(X-0.25*Y-(-0.25+1.5*{ph}/0.9)*W)/(0.22*W))"
+            tint = ":".join(f"{ch}='{_esc_expr(f'{ch}(X,Y)+({to}-{ch}(X,Y))*{band}')}'" for ch, to in (("r", 200), ("g", 255), ("b", 30)))
+            cards = [
+                (OUTRO_MADE_PNG, 0.0, 0.05, 0.4, made_y, False),
+                (WATERMARK_TEXT_PNG, -0.0953, 0.85, 0.35, oy, True),
+                (WATERMARK_LOGO_PNG, 0.3503, 0.25, 0.35, oy, True),
+            ]
+            ocur = "[ob0]"
+            for ci, (png, shift, f_at, f_s, y, sweep) in enumerate(cards):
+                inputs += ["-loop", "1", "-framerate", "30", "-i", png]
+                chain = (f"[{next_input}:v]scale={ow}:-2:flags=lanczos,format=rgba,"
+                         f"fade=t=in:st={f_at:.3f}:d={f_s:.3f}:alpha=1,fade=t=out:st={fade_out:.3f}:d=0.4:alpha=1")
+                if sweep:
+                    chain += f",geq={tint}:a='alpha(X,Y)'"
+                fp.append(f"{chain}[oc{ci}]")
+                next_input += 1
+                x = _esc_expr(f"{ox}+{shift}*{ow}*{rest}")
+                fp.append(f"{ocur}[oc{ci}]overlay=x='{x}':y={y}:eval=frame:shortest=1:format=auto[ob{ci + 1}]")
+                ocur = f"[ob{ci + 1}]"
+            fp.append(f"{cur}format=yuv420p,setsar=1[vclip]")
+            fp.append(f"{ocur}format=yuv420p,setsar=1[voutro]")
+            fp.append(f"[vclip][voutro]concat=n=2:v=1:a=0[vend]")
+            cur = "[vend]"
+            fp.append(f"[1:a]apad=pad_dur={OUTRO_S + 0.1:.2f}[aend]")
+            audio_map = "[aend]"
+            print(f"[render] Free plan: {OUTRO_S:.0f} s end card added", flush=True)
 
         # Rename final label to [vout]
         fp.append(f"{cur}copy[vout]")
@@ -2450,7 +2509,7 @@ def main(
         cmd = inputs + [
             "-/filter_complex", fc_path,
             "-map", "[vout]",
-            "-map", "1:a",
+            "-map", audio_map,
             "-c:v", "libx264",
             # x264 defaults to ~1.5 threads per CPU core; on large Railway hosts that
             # makes encoder startup allocate GBs and fail ("Error while opening encoder")
