@@ -30,7 +30,9 @@ const STANDALONE = new Set([
 /** Two-word fillers, cut only next to a pause */
 const PHRASES: string[][] = [['you', 'know']]
 // Any word said twice in a row loses the first one ("the the", "like like", "haan haan",
-// "accha accha", "emo emo"); like / haan / accha / emo are never cut on their own.
+// "accha accha", "emo emo"); like / haan / accha / emo are never cut on their own. A restarted
+// phrase of two or three words loses its first saying too ("I think I think", "so what I so what I").
+const REPEAT_PHRASE_MAX = 3
 
 // ── Timing rules ────────────────────────────────────────────────────────────────
 const LONG_PAUSE_MS = 600      // a gap longer than this is shortened…
@@ -45,35 +47,57 @@ const forms = (w: CutWord) => [norm(w.word), norm(w.word_roman)].filter(Boolean)
 const isIn = (set: Set<string>, w: CutWord) => forms(w).some(f => set.has(f))
 const same = (a: CutWord, b: CutWord) => forms(a).some(f => forms(b).includes(f))
 
+/** Why a word goes: a filler ("um", a lone "matlab", "you know"), or the first saying of a repeat */
+export type WordCut = 'filler' | 'repeat' | null
+
+/** The clip's words, in order (what wordCuts and computeCutRanges work on) */
+export function clipWords(allWords: CutWord[], clipStart: number, clipEnd: number): CutWord[] {
+  return allWords
+    .filter(w => w.start_ms >= clipStart && w.end_ms <= clipEnd && w.end_ms >= w.start_ms)
+    .sort((a, b) => a.start_ms - b.start_ms)
+}
+
+/** For each of `words` (clipWords), whether it goes and why */
+export function wordCuts(words: CutWord[]): WordCut[] {
+  const gapBefore = (i: number) => (i > 0 ? words[i].start_ms - words[i - 1].end_ms : Infinity)
+  const gapAfter = (i: number) => (i < words.length - 1 ? words[i + 1].start_ms - words[i].end_ms : Infinity)
+  const alone = (i: number, j = i) => gapBefore(i) >= ALONE_GAP_MS || gapAfter(j) >= ALONE_GAP_MS
+
+  const cut = new Array<WordCut>(words.length).fill(null)
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i]
+    const next = words[i + 1]
+    const repeated = !!next && same(w, next) && next.start_ms - w.end_ms <= REPEAT_GAP_MS
+    if (isIn(HESITATIONS, w)) cut[i] = 'filler'
+    else if (isIn(STANDALONE, w) && alone(i)) cut[i] = 'filler'
+    else if (repeated) cut[i] = cut[i] ?? 'repeat'
+    for (const phrase of PHRASES) {
+      const n = phrase.length
+      if (i + n <= words.length && phrase.every((p, k) => forms(words[i + k]).includes(p)) && alone(i, i + n - 1)) {
+        for (let k = 0; k < n; k++) cut[i + k] = 'filler'
+      }
+    }
+    // A restarted phrase: words i..i+n-1 said again straight after
+    for (let n = 2; n <= REPEAT_PHRASE_MAX; n++) {
+      if (i + 2 * n > words.length) break
+      const again = Array.from({ length: n }, (_, k) => same(words[i + k], words[i + n + k])).every(Boolean)
+      if (again && words[i + n].start_ms - words[i + n - 1].end_ms <= REPEAT_GAP_MS) {
+        for (let k = 0; k < n; k++) cut[i + k] = cut[i + k] ?? 'repeat'
+      }
+    }
+  }
+  return cut
+}
+
 /**
  * Source-time ranges to remove from the clip [clipStart, clipEnd), sorted and non-overlapping.
  * `protect`: ranges never cut (reaction moments: see reactionRanges; laughter found in a pause
  * at export), so a laugh or a reaction is never taken out as a "pause".
  */
 export function computeCutRanges(allWords: CutWord[], clipStart: number, clipEnd: number, protect: Range[] = []): Range[] {
-  const words = allWords
-    .filter(w => w.start_ms >= clipStart && w.end_ms <= clipEnd && w.end_ms >= w.start_ms)
-    .sort((a, b) => a.start_ms - b.start_ms)
+  const words = clipWords(allWords, clipStart, clipEnd)
   if (words.length === 0) return []
-  const gapBefore = (i: number) => (i > 0 ? words[i].start_ms - words[i - 1].end_ms : Infinity)
-  const gapAfter = (i: number) => (i < words.length - 1 ? words[i + 1].start_ms - words[i].end_ms : Infinity)
-  const alone = (i: number, j = i) => gapBefore(i) >= ALONE_GAP_MS || gapAfter(j) >= ALONE_GAP_MS
-
-  const removed = new Array<boolean>(words.length).fill(false)
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i]
-    const next = words[i + 1]
-    const repeated = !!next && same(w, next) && next.start_ms - w.end_ms <= REPEAT_GAP_MS
-    if (isIn(HESITATIONS, w)) removed[i] = true
-    else if (isIn(STANDALONE, w) && alone(i)) removed[i] = true
-    else if (repeated) removed[i] = true
-    for (const phrase of PHRASES) {
-      const n = phrase.length
-      if (i + n <= words.length && phrase.every((p, k) => forms(words[i + k]).includes(p)) && alone(i, i + n - 1)) {
-        for (let k = 0; k < n; k++) removed[i + k] = true
-      }
-    }
-  }
+  const removed = wordCuts(words).map(Boolean)
   // Never leave the clip with no words at all
   if (removed.every(Boolean)) return []
 

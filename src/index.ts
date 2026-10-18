@@ -32,6 +32,7 @@ import { handleRenderJob } from './jobs/render.js'
 import { handleAiEditJob } from './jobs/ai_edit.js'
 import { handleProxyJob } from './jobs/proxy.js'
 import { handleTrackSubjectsJob } from './jobs/track_subjects.js'
+import { handleDetectSilenceJob } from './jobs/silence.js'
 
 // Safe schema migrations — idempotent, run on every startup
 async function runMigrations() {
@@ -106,7 +107,7 @@ async function runMigrations() {
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_edit_job_id uuid REFERENCES ai_edit_jobs(id) ON DELETE SET NULL`
   // The original schema only allowed 'transcribe' and 'render' jobs, so an 'ai_edit' job could not be queued
   await db`ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_type_check`
-  await db`ALTER TABLE jobs ADD CONSTRAINT jobs_type_check CHECK (type IN ('transcribe','render','ai_edit','proxy','track_subjects'))`
+  await db`ALTER TABLE jobs ADD CONSTRAINT jobs_type_check CHECK (type IN ('transcribe','render','ai_edit','proxy','track_subjects','detect_silence'))`
   // One device per account: the current sign-in's id (the site's modules/auth/one-device.ts)
   await db`ALTER TABLE users ADD COLUMN IF NOT EXISTS session_id TEXT`
   // A running job's worker is alive (queue.ts heartbeat); a job whose heartbeat stops is taken back.
@@ -232,6 +233,18 @@ async function runMigrations() {
     )
   `
   await db`CREATE INDEX IF NOT EXISTS ai_suggestion_events_video_created ON ai_suggestion_events (video_id, created_at)`
+  // A clip's silences (the editor's Cleanup tool: jobs/silence.ts): its silent stretches, source ms
+  await db`
+    CREATE TABLE IF NOT EXISTS clip_silences (
+      clip_id uuid PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+      status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'done', 'failed')),
+      error text,
+      ranges jsonb,
+      scan_start_ms integer,
+      scan_end_ms integer,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )
+  `
   // Brand kits (editor Brand kit tool): a user's saved looks — colours, logo, @handle, title style —
   // put on a clip with Apply. data: the kit's settings (frontend lib/shared/brandKit.ts). How many a
   // user can have depends on their plan (frontend server/services/brandKits.ts)
@@ -273,6 +286,7 @@ registerHandler('render', handleRenderJob)
 registerHandler('ai_edit', handleAiEditJob)
 registerHandler('proxy', handleProxyJob)
 registerHandler('track_subjects', handleTrackSubjectsJob)
+registerHandler('detect_silence', handleDetectSilenceJob)
 
 /**
  * Whether this worker may change the database and take jobs. A worker on a PC whose database isn't
