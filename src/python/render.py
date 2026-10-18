@@ -674,6 +674,11 @@ _XFADE = {
     # xfade; ffmpeg's own "smoothleft" is a soft wipe, not a whip)
     "smoothleft": "slideleft",
     "radial": "radial", "pixelize": "pixelize",
+    # Swipe up: a slide up, smeared up and down through its middle (as Whip, sideways)
+    "swipeup": "slideup",
+    # The trending ones ffmpeg has no xfade for: drawn with the expressions below (_CUSTOM_TRANSITIONS)
+    "velocity": "velocity", "zoomout": "zoomout", "shake": "shake", "glitch": "glitch",
+    "flare": "flare", "spin": "spin", "warp": "warp",
 }
 _MIN_TRANSITION_MS = 80
 
@@ -769,7 +774,7 @@ def _ext_room(seg: dict, secondary_videos: dict, main_len_s: float, main_video_i
 
 
 def _eased_join(fp: list[str], a_lbl: str, b_lbl: str, tag: str, name: str, d: float, off: float,
-                fps: float, w: int, h: int, whip: bool, out: str) -> None:
+                fps: float, w: int, h: int, whip: bool, out: str, swipe: bool = False) -> None:
     """
     The clip so far (`a_lbl`, at least `off + d` long) and the incoming part (`b_lbl`, whose first
     `d` seconds are what blends in) joined with the eased `name` over [off, off + d]. The join
@@ -811,6 +816,10 @@ def _eased_join(fp: list[str], a_lbl: str, b_lbl: str, tag: str, name: str, d: f
     if whip:
         # Whip: smeared sideways through its middle 60%
         fp.append(f"[{tag}t]avgblur=sizeX=28:sizeY=1:enable='between(t,{d * 0.2:.3f},{d * 0.8:.3f})'[{tag}tw]")
+        t_lbl = f"[{tag}tw]"
+    elif swipe:
+        # Swipe up: smeared up and down through its middle 60%
+        fp.append(f"[{tag}t]avgblur=sizeX=1:sizeY=40:enable='between(t,{d * 0.2:.3f},{d * 0.8:.3f})'[{tag}tw]")
         t_lbl = f"[{tag}tw]"
     # Laid over the join for exactly its frames (from `off`): before and after, the join shows. The
     # join keeps its own timing; each eased frame is timed a quarter frame (in microseconds) before the join's frame it
@@ -887,6 +896,99 @@ def _seg_speed(seg: dict) -> float:
     except (TypeError, ValueError):
         return 1.0
     return v if 0.25 <= v <= 4 else 1.0
+
+
+# ── Trending transitions as xfade custom expressions ───────────────────────────
+# Each picks, for every pixel of the plane being drawn, where to read the outgoing (a) or incoming
+# (b) picture: zoomed, turned, stretched, shaken or torn, then swaps at the middle. Values are
+# worked out once per pixel and kept in slots (st / ld), so the long formulas stay quick — which
+# is why the filter runs on one thread (the slots are shared between threads). The editor's
+# preview draws them the same way (VideoPreview drawTransition).
+# Slots: 0 q (how far, 0 → 1), 1 x, 2 y (where to read), 3 scale, 4 eased, 5–7 spare.
+_TQ = "st(0,1-P)"  # (xfade's P runs 1 → 0)
+
+
+def _t_ease(t: str) -> str:
+    return f"st(4,clip({t},0,1));st(4,ld(4)*ld(4)*(3-2*ld(4)))"
+
+
+def _t_sample(src: str) -> str:
+    # the plane being drawn, from `src` at (ld(1), ld(2)); black outside the picture
+    return (f"if(between(ld(1),0,W-1)*between(ld(2),0,H-1),"
+            f"if(eq(PLANE,0),{src}0(ld(1),ld(2)),if(eq(PLANE,1),{src}1(ld(1),ld(2)),{src}2(ld(1),ld(2)))),"
+            f"if(eq(PLANE,0),16,128))")
+
+
+def _t_scaled(src: str, s: str) -> str:
+    return f"st(3,{s});st(1,W/2+(X-W/2)/ld(3));st(2,H/2+(Y-H/2)/ld(3));{_t_sample(src)}"
+
+
+def _t_turned(src: str, ang: str, s: str) -> str:
+    return (f"st(5,{ang});st(3,{s});st(6,cos(ld(5)));st(7,sin(ld(5)));"
+            f"st(1,W/2+((X-W/2)*ld(6)+(Y-H/2)*ld(7))/ld(3));"
+            f"st(2,H/2+((Y-H/2)*ld(6)-(X-W/2)*ld(7))/ld(3));{_t_sample(src)}")
+
+
+def _tr_zoomout() -> str:
+    # the shot pulls back and away (to 35%), the next lands from 190% to its size
+    a = f"{_t_ease('ld(0)/0.5')};{_t_scaled('a', '1-0.65*ld(4)')}"
+    b = f"{_t_ease('(ld(0)-0.5)/0.5')};{_t_scaled('b', '1.9-0.9*ld(4)')}"
+    return f"{_TQ};if(lt(ld(0),0.5),{a},{b})"
+
+
+def _tr_velocity() -> str:
+    # speed ramp: creeps in, rushes (to 220%), the next lands from small, slowing down
+    a = f"st(4,clip(ld(0)/0.5,0,1));{_t_scaled('a', '1+1.2*ld(4)*ld(4)*ld(4)')}"
+    b = f"st(4,1-clip((ld(0)-0.5)/0.5,0,1));{_t_scaled('b', '0.55+0.45*(1-ld(4)*ld(4)*ld(4))')}"
+    return f"{_TQ};if(lt(ld(0),0.5),{a},{b})"
+
+
+def _tr_spin() -> str:
+    # spins away (200°, growing), the next spins in (from -160°)
+    a = f"{_t_ease('ld(0)/0.5')};{_t_turned('a', '3.4907*ld(4)', '1+0.6*ld(4)')}"
+    b = f"{_t_ease('(ld(0)-0.5)/0.5')};{_t_turned('b', '-2.7925*(1-ld(4))', '1.6-0.6*ld(4)')}"
+    return f"{_TQ};if(lt(ld(0),0.5),{a},{b})"
+
+
+def _tr_warp() -> str:
+    # stretches sideways (×3.2, skewed, brighter) and snaps into the next
+    def side(src: str, k: str, sign: str) -> str:
+        return (f"{k};st(3,1+2.2*ld(4));st(5,1-0.2*ld(4));st(6,{sign}0.25*ld(4));"
+                f"st(1,W/2+((X-W/2)-ld(6)*(Y-H/2))/ld(3));st(2,H/2+(Y-H/2)/ld(5));"
+                f"st(7,{_t_sample(src)});if(eq(PLANE,0),clip(ld(7)+45*ld(4),16,235),ld(7))")
+    a = side("a", _t_ease("ld(0)/0.5"), "-")
+    b = side("b", f"{_t_ease('(ld(0)-0.5)/0.5')};st(4,1-ld(4))", "")
+    return f"{_TQ};if(lt(ld(0),0.5),{a},{b})"
+
+
+def _tr_shake() -> str:
+    # a camera jolt (up to 5% of the width) round the cut, framed 12% in so no edge shows
+    pre = (f"{_TQ};st(5,sin(PI*ld(0))*0.05*W);st(6,ld(5)*sin(ld(0)*61));st(7,ld(5)*0.6*cos(ld(0)*47));"
+           f"st(1,W/2+(X-W/2)/1.12+ld(6));st(2,H/2+(Y-H/2)/1.12+ld(7))")
+    return f"{pre};if(lt(ld(0),0.5),{_t_sample('a')},{_t_sample('b')})"
+
+
+def _tr_glitch() -> str:
+    # ten bands torn sideways by a changing amount, the colour planes a little further (an RGB split)
+    pre = (f"{_TQ};st(5,between(ld(0),0.3,0.7)*sin(PI*clip((ld(0)-0.3)/0.4,0,1)));"
+           f"st(6,sin(floor(Y/(H/10))*12.9898+floor(ld(0)*24)*78.233)*43758.5453);"
+           f"st(6,ld(6)-floor(ld(6))-0.5);"
+           f"st(1,X+ld(5)*(ld(6)*0.16*W+PLANE*0.02*W));st(2,Y)")
+    return f"{pre};if(lt(ld(0),0.5),{_t_sample('a')},{_t_sample('b')})"
+
+
+def _tr_flare() -> str:
+    # light leak: a warm band of light sweeps across and hides the cut
+    pre = (f"{_TQ};st(5,(X-W*(1.3-1.6*ld(0)))/(0.14*W));st(6,exp(-ld(5)*ld(5))*sin(PI*ld(0)));"
+           f"st(7,if(lt(ld(0),0.5),A,B))")
+    return (f"{pre};if(eq(PLANE,0),clip(ld(7)+175*ld(6),16,235),"
+            f"if(eq(PLANE,1),clip(ld(7)-28*ld(6),16,240),clip(ld(7)+38*ld(6),16,240)))")
+
+
+_CUSTOM_TRANSITIONS = {
+    "velocity": _tr_velocity, "zoomout": _tr_zoomout, "shake": _tr_shake, "glitch": _tr_glitch,
+    "flare": _tr_flare, "spin": _tr_spin, "warp": _tr_warp,
+}
 
 
 def _transition_joins(segments: list[dict], transitions: list[dict]) -> list[tuple[str, float] | None]:
@@ -2276,6 +2378,25 @@ def main(
                 out = f"[tj{si}]"
                 if j is None:
                     fp.append(f"{cur}{norm[si]}concat=n=2:v=1:a=0{out}")
+                elif j[0] in _CUSTOM_TRANSITIONS:
+                    # A trending one: drawn only over the last half of the outgoing part and the
+                    # first half of the incoming one (whole frames, so the clip keeps its exact
+                    # length), at half size — the motion hides it, and it's ~4× quicker
+                    name, d = j
+                    h = max(1, round(d / 2 * fps)) / fps
+                    expr = _CUSTOM_TRANSITIONS[name]()
+                    fp.append(f"{cur}split[cs{si}a][cs{si}b]")
+                    fp.append(f"[cs{si}a]trim=end={cum - h:.4f},setpts=PTS-STARTPTS[cpre{si}]")
+                    fp.append(f"[cs{si}b]trim=start={cum - h:.4f},setpts=PTS-STARTPTS,"
+                              f"scale=trunc(iw/4)*2:trunc(ih/4)*2,tpad=stop_mode=clone:stop_duration={h:.4f}[cxa{si}]")
+                    fp.append(f"{norm[si]}split[cn{si}a][cn{si}b]")
+                    fp.append(f"[cn{si}a]trim=end={h:.4f},setpts=PTS-STARTPTS,"
+                              f"scale=trunc(iw/4)*2:trunc(ih/4)*2,tpad=start_mode=clone:start_duration={h:.4f}[cxb{si}]")
+                    fp.append(f"[cn{si}b]trim=start={h:.4f},setpts=PTS-STARTPTS[cpost{si}]")
+                    fp.append(f"[cxa{si}][cxb{si}]xfade=transition=custom:duration={2 * h:.4f}:offset=0:expr='{expr}':threads=1,"
+                              f"scale={out_w}:{out_h}:flags=bicubic,setsar=1,format=yuv420p,settb=AVTB[cmid{si}]")
+                    fp.append(f"[cpre{si}][cmid{si}][cpost{si}]concat=n=3:v=1:a=0{out}")
+                    print(f"[render] transition {name} {2 * h:.2f}s at {cum:.2f}s", flush=True)
                 else:
                     name, d = j
                     h = d / 2
@@ -2284,9 +2405,11 @@ def main(
                     fp.append(f"{cur}tpad=stop_mode=clone:stop_duration={max(0.0, h - ext_tail[si - 1]) + 0.05:.3f}[ta{si}]")
                     fp.append(f"{norm[si]}tpad=start_mode=clone:start_duration={max(0.0, h - ext_head[si]):.3f}[tb{si}]")
                     off = max(0.0, cum - h)
-                    whip = bool(segments[si - 1].get("id")) and any(t.get("type") == "smoothleft" and t.get("after_segment_id") == segments[si - 1].get("id") for t in spec.get("transitions", []) or [])
+                    # Which kind this join is (Whip and Swipe up are slides with a blur through their middle)
+                    kind_here = next((t.get("type") for t in spec.get("transitions", []) or [] if segments[si - 1].get("id") and t.get("after_segment_id") == segments[si - 1].get("id")), None)
+                    whip, swipe = kind_here == "smoothleft", kind_here == "swipeup"
                     if name in _EASED:
-                        _eased_join(fp, f"[ta{si}]", f"[tb{si}]", f"ej{si}", name, d, off, fps, out_w, out_h, whip, out)
+                        _eased_join(fp, f"[ta{si}]", f"[tb{si}]", f"ej{si}", name, d, off, fps, out_w, out_h, whip, out, swipe=swipe)
                     elif whip:
                         # (Whip is always an eased slide; kept for safety)
                         fp.append(f"[ta{si}][tb{si}]xfade=transition={name}:duration={d:.3f}:offset={off:.3f}[tw{si}]")
