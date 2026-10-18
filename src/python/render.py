@@ -777,8 +777,10 @@ def _smooth_fps() -> str:
 # (their middle is at 84% of the height) and the platforms' own caption area. The editor's preview
 # uses the same numbers (components/editor/watermark.ts).
 _ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
-# Two layers of the mark (each the whole mark's size, transparent elsewhere): the S logo, the word
-WATERMARK_LOGO_PNG = os.path.join(_ASSETS, "watermark_logo.png")
+# Layers of the mark (each the whole mark's size, transparent elsewhere): the S logo's top and bottom
+# halves, the word
+WATERMARK_TOP_PNG = os.path.join(_ASSETS, "watermark_logo_top.png")
+WATERMARK_BOTTOM_PNG = os.path.join(_ASSETS, "watermark_logo_bottom.png")
 WATERMARK_TEXT_PNG = os.path.join(_ASSETS, "watermark_text.png")
 # The Free plan's end card: OUTRO_S s after the clip, the mark large in the middle (OUTRO_WIDTH of
 # the frame) with "MADE WITH" above it, on the brand's near-black
@@ -790,21 +792,37 @@ WATERMARK_WIDTH = 0.28
 WATERMARK_RIGHT = 0.04
 WATERMARK_BOTTOM = 0.22
 WATERMARK_OPACITY = 0.9
-# Its entrance: the S fades in at the mark's middle (LOGO_IN s), then over MOVE_S the S moves left
-# to its place while the word slides out to the right from behind it, fading in; then it holds.
-# Shifts are shares of the mark's width (where each starts, from where it ends)
-WATERMARK_LOGO_IN = 0.35
-WATERMARK_MOVE_AT = 0.35
-WATERMARK_MOVE_S = 0.6
-WATERMARK_TEXT_AT = 0.6
-WATERMARK_TEXT_S = 0.35
-WATERMARK_LOGO_SHIFT = 0.3503
-WATERMARK_TEXT_SHIFT = -0.0953
-# Then, from SHINE_AT s, every SHINE_EVERY s a lime light sweeps across it (left to right, SHINE_S s):
-# the white letters light up lime as it passes, the S brightens
-WATERMARK_SHINE_AT = 1.2
-WATERMARK_SHINE_EVERY = 3.0
+# It plays in a loop of WATERMARK_LOOP_S s (the times below are into each loop), as the sign-in page's
+# heading does (components/auth/AuthSlider.tsx PanelTitle): the S pops in at the word's middle (grows
+# from POP_FROM with a little overshoot, over POP_S), then from SPLIT_AT, over SPLIT_S, it splits: its
+# top half slides left to the S's place, its bottom half slides right to the word's end, and the word
+# opens from its middle between them. Then the bottom half fades away at the end of the word as the
+# S's bottom fades in at its place (from SETTLE_AT, over SETTLE_S), and "MADE WITH" fades in above
+# (from MADE_AT, over MADE_S). Places are shares of the mark's width or height (the layers are
+# 641 x 216): the S's centre, the word's middle and half its width
+WATERMARK_POP_S = 0.45
+WATERMARK_POP_FROM = 0.4
+WATERMARK_SPLIT_AT = 0.6
+WATERMARK_SPLIT_S = 0.75
+WATERMARK_SETTLE_AT = 1.35
+WATERMARK_SETTLE_S = 0.35
+WATERMARK_MADE_AT = 1.6
+WATERMARK_MADE_S = 0.4
+WATERMARK_S_CX, WATERMARK_S_CY = 97 / 641, 115 / 216
+WATERMARK_WORD_CX, WATERMARK_WORD_HALF = 382 / 641, 230 / 641
+# "MADE WITH" (assets/outro_made.png, the mark's width, its letters in the middle) has its top this
+# share of the mark's width above the mark's top: its letters end just above the S
+WATERMARK_MADE_RISE = 0.08
+# While it is all in, from SHINE_AT, SHINE_N times every SHINE_EVERY s a lime light sweeps across the
+# logo and name (left to right, SHINE_S s): the white letters light up lime as it passes
+WATERMARK_SHINE_AT = 2.2
+WATERMARK_SHINE_EVERY = 2.4
+WATERMARK_SHINE_N = 2
 WATERMARK_SHINE_S = 0.9
+# Fully in for 5 s (to OUT_AT), it all fades out over OUT_S, stays away until the loop starts again
+WATERMARK_OUT_AT = 7.0
+WATERMARK_OUT_S = 0.6
+WATERMARK_LOOP_S = 9.1
 
 
 def _seg_speed(seg: dict) -> float:
@@ -2419,36 +2437,67 @@ def main(
 
         # ── Watermark (free plan only) ─────────────────────────────────────────
         # The Shortcut badge (assets/watermark.png), over everything else. Its size and place are
-        # shares of the frame, so every quality and shape gets the same mark. It slides up and fades
-        # in at the start, then a light sweeps across it every few seconds (WATERMARK_* — the editor's
+        # shares of the frame, so every quality and shape gets the same mark. In a loop: the S pops in and
+        # splits as the word opens ("MADE WITH" above), a light sweeps across, it stays 5 s and fades away (WATERMARK_* — the editor's
         # preview plays the same: components/editor/watermark.ts). A Free export is never delivered
         # without it: if the image is missing the render stops with an error.
         if watermark:
-            for _p in (WATERMARK_LOGO_PNG, WATERMARK_TEXT_PNG):
+            for _p in (WATERMARK_TOP_PNG, WATERMARK_BOTTOM_PNG, WATERMARK_TEXT_PNG, OUTRO_MADE_PNG):
                 if not os.path.isfile(_p):
                     raise RuntimeError(f"The Free-plan watermark image is missing: {_p}")
             wm_w = max(2, int(round(out_w * WATERMARK_WIDTH)) // 2 * 2)
             wm_x = out_w - wm_w - int(round(out_w * WATERMARK_RIGHT))
             wm_b = int(round(out_h * WATERMARK_BOTTOM))
-            q = f"clip((t-{WATERMARK_MOVE_AT})/{WATERMARK_MOVE_S},0,1)"
-            rest = f"(1-if(lt({q},0.5),4*pow({q},3),1-pow(2-2*{q},3)/2))"   # 1 -> 0, eased
-            layers = [
-                # (the word under the S: it comes out from behind it)
-                (WATERMARK_TEXT_PNG, WATERMARK_TEXT_SHIFT, WATERMARK_TEXT_AT, WATERMARK_TEXT_S),
-                (WATERMARK_LOGO_PNG, WATERMARK_LOGO_SHIFT, 0.0, WATERMARK_LOGO_IN),
-            ]
+            mark_h = int(round(wm_w * 216 / 641)) // 2 * 2          # (the mark's layers are 641 x 216)
+            made_dy = int(round(wm_w * WATERMARK_MADE_RISE))
+            # (time into the loop: for the moves (t) and for the pictures' own clocks (T))
+            lt, lT = f"mod(t,{WATERMARK_LOOP_S})", f"mod(T,{WATERMARK_LOOP_S})"
+
+            def eased(tv):   # the split's progress, 0 -> 1, eased in and out
+                q = f"clip(({tv}-{WATERMARK_SPLIT_AT})/{WATERMARK_SPLIT_S},0,1)"
+                return f"if(lt({q},0.5),4*pow({q},3),1-pow(2-2*{q},3)/2)"
+
+            def ramp(at, d):
+                return f"clip(({lT}-{at})/{d},0,1)"
+            out = f"(1-{ramp(WATERMARK_OUT_AT, WATERMARK_OUT_S)})"
+            # The pop: the S's size (POP_FROM -> 1, a little past 1 and back) and its opacity
+            pp = ramp(0, WATERMARK_POP_S)
+            size = f"({WATERMARK_POP_FROM}+{1 - WATERMARK_POP_FROM:.2f}*(1+2.2*pow({pp}-1,3)+1.2*pow({pp}-1,2)))"
+            pop_a = f"min(1,2*{pp})"
+            # (a half drawn at that size about the S's centre: each pixel taken from nearer the centre)
+            cx, cy = f"({WATERMARK_S_CX:.4f}*W)", f"({WATERMARK_S_CY:.4f}*H)"
+            at_size = (f"{cx}+(X-{cx})/{size}", f"{cy}+(Y-{cy})/{size}")
+            start = WATERMARK_WORD_CX - WATERMARK_S_CX                       # the S at the word's middle
+            end = WATERMARK_WORD_CX + WATERMARK_WORD_HALF - WATERMARK_S_CX   # the bottom half at its end
             # The light (a soft diagonal band, X - 0.25*Y its centre line), on each layer's own pixels
-            ph = f"mod(T-{WATERMARK_SHINE_AT},{WATERMARK_SHINE_EVERY})"
-            band = (f"gte(T,{WATERMARK_SHINE_AT})*lt({ph},{WATERMARK_SHINE_S})"
+            ph = f"mod({lT}-{WATERMARK_SHINE_AT},{WATERMARK_SHINE_EVERY})"
+            band = (f"gte({lT},{WATERMARK_SHINE_AT})*lt({lT},{WATERMARK_SHINE_AT + WATERMARK_SHINE_N * WATERMARK_SHINE_EVERY})"
+                    f"*lt({ph},{WATERMARK_SHINE_S})"
                     f"*max(0,1-abs(X-0.25*Y-(-0.25+1.5*{ph}/{WATERMARK_SHINE_S})*W)/(0.22*W))")
-            tint = ":".join(f"{ch}='{_esc_expr(f'{ch}(X,Y)+({to}-{ch}(X,Y))*{band}')}'" for ch, to in (("r", 200), ("g", 255), ("b", 30)))
-            for li, (png, shift, fade_at, fade_s) in enumerate(layers):
+            settle = ramp(WATERMARK_SETTLE_AT, WATERMARK_SETTLE_S)
+            # (picture, x shift (an expression of t, a share of the mark's width), opacity, drawn at
+            #  the pop's size, in the light, height above the mark)
+            layers = [
+                # the word, opening from its middle as the halves part
+                (WATERMARK_TEXT_PNG, "0", f"lte(abs(X-{WATERMARK_WORD_CX:.4f}*W),({eased(lT)})*{WATERMARK_WORD_HALF:.4f}*W)", False, True, 0),
+                (WATERMARK_TOP_PNG, f"{start:.4f}*(1-({eased(lt)}))", pop_a, True, True, 0),
+                (WATERMARK_BOTTOM_PNG, f"{start:.4f}+{end - start:.4f}*({eased(lt)})", f"{pop_a}*(1-{settle})", True, False, 0),
+                (WATERMARK_BOTTOM_PNG, "0", settle, False, True, 0),
+                (OUTRO_MADE_PNG, "0", ramp(WATERMARK_MADE_AT, WATERMARK_MADE_S), False, False, made_dy),
+            ]
+            for li, (png, shift, alpha, popped, sweep, dy) in enumerate(layers):
                 inputs += ["-loop", "1", "-framerate", "30", "-i", png]
+                sx, sy = at_size if popped else ("X", "Y")
+                chan = {ch: f"{ch}({sx},{sy})" for ch in "rgb"}
+                if sweep:
+                    chan = {ch: f"{v}+({to}-{v})*{band}" for (ch, v), to in zip(chan.items(), (200, 255, 30))}
+                geq = ":".join(f"{ch}='{_esc_expr(v)}'" for ch, v in chan.items())
+                a_expr = _esc_expr(f"alpha({sx},{sy})*{alpha}*{out}")
                 fp.append(f"[{next_input}:v]scale={wm_w}:-2:flags=lanczos,format=rgba,colorchannelmixer=aa={WATERMARK_OPACITY},"
-                          f"fade=t=in:st={fade_at:.3f}:d={fade_s:.3f}:alpha=1,geq={tint}:a='alpha(X,Y)'[vwml{li}]")
+                          f"geq={geq}:a='{a_expr}'[vwml{li}]")
                 next_input += 1
-                x = _esc_expr(f"{wm_x}+{shift}*{wm_w}*{rest}")
-                fp.append(f"{cur}[vwml{li}]overlay=x='{x}':y=H-h-{wm_b}:eval=frame:shortest=1:format=auto[vwm{li}]")
+                x = _esc_expr(f"{wm_x}+({shift})*{wm_w}")
+                fp.append(f"{cur}[vwml{li}]overlay=x='{x}':y=H-{mark_h + wm_b + dy}:eval=frame:shortest=1:format=auto[vwm{li}]")
                 cur = f"[vwm{li}]"
 
         # ── Free plan: a 3 s end card after the clip ───────────────────────────
@@ -2474,7 +2523,8 @@ def main(
             cards = [
                 (OUTRO_MADE_PNG, 0.0, 0.05, 0.4, made_y, False),
                 (WATERMARK_TEXT_PNG, -0.0953, 0.85, 0.35, oy, True),
-                (WATERMARK_LOGO_PNG, 0.3503, 0.25, 0.35, oy, True),
+                (WATERMARK_TOP_PNG, 0.3503, 0.25, 0.35, oy, True),
+                (WATERMARK_BOTTOM_PNG, 0.3503, 0.25, 0.35, oy, True),
             ]
             ocur = "[ob0]"
             for ci, (png, shift, f_at, f_s, y, sweep) in enumerate(cards):
