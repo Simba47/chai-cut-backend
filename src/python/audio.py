@@ -140,8 +140,12 @@ def _between(ranges_ms) -> str:
     return "+".join(f"between(t,{a / 1000:.3f},{b / 1000:.3f})" for a, b in ranges_ms)
 
 
+# A part's speed range (the editor's Speed, as render.py)
+SPEED_MIN, SPEED_MAX = 0.1, 10.0
+
+
 def _part_speed(seg: dict) -> float:
-    """A part's speed (the editor's Speed): 0.25 to 4, else 1 — only a part of the main video has one."""
+    """A part's speed (the editor's Speed): SPEED_MIN to SPEED_MAX, else 1 — only a part of the main video has one."""
     box = (seg.get("crop_boxes") or [{}])[0] or {}
     if seg.get("inserted") or box.get("source_video_id") or str(seg.get("layout", "")).startswith("frame_"):
         return 1.0
@@ -149,11 +153,11 @@ def _part_speed(seg: dict) -> float:
         v = float(seg.get("speed") or 1)
     except (TypeError, ValueError):
         return 1.0
-    return v if 0.25 <= v <= 4 else 1.0
+    return v if SPEED_MIN <= v <= SPEED_MAX else 1.0
 
 
 def _atempo_chain(speed: float) -> str:
-    """ffmpeg's atempo takes 0.5–2 at a time: 4× is 2 · 2, 0.25× is 0.5 · 0.5 (the voice's pitch is kept)"""
+    """ffmpeg's atempo takes 0.5–2 at a time: 4× is 2 · 2, 0.25× is 0.5 · 0.5, 10× is 2 · 2 · 2 · 1.25 (the voice's pitch is kept)"""
     parts: list[str] = []
     s = speed
     while s > 2.0 + 1e-9:

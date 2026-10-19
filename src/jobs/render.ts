@@ -542,8 +542,10 @@ export function insertSpans(segments: Row[], mainVideoId: string): InsertSpan[] 
 /** A stretch of the timeline [at, at + ms): the main video from `from` on, or held at `hold` (clip ms) */
 /** `speed` (1 when not given): the piece's `ms` of timeline plays `ms · speed` of the main video */
 export type Piece = { at: number; ms: number; from?: number; hold?: number; speed?: number }
-/** A part's speed (the editor's Speed): 0.25 to 4, else 1 */
-export const rowSpeed = (s: Row) => { const v = Number(s.speed); return isFinite(v) && v >= 0.25 && v <= 4 ? v : 1 }
+/** A part's speed range (the editor's Speed, lib/shared/constants.ts SPEED_MIN / SPEED_MAX; python/render.py too) */
+export const SPEED_MIN = 0.1, SPEED_MAX = 10
+/** A part's speed (the editor's Speed): SPEED_MIN to SPEED_MAX, else 1 */
+export const rowSpeed = (s: Row) => { const v = Number(s.speed); return isFinite(v) && v >= SPEED_MIN && v <= SPEED_MAX ? v : 1 }
 
 /**
  * The clip's pieces from its saved rows (as the editor's piecesOf): a video put in between holds

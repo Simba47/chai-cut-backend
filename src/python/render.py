@@ -768,7 +768,7 @@ _SMOOTH_FPS: list = []
 
 
 def _smooth_fps() -> str:
-    """The frame rate smooth slow motion fills in to: the clip's own (set by the render), else 30."""
+    """The frame rate a part at another speed keeps (smooth slow motion fills in to it): the clip's own (set by the render), else 30."""
     return _SMOOTH_FPS[0] if _SMOOTH_FPS else "30"
 
 
@@ -825,13 +825,17 @@ WATERMARK_OUT_S = 0.6
 WATERMARK_LOOP_S = 9.1
 
 
+# A part's speed range (the editor's Speed, lib/shared/constants.ts SPEED_MIN / SPEED_MAX)
+SPEED_MIN, SPEED_MAX = 0.1, 10.0
+
+
 def _seg_speed(seg: dict) -> float:
-    """A part's speed (the editor's Speed): 0.25 to 4, else 1. Only parts of the main video have one."""
+    """A part's speed (the editor's Speed): SPEED_MIN to SPEED_MAX, else 1. Only parts of the main video have one."""
     try:
         v = float(seg.get("speed") or 1)
     except (TypeError, ValueError):
         return 1.0
-    return v if 0.25 <= v <= 4 else 1.0
+    return v if SPEED_MIN <= v <= SPEED_MAX else 1.0
 
 
 def _transition_joins(segments: list[dict], transitions: list[dict]) -> list[tuple[str, float] | None]:
@@ -1543,8 +1547,9 @@ def main(
     # (videos put in between: the main video waits during each, so after one it is behind the
     # clip's own time — render.ts sets each part's video_offset_ms; a filled part gets it here)
     _inserts = spec.get("pieces") or []
-    # (smooth slow motion fills in to the clip's own frame rate)
-    _SMOOTH_FPS[:] = [f"{_probe_fps(video_path):.3f}"] if any(_s.get("smooth") and _seg_speed(_s) < 1 for _s in segments) else []
+    # (a part at another speed keeps the clip's own frame rate: smooth slow motion fills in to it,
+    # the others repeat or skip frames to it)
+    _SMOOTH_FPS[:] = [f"{_probe_fps(video_path):.3f}"] if any(_seg_speed(_s) != 1 for _s in segments) else []
 
     def _video_at(t: int) -> int:
         # (render.ts's pieces: each a stretch of the timeline, the main video from `from`, or held at `hold`)
@@ -2128,6 +2133,10 @@ def main(
                     speed_f = f"setpts=PTS/{seg_speed:.6f},"
                     if seg_smooth:
                         speed_f += f"minterpolate=fps={_smooth_fps()}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,setpts=PTS-STARTPTS,"
+                    else:
+                        # (the clip's own frame rate: a 10x part isn't written at 10x the frames a
+                        # second, nor a 0.1x one at a tenth — frames skipped or held instead)
+                        speed_f += f"fps={_smooth_fps()},"
                     speed_f += f"trim=duration={dur_ms / 1000.0 + x_h + x_t:.3f},setpts=PTS-STARTPTS,"
                 # (smooth slow motion reads a little past the part's end: the in-between frames
                 # would otherwise end a few frames short of its length)
