@@ -772,26 +772,34 @@ def _smooth_fps() -> str:
     return _SMOOTH_FPS[0] if _SMOOTH_FPS else "30"
 
 
-# The Free-plan watermark (the Shortcut logo + name, no background): its width, the gap from the right edge and from the
-# bottom, as shares of the frame, and its opacity. The bottom gap lifts it above where captions sit
-# (their middle is at 84% of the height) and the platforms' own caption area. The editor's preview
-# uses the same numbers (components/editor/watermark.ts).
+# The Free-plan watermark ("MADE WITH" over the Shortcut logo + name, no background): its width,
+# where it sits and its opacity, as shares of the frame. Top left, below the apps' own top bar: the
+# right side and the bottom of a Reel / TikTok / Short are under the apps' buttons and caption. A
+# soft shadow under it keeps it readable on bright video. The editor's preview uses the same
+# numbers (components/editor/watermark.ts).
 _ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 # Layers of the mark (each the whole mark's size, transparent elsewhere): the S logo's top and bottom
 # halves, the word
 WATERMARK_TOP_PNG = os.path.join(_ASSETS, "watermark_logo_top.png")
 WATERMARK_BOTTOM_PNG = os.path.join(_ASSETS, "watermark_logo_bottom.png")
 WATERMARK_TEXT_PNG = os.path.join(_ASSETS, "watermark_text.png")
+# "MADE WITH" over it: 641 x 120, its letters (y 43-77) starting where the word does
+WATERMARK_MADE_PNG = os.path.join(_ASSETS, "watermark_made.png")
 # The Free plan's end card: OUTRO_S s after the clip, the mark large in the middle (OUTRO_WIDTH of
 # the frame) with "MADE WITH" above it, on the brand's near-black
 OUTRO_MADE_PNG = os.path.join(_ASSETS, "outro_made.png")
 OUTRO_S = 3.0
 OUTRO_WIDTH = 0.62
 OUTRO_BG = "0x0b0b0c"
-WATERMARK_WIDTH = 0.28
-WATERMARK_RIGHT = 0.04
-WATERMARK_BOTTOM = 0.22
+WATERMARK_WIDTH = 0.22
+# (the left of the S from the frame's left; the top of "MADE WITH" from the frame's top)
+WATERMARK_LEFT = 0.05
+WATERMARK_TOP = 0.12
 WATERMARK_OPACITY = 0.9
+# The shadow: black at this opacity, blurred (sigma) and dropped by these shares of the mark's width
+WATERMARK_SHADOW_A = 0.55
+WATERMARK_SHADOW_BLUR = 0.014
+WATERMARK_SHADOW_Y = 0.008
 # It plays in a loop of WATERMARK_LOOP_S s (the times below are into each loop), as the sign-in page's
 # heading does (components/auth/AuthSlider.tsx PanelTitle): the S pops in at the word's middle (grows
 # from POP_FROM with a little overshoot, over POP_S), then from SPLIT_AT, over SPLIT_S, it splits: its
@@ -810,8 +818,8 @@ WATERMARK_MADE_AT = 1.6
 WATERMARK_MADE_S = 0.4
 WATERMARK_S_CX, WATERMARK_S_CY = 97 / 641, 115 / 216
 WATERMARK_WORD_CX, WATERMARK_WORD_HALF = 382 / 641, 230 / 641
-# "MADE WITH" (assets/outro_made.png, the mark's width, its letters in the middle) has its top this
-# share of the mark's width above the mark's top: its letters end just above the S
+# "MADE WITH" (WATERMARK_MADE_PNG, the mark's width) has its top this share of the mark's width above
+# the mark's top: its letters end just above the S
 WATERMARK_MADE_RISE = 0.08
 # While it is all in, from SHINE_AT, SHINE_N times every SHINE_EVERY s a lime light sweeps across the
 # logo and name (left to right, SHINE_S s): the white letters light up lime as it passes
@@ -2451,14 +2459,17 @@ def main(
         # preview plays the same: components/editor/watermark.ts). A Free export is never delivered
         # without it: if the image is missing the render stops with an error.
         if watermark:
-            for _p in (WATERMARK_TOP_PNG, WATERMARK_BOTTOM_PNG, WATERMARK_TEXT_PNG, OUTRO_MADE_PNG):
+            for _p in (WATERMARK_TOP_PNG, WATERMARK_BOTTOM_PNG, WATERMARK_TEXT_PNG, WATERMARK_MADE_PNG):
                 if not os.path.isfile(_p):
                     raise RuntimeError(f"The Free-plan watermark image is missing: {_p}")
             wm_w = max(2, int(round(out_w * WATERMARK_WIDTH)) // 2 * 2)
-            wm_x = out_w - wm_w - int(round(out_w * WATERMARK_RIGHT))
-            wm_b = int(round(out_h * WATERMARK_BOTTOM))
-            mark_h = int(round(wm_w * 216 / 641)) // 2 * 2          # (the mark's layers are 641 x 216)
+            # (the layers are 641 wide: the S starts at 39, "MADE WITH"'s letters at y 43)
+            wm_x = int(round(out_w * WATERMARK_LEFT)) - int(round(wm_w * 39 / 641))
             made_dy = int(round(wm_w * WATERMARK_MADE_RISE))
+            made_y = int(round(out_h * WATERMARK_TOP)) - int(round(wm_w * 43 / 641))
+            mark_y = made_y + made_dy
+            sh_sigma = max(1.0, wm_w * WATERMARK_SHADOW_BLUR)
+            sh_dy = max(1, int(round(wm_w * WATERMARK_SHADOW_Y)))
             # (time into the loop: for the moves (t) and for the pictures' own clocks (T))
             lt, lT = f"mod(t,{WATERMARK_LOOP_S})", f"mod(T,{WATERMARK_LOOP_S})"
 
@@ -2485,16 +2496,16 @@ def main(
                     f"*max(0,1-abs(X-0.25*Y-(-0.25+1.5*{ph}/{WATERMARK_SHINE_S})*W)/(0.22*W))")
             settle = ramp(WATERMARK_SETTLE_AT, WATERMARK_SETTLE_S)
             # (picture, x shift (an expression of t, a share of the mark's width), opacity, drawn at
-            #  the pop's size, in the light, height above the mark)
+            #  the pop's size, in the light, its top)
             layers = [
                 # the word, opening from its middle as the halves part
-                (WATERMARK_TEXT_PNG, "0", f"lte(abs(X-{WATERMARK_WORD_CX:.4f}*W),({eased(lT)})*{WATERMARK_WORD_HALF:.4f}*W)", False, True, 0),
-                (WATERMARK_TOP_PNG, f"{start:.4f}*(1-({eased(lt)}))", pop_a, True, True, 0),
-                (WATERMARK_BOTTOM_PNG, f"{start:.4f}+{end - start:.4f}*({eased(lt)})", f"{pop_a}*(1-{settle})", True, False, 0),
-                (WATERMARK_BOTTOM_PNG, "0", settle, False, True, 0),
-                (OUTRO_MADE_PNG, "0", ramp(WATERMARK_MADE_AT, WATERMARK_MADE_S), False, False, made_dy),
+                (WATERMARK_TEXT_PNG, "0", f"lte(abs(X-{WATERMARK_WORD_CX:.4f}*W),({eased(lT)})*{WATERMARK_WORD_HALF:.4f}*W)", False, True, mark_y),
+                (WATERMARK_TOP_PNG, f"{start:.4f}*(1-({eased(lt)}))", pop_a, True, True, mark_y),
+                (WATERMARK_BOTTOM_PNG, f"{start:.4f}+{end - start:.4f}*({eased(lt)})", f"{pop_a}*(1-{settle})", True, False, mark_y),
+                (WATERMARK_BOTTOM_PNG, "0", settle, False, True, mark_y),
+                (WATERMARK_MADE_PNG, "0", ramp(WATERMARK_MADE_AT, WATERMARK_MADE_S), False, False, made_y),
             ]
-            for li, (png, shift, alpha, popped, sweep, dy) in enumerate(layers):
+            for li, (png, shift, alpha, popped, sweep, ly) in enumerate(layers):
                 inputs += ["-loop", "1", "-framerate", "30", "-i", png]
                 sx, sy = at_size if popped else ("X", "Y")
                 chan = {ch: f"{ch}({sx},{sy})" for ch in "rgb"}
@@ -2503,10 +2514,13 @@ def main(
                 geq = ":".join(f"{ch}='{_esc_expr(v)}'" for ch, v in chan.items())
                 a_expr = _esc_expr(f"alpha({sx},{sy})*{alpha}*{out}")
                 fp.append(f"[{next_input}:v]scale={wm_w}:-2:flags=lanczos,format=rgba,colorchannelmixer=aa={WATERMARK_OPACITY},"
-                          f"geq={geq}:a='{a_expr}'[vwml{li}]")
+                          f"geq={geq}:a='{a_expr}',split[vwml{li}][vwms{li}]")
+                # (its shadow: the layer in black, softened, a little lower — under it)
+                fp.append(f"[vwms{li}]colorchannelmixer=rr=0:gg=0:bb=0:aa={WATERMARK_SHADOW_A},gblur=sigma={sh_sigma:.2f}[vwmsh{li}]")
                 next_input += 1
                 x = _esc_expr(f"{wm_x}+({shift})*{wm_w}")
-                fp.append(f"{cur}[vwml{li}]overlay=x='{x}':y=H-{mark_h + wm_b + dy}:eval=frame:shortest=1:format=auto[vwm{li}]")
+                fp.append(f"{cur}[vwmsh{li}]overlay=x='{x}':y={ly + sh_dy}:eval=frame:shortest=1:format=auto[vwmb{li}]")
+                fp.append(f"[vwmb{li}][vwml{li}]overlay=x='{x}':y={ly}:eval=frame:shortest=1:format=auto[vwm{li}]")
                 cur = f"[vwm{li}]"
 
         # ── Free plan: a 3 s end card after the clip ───────────────────────────
