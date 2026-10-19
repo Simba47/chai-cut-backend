@@ -11,6 +11,7 @@ import { findClips, type FoundClip } from '../lib/clipFinder.js'
 import { askGemini } from '../lib/gemini.js'
 import { findLoops } from '../lib/transcriptGuard.js'
 import { generateClipText, fontForText, type ClipText, type ClipTextLanguage } from '../lib/clipText.js'
+import { fitInRoom, minWidthFor, sideBySideRooms, steadyRoom } from '../lib/framingRoom.js'
 import { loadClipBrand, logoSpan, brandCaptionRow, type ClipBrand } from '../lib/brandKit.js'
 import { brollEnabled, pickBrollMoments, searchStock, downloadStock, withBroll } from '../lib/broll.js'
 import { findVisuals, describeVisuals, pickVisualMoments, detectPanels, refinePanels, type Visual, type VisualMoment, type Panel } from '../lib/visuals.js'
@@ -861,13 +862,19 @@ export function planShotReactions(shots: PersonShot[], speech: SpokenWord[]): Re
   return windows.sort((a, b) => a.start_ms - b.start_ms)
 }
 
-/** Crop for one person in a split (1080×960) or trio (1080×640) slot, in the slot's own shape */
-function personCrop(layout: 'split' | 'trio', cx: number, cy: number, reelW: number): Omit<SlotKf, 't_ms'> {
+/** How wide a one-person split / trio crop is, unless the people beside them leave less room (lib/framingRoom.ts) */
+const PERSON_W = { split: 0.34, trio: 0.4 } as const
+
+/**
+ * Crop for one person in a split (1080×960) or trio (1080×640) slot, in the slot's own shape.
+ * `room`: a narrower width and a sideways shift, so the box doesn't reach the people beside them.
+ */
+function personCrop(layout: 'split' | 'trio', cx: number, cy: number, reelW: number, room?: { w: number; shift: number } | null): Omit<SlotKf, 't_ms'> {
   const sourceAR = (9 / 16) / reelW
   // A trio slot is short: a little wider, with the face in the middle, so heads aren't cut off
-  const w = layout === 'trio' ? 0.4 : 0.34
+  const w = room?.w ?? PERSON_W[layout]
   const h = Math.min(1, w / ((layout === 'trio' ? 1080 / 640 : 1080 / 960) / sourceAR))
-  return { w, h, x: Math.max(0, Math.min(1 - w, cx - w / 2)), y: Math.max(0, Math.min(1 - h, cy - h * (layout === 'trio' ? 0.5 : 0.42))) }
+  return { w, h, x: Math.max(0, Math.min(1 - w, cx + (room?.shift ?? 0) - w / 2)), y: Math.max(0, Math.min(1 - h, cy - h * (layout === 'trio' ? 0.5 : 0.42))) }
 }
 
 /**
@@ -1030,8 +1037,20 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number, op
   }
   // One person per slot (reaction split 1080×960, trio 1080×640), cut to the slot's shape so
   // nothing is trimmed at export and no neighbour spills in (see personCrop)
-  const personKf = (layout: Layout, t_ms: number, cx: number, cy: number): SlotKf =>
-    ({ t_ms, ...personCrop(layout === 'trio' ? 'trio' : 'split', cx, cy, reelW) })
+  const personKf = (layout: Layout, t_ms: number, cx: number, cy: number, room?: { w: number; shift: number } | null): SlotKf =>
+    ({ t_ms, ...personCrop(layout === 'trio' ? 'trio' : 'split', cx, cy, reelW, room) })
+  /**
+   * One steady width and shift for a person's box over a stretch of frames, so it stops short of
+   * the people beside them (lib/framingRoom.ts): `at(i)` is where that person is in frame i
+   */
+  const personRoom = (frames: FrameDetection[], at: (i: number) => number | null, layout: Layout) => steadyRoom(frames.flatMap((f, i) => {
+    const cx = at(i)
+    const faces = f.faces.filter(x => (x.score ?? 0) > 0)
+    if (cx === null || faces.length < 2) return []
+    const own = [...faces].sort((a, b) => Math.abs(a.x + a.w / 2 - cx) - Math.abs(b.x + b.w / 2 - cx))[0]
+    if (Math.abs(own.x + own.w / 2 - cx) > 0.15) return []
+    return [{ cx, own, others: faces.filter(x => x !== own) }]
+  }), PERSON_W[layout === 'trio' ? 'trio' : 'split'])
 
   // Fallback: no frames detected → one centered vertical segment
   if (info.frames.length === 0) {
@@ -1115,11 +1134,17 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number, op
     const sizes = n === 3 ? [1, 1, 1] : n === 4 ? [1, 2, 1] : [Math.floor(n / 3) + (n % 3 > 0 ? 1 : 0), Math.floor(n / 3), 0]
     sizes[2] = n - sizes[0] - sizes[1]
     let k = 0
-    return sizes.map(cnt => {
-      const g = faces.slice(k, k += cnt)
+    const groups = sizes.map(cnt => faces.slice(k, k += cnt)).map(g => {
       const left = Math.min(...g.map(x => x.x)), right = Math.max(...g.map(x => x.x + x.w))
       const faceW = g.reduce((t, x) => t + x.w, 0) / g.length
-      return { cx: (left + right) / 2, w: Math.min(0.6, Math.max(0.18, right - left + 3 * faceW)), cy: g.reduce((t, x) => t + x.y + x.h / 2, 0) / g.length }
+      return { faces: g, cx: (left + right) / 2, want: Math.min(0.6, Math.max(0.18, right - left + 3 * faceW)) }
+    })
+    // Side by side: a close shot's people sit near each other, and boxes sized from their own
+    // faces alone reached over the next person — each is kept to its room (lib/framingRoom.ts)
+    const rooms = sideBySideRooms(groups)
+    return groups.map((g, gi) => {
+      const fit = fitInRoom(g.cx, g.want, rooms[gi], minWidthFor(g.faces))
+      return { cx: g.cx, w: fit.w, x: fit.x, cy: g.faces.reduce((t, x) => t + x.y + x.h / 2, 0) / g.faces.length }
     })
   }
 
@@ -1409,15 +1434,18 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number, op
         const slots = g.frames.map(groupSlots).filter((v): v is NonNullable<typeof v> => !!v)
         if (slots.length) {
           const cxs = median(slots.map(sl => sl[slot].cx)), w = median(slots.map(sl => sl[slot].w)), cy = median(slots.map(sl => sl[slot].cy))
+          // (where its room put it, relative to its people's centre)
+          const shift = median(slots.map(sl => sl[slot].x + sl[slot].w / 2 - sl[slot].cx))
           const a = (1080 / 640) / ((9 / 16) / reelW)   // trio slot shape, in source units
           const h = Math.min(1, w / a)
-          return [{ t_ms: kfTime(g.frames[0], 0), w, h, x: Math.max(0, Math.min(1 - w, cxs - w / 2)), y: Math.max(0, Math.min(1 - h, cy - h * 0.45)) }]
+          return [{ t_ms: kfTime(g.frames[0], 0), w, h, x: Math.max(0, Math.min(1 - w, cxs + shift - w / 2)), y: Math.max(0, Math.min(1 - h, cy - h * 0.45)) }]
         }
       }
       if (slotIdsOf(g.mode)) {
         // A reaction layout: one person per slot, at one height (their median face centre)
         const cy = median(g.frames.map(f => rawCy(f, slot)).filter((v): v is number => v !== null))
-        return g.frames.map((f, i) => personKf(g.layout, kfTime(f, i), cx[i], cy))
+        const room = personRoom(g.frames, i => cx[i], g.layout)
+        return g.frames.map((f, i) => personKf(g.layout, kfTime(f, i), cx[i], cy, room))
       }
       if (g.layout === 'split') {
         // Two people side by side: a tight crop on each (half the frame each would show the
@@ -1428,7 +1456,8 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number, op
         }).filter((v): v is number => v !== null)
         if (cys.length) {
           const cy = median(cys)
-          return g.frames.map((f, i) => personKf('split', kfTime(f, i), cx[i], cy))
+          const room = personRoom(g.frames, i => cx[i], 'split')
+          return g.frames.map((f, i) => personKf('split', kfTime(f, i), cx[i], cy, room))
         }
       }
       return g.frames.map((f, i) => g.layout === 'vertical' ? vertKf(kfTime(f, i), cx[i]) : splitKf(kfTime(f, i), cx[i]))
