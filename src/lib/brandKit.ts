@@ -7,19 +7,18 @@ import db from '../db.js'
  * one. What it puts on each clip mirrors what the frontend puts on a clip made by hand
  * (services/brandKits.ts brandNewClips): its logo where and when the kit says, its caption style
  * when its captions are on, and here also its title style on the hook. Keep the two in step.
+ * (A kit's progress bar and brand voice aren't used any more — user, 2026-10-20: taken out of kits.)
  */
 
 export interface ClipBrand {
+  /** The kit (its brand_kits id): the clip is saved with it switched on (clips.brand) */
+  kit_id?: string
   title: { font: string | null; color: string; size: number }
   /** The caption style fields (null: the kit's captions are off — the job's own style is kept) */
   captions: {
     template: string | null; animation: string; font: string | null; size: number; color: string
     highlight_color: string; uppercase: boolean; words_per_line: number | null
   } | null
-  /** How the AI writes the clip's text (lib/clipText.ts BrandVoice); null: none set */
-  voice: { tone: string; avoid: string; hashtags: string[]; cta: string } | null
-  /** A bar filling up as the clip plays (the clip's progress_bar); null: none */
-  progress: ProgressBar | null
   /** Its logo on the frame (shares of it) and when it shows; null: no logo */
   logo: { path: string; x: number; y: number; w: number; h: number; opacity: number; show: 'all' | 'start' | 'end'; seconds: number } | null
 }
@@ -57,15 +56,7 @@ export function clipBrand(raw: unknown, userId: string): ClipBrand {
       show: (['all', 'start', 'end'] as const).find(s => s === l.show) ?? 'all', seconds: Math.round(num(l.seconds, 1, 15, 3)),
     }
   }
-  const p = (d.progress && typeof d.progress === 'object' ? d.progress : {}) as Record<string, unknown>
-  const v = (d.voice && typeof d.voice === 'object' ? d.voice : {}) as Record<string, unknown>
-  const txt = (x: unknown, max: number) => (typeof x === 'string' ? x.slice(0, max) : '')
-  const voice = {
-    tone: txt(v.tone, 200), avoid: txt(v.avoid, 200), cta: txt(v.cta, 120),
-    hashtags: (Array.isArray(v.hashtags) ? v.hashtags : []).map(h => txt(h, 40).replace(/^#+/, '').replace(/\s+/g, '')).filter(Boolean).slice(0, 5),
-  }
   return {
-    voice: voice.tone || voice.avoid || voice.cta || voice.hashtags.length ? voice : null,
     title: { font: typeof t.font === 'string' && t.font.length <= 60 ? t.font : null, color: color(t.color, '#ffffff'), size: Math.round(num(t.size, 24, 160, 64)) },
     captions: c.on === true ? {
       template: typeof c.template === 'string' && c.template.length <= 60 ? c.template : null,
@@ -77,7 +68,6 @@ export function clipBrand(raw: unknown, userId: string): ClipBrand {
       uppercase: c.uppercase === true,
       words_per_line: typeof c.words_per_line === 'number' ? Math.round(num(c.words_per_line, 1, 10, 3)) : null,
     } : null,
-    progress: p.on === true ? cleanProgressBar(p) : null,
     logo,
   }
 }
@@ -97,11 +87,11 @@ export async function loadClipBrand(userId: string, choice: string | undefined):
   if (choice === 'none') return null
   try {
     const [row] = choice && /^[0-9a-f-]{36}$/i.test(choice)
-      ? await db<{ data: unknown; user_id: string }[]>`
-          SELECT bk.data, bk.user_id FROM brand_kits bk WHERE bk.id = ${choice}
+      ? await db<{ id: string; data: unknown; user_id: string }[]>`
+          SELECT bk.id, bk.data, bk.user_id FROM brand_kits bk WHERE bk.id = ${choice}
             AND (bk.user_id = ${userId} OR EXISTS (SELECT 1 FROM brand_kit_shares s WHERE s.kit_id = bk.id AND s.user_id = ${userId}))`
-      : await db<{ data: unknown; user_id: string }[]>`SELECT data, user_id FROM brand_kits WHERE user_id = ${userId} AND (data->>'is_default')::boolean LIMIT 1`
-    return row ? clipBrand(row.data, row.user_id) : null
+      : await db<{ id: string; data: unknown; user_id: string }[]>`SELECT id, data, user_id FROM brand_kits WHERE user_id = ${userId} AND (data->>'is_default')::boolean LIMIT 1`
+    return row ? { ...clipBrand(row.data, row.user_id), kit_id: row.id } : null
   } catch (e) {
     // (no brand_kits table yet, or the database hiccuped: the clips are made without a kit)
     console.warn('[brand] the brand kit could not be read:', e instanceof Error ? e.message : e)

@@ -163,6 +163,11 @@ def _num(v) -> float | None:
 def adjust_free_areas(layout: str, areas: list[dict], frame: dict | None) -> list[dict]:
     """A free frame's areas (shares of the frame) as its bars and moved area set them. Mirrors adjustFreeAreas() in the editor."""
     frame = frame or {}
+    # A Branded card with its own look (frame.card): its areas from that look
+    if layout == "frame_brand_card":
+        look = card_look(frame)
+        if look:
+            return card_areas(look)
     out = [dict(a) for a in areas]
     bar, bar2, mv = FREE_BARS.get(layout), FREE_BARS2.get(layout), FREE_MOVABLE.get(layout)
 
@@ -207,6 +212,124 @@ def adjust_free_areas(layout: str, areas: list[dict], frame: dict | None) -> lis
             a["y"] = min(1 - h, max(0.0, a["y"] if y is None else y))
             a["w"], a["h"] = w, h
     return out
+
+
+# ── The Branded card's look (frame.card) ─────────────────────────────────────
+# Mirrors the editor's lib/shared/brandCard.ts: cardAreas ↔ card_areas, cardPatternHit /
+# cardBackgroundPixels ↔ card_bg_filter. Keep them identical. Shares of the frame; pattern sizes
+# px at 1080 wide.
+_CARD_PATTERNS = ("dots", "grid", "stripes", "checker", "waves")
+_CARD_VIDEO_RATIO = 0.6 / 0.88
+_CARD_TITLE_H, _CARD_HANDLE_H, _CARD_TITLE_GAP, _CARD_HANDLE_GAP, _CARD_STACK_GAP = 0.15, 0.1, 0.01, 0.02, 0.005
+
+
+def _card_num(v, lo: float, hi: float, fallback: float) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return fallback
+    return min(hi, max(lo, f)) if f == f and abs(f) != float("inf") else fallback
+
+
+def clean_background(raw, default_color: str = "#000000") -> dict:
+    """A background (frame.bg, or a card look's) made safe (the editor's cleanFrameBackground)"""
+    bg = raw if isinstance(raw, dict) else {}
+    col = lambda c, f: c.lower() if isinstance(c, str) and len(c) == 7 and c.startswith("#") else f
+    return {
+        "style": bg.get("style") if bg.get("style") in ("solid", "gradient", "pattern") else "solid",
+        "color": col(bg.get("color"), default_color),
+        "color2": col(bg.get("color2"), "#2e2e3a"),
+        "direction": "diagonal" if bg.get("direction") == "diagonal" else "down",
+        "pattern": bg.get("pattern") if bg.get("pattern") in _CARD_PATTERNS else "dots",
+        "scale": round(_card_num(bg.get("scale"), 16, 160, 48)),
+    }
+
+
+def frame_background(layout: str, frame: dict | None) -> dict | None:
+    """
+    The background a frame section shows when it has its own (the editor's frameBackgroundOf): its
+    own (frame.bg), else a Branded card's look's; None = as the template has it (band colour, black, blur)
+    """
+    if layout == "frame_blur_fill":
+        return None
+    f = frame or {}
+    if isinstance(f.get("bg"), dict):
+        return clean_background(f["bg"])
+    look = card_look(f) if layout == "frame_brand_card" else None
+    return look["bg"] if look else None
+
+
+def card_look(frame: dict | None) -> dict | None:
+    """A Branded card section's look (frame.card) made safe; None when it has none (the template's own look)"""
+    raw = (frame or {}).get("card")
+    if not isinstance(raw, dict):
+        return None
+    v = raw.get("video") if isinstance(raw.get("video"), dict) else {}
+    return {
+        "bg": clean_background(raw.get("bg"), "#1c1c22"),
+        "video": {
+            "width": round(_card_num(v.get("width"), 0.5, 1, 0.88) * 1000) / 1000,
+            "y": round(_card_num(v.get("y"), 0, 1, 0.51) * 1000) / 1000,
+            "corners": round(_card_num(v.get("corners"), 0, 100, 50)),
+        },
+        "title_at": "bottom" if raw.get("title_at") == "bottom" else "top",
+        "handle_at": "top" if raw.get("handle_at") == "top" else "bottom",
+    }
+
+
+def card_areas(look: dict) -> list[dict]:
+    """Where the card's title, video and @handle go (the editor's cardAreas: the same numbers)"""
+    vw = min(1.0, max(0.5, look["video"]["width"]))
+    vh = vw * _CARD_VIDEO_RATIO
+    vx = (1 - vw) / 2
+    cy = min(1 - vh / 2, max(vh / 2, look["video"]["y"]))
+    vy = cy - vh / 2
+    inside = lambda y, h: min(1 - h, max(0.0, y))
+    ty = inside(vy - _CARD_TITLE_GAP - _CARD_TITLE_H if look["title_at"] == "top" else vy + vh + _CARD_TITLE_GAP, _CARD_TITLE_H)
+    if look["handle_at"] == look["title_at"]:
+        hy = ty - _CARD_STACK_GAP - _CARD_HANDLE_H if look["handle_at"] == "top" else ty + _CARD_TITLE_H + _CARD_STACK_GAP
+    else:
+        hy = vy - _CARD_HANDLE_GAP - _CARD_HANDLE_H if look["handle_at"] == "top" else vy + vh + _CARD_HANDLE_GAP
+    return [
+        {"kind": "band", "lane": "band", "x": 0.06, "y": ty, "w": 0.88, "h": _CARD_TITLE_H, "bg": "none"},
+        {"kind": "slot", "slot": 0, "x": vx, "y": vy, "w": vw, "h": vh, "radius": round(look["video"]["corners"] * 0.8)},
+        {"kind": "band", "lane": "band2", "x": 0.06, "y": inside(hy, _CARD_HANDLE_H), "w": 0.88, "h": _CARD_HANDLE_H, "bg": "none", "size": 40},
+    ]
+
+
+def card_bg_filter(look: dict, w: int, h: int, dur_s: float, lbl: str) -> str | None:
+    """A Branded card's background (bg_filter of its look's)"""
+    return bg_filter(look["bg"], w, h, dur_s, lbl)
+
+
+def bg_filter(bg: dict, w: int, h: int, dur_s: float, lbl: str) -> str:
+    """
+    A frame background (clean_background), w × h for dur_s, as one ffmpeg filter chain ending in
+    `lbl`: a plain colour, or a gradient / pattern drawn once (geq on a single frame, then held).
+    The editor's backgroundPixels: the same formulas.
+    """
+    if bg["style"] == "solid":
+        return f"color=c=0x{bg['color'][1:]}:s={w}x{h}:d={dur_s:.3f}:r=30,format=yuv420p,setsar=1{lbl}"
+    a = [int(bg["color"][i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(bg["color2"][i:i + 2], 16) for i in (1, 3, 5)]
+    u, v = "(X*1080/W)", "(Y*1080/W)"
+    if bg["style"] == "gradient":
+        s = "((X/W+Y/H)/2)" if bg["direction"] == "diagonal" else "(Y/H)"
+        chans = [f"{a[i]}+({b[i] - a[i]})*{s}" for i in range(3)]
+    else:
+        p = float(bg["scale"])
+        hit = {
+            "dots": f"lt(hypot(mod({u},{p})-{p / 2},mod({v},{p})-{p / 2}),{p * 0.18})",
+            "grid": f"gt(lt(mod({u},{p}),{max(2.0, p * 0.06)})+lt(mod({v},{p}),{max(2.0, p * 0.06)}),0)",
+            "stripes": f"lt(mod({u}+{v},{p}),{p * 0.3})",
+            "checker": f"gte(mod(floor({u}/{p})+floor({v}/{p}),2),1)",
+            "waves": f"lt(mod({v}+sin({u}/{p}*2*PI)*{p * 0.25},{p}),{max(2.0, p * 0.12)})",
+        }[bg["pattern"]]
+        chans = [f"if({hit},{b[i]},{a[i]})" for i in range(3)]
+    # (commas inside the expressions are escaped for the filtergraph)
+    return (f"color=c=black:s={w}x{h}:d=0.04:r=25,format=rgb24,"
+            f"geq=r='{chans[0]}':g='{chans[1]}':b='{chans[2]}',"
+            f"loop=loop=-1:size=1:start=0,trim=duration={dur_s:.3f},setpts=PTS-STARTPTS,fps=30,format=yuv420p,setsar=1{lbl}")
 
 
 def frame_areas(layout: str, out_w: int, out_h: int, show_band: bool = True, custom: list[float] | None = None,

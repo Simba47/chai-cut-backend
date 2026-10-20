@@ -1712,7 +1712,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       await new Promise(r => setTimeout(r, (i % 4) * 250)) // spread the calls a little
       try {
         const said = words.filter(w => w.start_ms >= h.start_ms && w.start_ms < h.end_ms)
-        return await generateClipText(said, video.title ?? null, prompt => askGemini(prompt), titleLanguageFor(payload.title_language, said), brand?.voice ?? null)
+        return await generateClipText(said, video.title ?? null, prompt => askGemini(prompt), titleLanguageFor(payload.title_language, said), null)
       } catch (e) {
         console.warn(`[ai_edit] clip text failed for ${h.start_ms}-${h.end_ms}:`, e instanceof Error ? e.message : e)
         return null
@@ -1894,8 +1894,8 @@ async function saveClip(
           ${font}, ${brand ? brand.title.size : 76}, ${brand ? brand.title.color : '#FFFFFF'})
       `
     }
-    // The brand kit's progress bar
-    if (brand?.progress) await tx`UPDATE clips SET progress_bar = ${tx.json(brand.progress as never)} WHERE id = ${clipId}`
+    // Saved with its brand kit switched on (the editor's Brand kit switch; nothing to put back when it's switched off)
+    if (brand?.kit_id) await tx`UPDATE clips SET brand = ${tx.json({ kit_id: brand.kit_id, before: null } as never)} WHERE id = ${clipId}`
     // The brand kit's logo, where and when the kit says
     if (brand?.logo) {
       const [from, to] = logoSpan(brand.logo, highlight.end_ms - highlight.start_ms)

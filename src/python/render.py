@@ -25,7 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges, heard_speech_ranges
 import emoji as emoji_art   # colour emoji (Twemoji 17), drawn locally
-from frames import is_frame, row_heights, row_order, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base, BLUR_SOURCE_SLOT, shown_main_slots
+from frames import is_frame, row_heights, row_order, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base, BLUR_SOURCE_SLOT, shown_main_slots, frame_background, bg_filter
 
 # ── Quality presets (identical to previous version) ───────────────────────────
 _QUALITY: dict[int, dict] = {
@@ -1048,6 +1048,27 @@ def _display_size(path: str) -> tuple[int, int] | None:
 def _filter_path(p: str) -> str:
     """A file path as a quoted filter option (forward slashes; ':' still escaped inside the quotes)."""
     return "'" + p.replace("\\", "/").replace(":", "\\:").replace("'", "") + "'"
+
+
+def _box_alpha_png(tmp: str, w: int, h: int, x: int, y: int, bw: int, bh: int, r: int) -> str:
+    """
+    A w×h grey mask: white inside a rounded box at (x, y) sized bw×bh with corner radius r, black
+    outside — as an alpha mask it keeps the box and makes the rest see-through. Drawn at twice the
+    size and scaled down (as _box_mask); made once per shape.
+    """
+    path = os.path.join(tmp, f"boxa_{w}x{h}_{x}_{y}_{bw}x{bh}_{r}.png")
+    if os.path.exists(path):
+        return path
+    W, H, X0, Y0, X1, Y1, R = w * 2, h * 2, x * 2, y * 2, (x + bw) * 2, (y + bh) * 2, r * 2
+    dx = f"max(max({X0 + R}-X\\,X-{X1 - 1 - R})\\,0)"
+    dy = f"max(max({Y0 + R}-Y\\,Y-{Y1 - 1 - R})\\,0)"
+    inside = (f"lte({dx}*{dx}+{dy}*{dy}\\,{R * R})*gte(X\\,{X0})*lt(X\\,{X1})*gte(Y\\,{Y0})*lt(Y\\,{Y1})")
+    vf = f"format=gray,geq=lum=255*{inside},scale={w}:{h}:flags=area"
+    res = subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"color=c=black:s={W}x{H}:d=1",
+                          "-vf", vf, "-frames:v", "1", path], capture_output=True, text=True)
+    if res.returncode != 0 or not os.path.exists(path):
+        raise RuntimeError(f"box alpha mask failed: {res.stderr[-400:]}")
+    return path
 
 
 def _box_mask(tmp: str, w: int, h: int, x: int, y: int, bw: int, bh: int, r: int) -> str:
@@ -2093,9 +2114,11 @@ def main(
                 if base_off is None:
                     base_off = first_box.get("source_offset_ms") if first_box and first_box.get("source_offset_ms") is not None else smss
 
-                # Underneath: a blurred copy of the main video (Blur fill), the band's colour, or black
+                # Underneath: a blurred copy of the main video (Blur fill), the frame's own background,
+                # the band's colour, or black
                 frame_lbl = f"[fr{si}base]"
                 base_kind = frame_base(layout)
+                own_bg = frame_background(layout, st)
                 if base_kind == "blur":
                     ts = int(base_off) / 1000.0
                     bw2, bh2 = _even(out_w * 1.1), _even(out_h * 1.1)
@@ -2116,6 +2139,10 @@ def main(
                         fp.append(f"[{bk}b]{start},{blur},setpts=PTS+{rel:.3f}/TB[{bk}c]")
                         fp.append(f"{frame_lbl}[{bk}c]overlay=0:0:eof_action=pass:enable='between(t,{rel:.3f},{rel + d:.3f})'[{bk}o]")
                         frame_lbl = f"[{bk}o]"
+                elif own_bg:
+                    # The frame's own background (frame.bg, or a Branded card's look): a colour, or a
+                    # gradient / pattern drawn once and held
+                    fp.append(bg_filter(own_bg, out_w, out_h, dur_s, frame_lbl))
                 else:
                     canvas(band_bg if base_kind == "band" and band_bg != "none" else "000000", out_w, out_h, frame_lbl)
                 cur_frame = frame_lbl
@@ -2235,6 +2262,25 @@ def main(
                         fp.append(f"{cur_row}{il}overlay=0:0:eof_action=pass:enable='between(t,{rel:.3f},{rel + d:.3f})'{ol}")
                         cur_row = ol
 
+                    # With its own background, a slot showing a video or photo in a rounded or moved box:
+                    # the ring around the box see-through, so the background shows there (the editor
+                    # draws no fill there). The box: the main video's, else the slot's first photo or video's
+                    if own_bg and kind == "slot" and not contain and not area.get("r"):
+                        ring = None
+                        if area["slot"] in main_slots:
+                            ring = media_box((st.get("main_corners") or {}).get(str(area["slot"])), (st.get("main_rects") or {}).get(str(area["slot"])), aw, rh)
+                        else:
+                            first = next((it for it in lane_items(seg, st, area["slot"]) if not it.get("hidden") and it.get("kind") in ("photo", "video")), None)
+                            ring = media_box(first.get("corners"), first.get("rect"), aw, rh) if first else None
+                        if ring and ring[5]:
+                            riw, rih, rpx, rpy, rr2, _ = ring
+                            mask = _box_alpha_png(tmp, aw, rh, rpx, rpy, riw, rih, rr2)
+                            inputs += ["-loop", "1", "-framerate", "30", "-t", f"{dur_s:.3f}", "-i", mask]
+                            fp.append(f"{cur_row}format=rgba[{key}ga]")
+                            fp.append(f"[{next_input}:v]format=gray,setsar=1[{key}gm]")
+                            fp.append(f"[{key}ga][{key}gm]alphamerge[{key}g]")
+                            next_input += 1
+                            cur_row = f"[{key}g]"
                     # A rounded or circle area: its corners see-through (an alpha mask), so what's under shows
                     if area.get("r"):
                         mask = _round_alpha_png(tmp, aw, rh, int(area["r"]))

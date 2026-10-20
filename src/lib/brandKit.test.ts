@@ -64,10 +64,9 @@ test('a kit saved before these settings existed still works (defaults fill the r
   assert.ok(b.logo && b.logo.x < 0.1 && b.logo.y > 0.8, 'bottom left')
 })
 
-test('progress bar: off in the kit gives none; on gives its colour, thickness and edge, made safe', () => {
-  assert.equal(clipBrand({ progress: { on: false, color: '#ff3366' } }, U).progress, null)
-  assert.equal(clipBrand({}, U).progress, null, 'a kit from before progress bars')
-  assert.deepEqual(clipBrand({ progress: { on: true, color: '#FF3366', height: 20, position: 'top' } }, U).progress, { color: '#ff3366', height: 20, position: 'top' })
+test("a clip's progress bar made safe; a kit's progress bar and voice aren't used", () => {
+  const b = clipBrand({ progress: { on: true, color: '#FF3366' }, voice: { tone: 'fun' } }, U) as Record<string, unknown>
+  assert.equal(b.progress, undefined); assert.equal(b.voice, undefined)
   assert.deepEqual(cleanProgressBar({ color: 'red', height: 999, position: 'left' }), { color: '#ffffff', height: 40, position: 'bottom' })
   assert.equal(cleanProgressBar(null), null)
 })

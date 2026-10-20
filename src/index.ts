@@ -261,6 +261,9 @@ async function runMigrations() {
   await db`CREATE INDEX IF NOT EXISTS brand_kits_user ON brand_kits (user_id, created_at)`
   // How see-through a photo on the clip is, 0–1 (a brand kit's logo; null = solid)
   await db`ALTER TABLE overlays ADD COLUMN IF NOT EXISTS opacity REAL`
+  // The brand kit on a clip (the editor's Brand kit switch): { kit_id, before } — what the brand
+  // changed, so switching it off puts it back; null = off
+  await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS brand JSONB`
   // A bar along the top or bottom edge filling up as the clip plays (a brand kit's progress bar):
   // { color, height (px on a 1080 × 1920 frame), position: 'top' | 'bottom' }; null = none
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS progress_bar JSONB`
