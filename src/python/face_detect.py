@@ -51,6 +51,14 @@ MIN_SCORE = 0.5        # ignore less confident MediaPipe faces
 # Ignore faces smaller than this share of the frame. Small enough for everyone at a table in a
 # wide group shot; background people next to a close-up are dropped by the prominence filter.
 MIN_FACE_AREA = 0.002
+# …but a face YuNet is this sure of is kept down to SURE_SMALL_FACE_AREA: in a wide shot of seven
+# people on a sofa (2026-10-20) their faces were 0.15–0.24% of a 640 px frame, YuNet 85–89% sure of
+# every one, and all but the nearest were dropped as "too small". A face far in the background
+# reads smaller and less sure (0.08%, 65% there).
+SURE_SMALL_FACE = 0.8
+SURE_SMALL_FACE_AREA = 0.0008
+# The most faces reported in a frame (a wide shot of a panel can show seven or more)
+MAX_FACES = 12
 # A face the detector is unsure of that the landmark model also can't read is a picture (a
 # poster, a photo on the wall), not a person
 UNSURE_FACE = 0.7
@@ -155,20 +163,35 @@ def _merge_faces(mp_boxes, yn_boxes):
     """Faces from both detectors: those both found, YuNet's alone (small/distant faces), and
     MediaPipe's alone only when it is sure (side-on faces YuNet can miss; an unsure MediaPipe-only
     face is usually a picture on the wall)"""
-    out = []
+    # Each face's size as YuNet measures it ("_size"): MediaPipe draws its box round the same face
+    # about 2–3× bigger, so next to a MediaPipe box every YuNet-only face looked too small and was
+    # dropped. Faces both found take YuNet's; MediaPipe-only ones are scaled by how much bigger
+    # MediaPipe's boxes are in this frame (where both found a face)
+    out, ratios = [], []
     for m in mp_boxes:
         match = max(yn_boxes, key=lambda y: _iou(m, y), default=None)
         if match is not None and _iou(m, match) > 0.3:
-            out.append({**m, "score": max(m["score"], match["score"])})
+            out.append({**m, "score": max(m["score"], match["score"]), "_size": match["area"], "_sure": match["score"]})
+            ratios.append(m["area"] / max(1e-9, match["area"]))
         elif m["score"] >= UNSURE_FACE:
-            out.append(m)
+            out.append({**m, "_size": None, "_sure": 0.0})
+    scale = float(np.median(ratios)) if ratios else 1.0
+    for b in out:
+        if b["_size"] is None:
+            b["_size"] = b["area"] / scale
     for y in yn_boxes:
         if all(_iou(y, m) <= 0.3 for m in mp_boxes):
-            out.append(y)
-    out = [b for b in out if b["area"] >= MIN_FACE_AREA]
-    out.sort(key=lambda b: -b["area"])
+            out.append({**y, "_size": y["area"], "_sure": y["score"]})
+    out = [b for b in out if b["area"] >= MIN_FACE_AREA or (b["_sure"] >= SURE_SMALL_FACE and b["_size"] >= SURE_SMALL_FACE_AREA)]
+    out.sort(key=lambda b: -b["_size"])
     # Round a table, the person nearest the camera can look 2–3× bigger than those across it
-    return _filter_by_size(out, min_rel=0.25)
+    if out:
+        biggest = out[0]["_size"]
+        out = [b for b in out if b["_size"] >= 0.25 * biggest]
+    for b in out:
+        b.pop("_size", None)
+        b.pop("_sure", None)
+    return out
 
 
 def _inside_share(small, big):
@@ -335,7 +358,7 @@ def track_faces(frames: list[list[dict]], iou=0.3, resets: set[int] | None = Non
     return ids
 
 
-def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False) -> dict:
+def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False, people: bool = False) -> dict:
     import cv2
 
     cascade = None
@@ -443,7 +466,7 @@ def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False
 
     # ── Pass 3: per-frame people, with the layout filters ────────────────────────────────
     per_frame = []
-    slot_data: list[list[dict]] = [[] for _ in range(6)]
+    slot_data: list[list[dict]] = [[] for _ in range(MAX_FACES)]
     max_person_count = 0
     counts_by_method = {"mediapipe": 0, "haar": 0, "motion": 0, "none": 0}
     lip_frames = 0
@@ -489,8 +512,9 @@ def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False
                 subjects = [by_area[0]]
 
         # Proximity filter: if the 2 closest detected faces are within 15% of
-        # frame width they can't be split into meaningful individual crops.
-        if len(subjects) >= 2 and not all_faces:
+        # frame width they can't be split into meaningful individual crops. Not when following
+        # people (people: the Subjects tool) — everyone sitting side by side is someone to follow
+        if len(subjects) >= 2 and not all_faces and not people:
             by_cx = sorted(subjects, key=lambda s: s["cx"])
             min_gap = min(by_cx[i+1]["cx"] - by_cx[i]["cx"] for i in range(len(by_cx)-1))
             if min_gap < 0.15:
@@ -518,10 +542,10 @@ def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False
                        **({"lip": s["lip"]} if s.get("lip") is not None else {}),
                        **({"ex": s["ex"]} if s.get("ex") is not None else {}),
                        **({"sig": s["sig"]} if s.get("sig") is not None else {})}
-                      for s in subjects[:6]],
+                      for s in subjects[:MAX_FACES]],
         })
 
-        for i, s in enumerate(subjects[:6]):
+        for i, s in enumerate(subjects[:MAX_FACES]):
             slot_data[i].append({"x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"]})
 
     counts = [f["person_count"] for f in per_frame] or [0]
@@ -534,7 +558,7 @@ def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False
 
     # ── Averaged boxes (backward compat) ──────────────────────────────────────
     face_boxes = []
-    for i in range(max_person_count):
+    for i in range(min(max_person_count, MAX_FACES)):
         samples = slot_data[i]
         if not samples:
             continue
@@ -552,11 +576,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--frames-dir", required=True)
     parser.add_argument("--lips", action="store_true", help="also measure mouth opening (speaker tracking)")
+    parser.add_argument("--people", action="store_true",
+                        help="following marked people: people sitting close together aren't merged into one")
     parser.add_argument("--all-faces", action="store_true",
                         help="every face seen, with none of the crop filters (still faces, a close-up's bystanders, faces too close to split)")
     args = parser.parse_args()
     try:
-        result = detect_subjects(args.frames_dir, lips=args.lips, all_faces=args.all_faces)
+        result = detect_subjects(args.frames_dir, lips=args.lips, all_faces=args.all_faces, people=args.people)
     except Exception as e:
         print(f"[face_detect] Error: {e}", file=sys.stderr)
         result = {"face_count": 0, "face_boxes": [], "frames": []}

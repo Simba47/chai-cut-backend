@@ -733,8 +733,9 @@ export async function handleTrackSubjectsJob(job: Job, signal?: AbortSignal) {
     await setSubjects(ids, { progress: 25 })
 
     // Faces with their lips (who is talking), the camera cuts, and the words said in this stretch
+    // (people: everyone sitting side by side is someone to follow — not merged into one, as for a crop)
     const [info, cuts, speech] = await Promise.all([
-      detectFaces(tmp, videoPath, from, to, signal, true),
+      detectFaces(tmp, videoPath, from, to, signal, true, false, true),
       detectCuts(videoPath, from, to, signal),
       spokenWords(clip.video_id, from, to),
     ])
@@ -917,7 +918,7 @@ async function subEditSteps(clipId: string, signal: AbortSignal, onCreated: (ids
   try {
     const videoPath = await clipVideo(clip, tmp, signal)
     const [info, cuts, speech, size] = await Promise.all([
-      detectFaces(tmp, videoPath, from, to, signal, true),
+      detectFaces(tmp, videoPath, from, to, signal, true, false, true),
       detectCuts(videoPath, from, to, signal),
       spokenWords(clip.video_id, from, to),
       probeSize(videoPath),
