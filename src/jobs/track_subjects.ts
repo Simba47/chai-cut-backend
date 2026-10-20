@@ -361,10 +361,16 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
     return sigs.length ? meanOf(sigs) : r.sig?.length ? r.sig : null
   })
 
-  // Each frame: the marked shot (every face where it was, nobody else), part of it (some faces not
-  // read, nobody else), another shot, or no faces read. `apart`: how far its faces' colours are from
-  // the marked people's (their average), judged later over a whole stretch
+  // Each frame: the marked shot (every face where it was), part of it (some faces not read), another
+  // shot, or no faces read. `apart`: how far its faces' colours are from the marked people's (their
+  // average), judged later over a whole stretch. A face more than at the mark is someone who isn't in
+  // the marked shot — unless a face was seen in that place in the marked camera shot itself (user,
+  // 2026-10-20): in a panel of seven the face reader sees 4 to 7 of them as heads turn, and a frame
+  // with one more face counted as another shot, so a group marked on 5 faces wasn't found where the
+  // same shot came back. Someone walking in (a place nobody was in) still is another shot
   type State = 'match' | 'part' | 'other' | 'none'
+  // Every face seen in the marked camera shot (any frame of it): the places of its people
+  const seenPlaces = fr.filter((_, fi) => stretchOf(timeOf(fi)) === home).flatMap(f => f.faces.filter(face => face.w >= SHOT_BACKGROUND * smallest))
   const states = fr.map((f): { s: State; box?: CropBox; apart?: number } => {
     const faces = f.faces.filter(face => face.w >= SHOT_BACKGROUND * smallest)
     if (!faces.length) return { s: 'none' }
@@ -383,12 +389,15 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
       const sig = faces[best].sig, refSig = refSigs[ri]
       if (sig?.length && refSig) apart.push(l1(sig, refSig))
     })
-    if (used.size < faces.length) return { s: 'other' }     // someone who isn't in the marked shot
     const far = apart.length ? apart.reduce((a, b) => a + b, 0) / apart.length : undefined
     // The same places, surely other people (another interview shot the same way)
     if (far !== undefined && far >= SHOT_OTHER_PEOPLE) return { s: 'other', apart: far }
+    // Someone who isn't in the marked shot: a face more, in a place nobody was in the marked camera shot
+    if (faces.some((face, k) => !used.has(k) && !seenPlaces.some(p => near(face, p) !== null))) return { s: 'other' }
     if (found < refFaces.length) return { s: 'part', apart: far }
-    const xs = faces.flatMap(face => [face.x, face.x + face.w]), ys = faces.flatMap(face => [face.y, face.y + face.h])
+    // (the marked people's box: a face more isn't in it)
+    const mine = [...used].map(k => faces[k])
+    const xs = mine.flatMap(face => [face.x, face.x + face.w]), ys = mine.flatMap(face => [face.y, face.y + face.h])
     const x = Math.min(...xs), y = Math.min(...ys)
     return { s: 'match', box: { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y }, apart: far }
   })

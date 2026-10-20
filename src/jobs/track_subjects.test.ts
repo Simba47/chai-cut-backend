@@ -66,3 +66,17 @@ test('two groups claiming one shot: it goes to the group whose person it is near
   assert.deepEqual(b.spans, [[5000, 10000]])
   assert.ok(b.path.every(([t]) => t >= 5000 && t <= 10000), 'its people’s boxes go with the stretch')
 })
+
+test('a panel: a face more where someone sits in the marked shot is not another shot (heads turning)', () => {
+  // Three people marked; a fourth sits at 0.65, read only now and then. The shot comes back at 10–15 s,
+  // the fourth read in most frames there
+  const fp: FrameDetection[] = []
+  const at = (t: number, n: number) => {
+    const fourth = t < 5000 ? n % 4 === 0 : t >= 10000 && n % 4 !== 0
+    if (t >= 5000 && t < 10000) return [face(0.4, 0.9)]
+    return [face(0.2, 0.05, 0.06), face(0.5, 0.05, 0.06), face(0.8, 0.05, 0.06), ...(fourth ? [face(0.65, 0.05, 0.06)] : [])]
+  }
+  for (let n = 0; n * 250 + 100 < 15000; n++) fp.push({ frame_index: n, person_count: 0, faces: at(n * 250 + 100, n) })
+  const { spans } = shotSpans(fp, [5000, 10000], 1100, 15000)
+  assert.deepEqual(spans, [[0, 5000], [10000, 15000]])
+})
