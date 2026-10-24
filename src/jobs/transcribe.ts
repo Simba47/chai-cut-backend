@@ -10,13 +10,13 @@ import { join } from 'node:path'
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { GoogleAuth } from 'google-auth-library'
-import { r2, R2_BUCKET, r2DownloadToFile, r2UploadFile } from '../r2.js'
+import { r2, R2_BUCKET, r2DownloadToFile, r2SignedUrl, r2UploadFile } from '../r2.js'
 import { aiProvider, askGemini, retryAfterMs, retryDelayMs } from '../lib/gemini.js'
 import { runawayReason, trimRunaway } from '../lib/transcriptGuard.js'
 import { convertWordForWord } from '../lib/wordConvert.js'
 import db from '../db.js'
 import type { Job, TranscribeJobPayload } from '../types.js'
-import { queueProxy } from './proxy.js'
+import { audioKeyFor, queueProxy } from './proxy.js'
 
 async function r2Download(key: string): Promise<Buffer> {
   const res = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }))
@@ -163,6 +163,8 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
   }
 
   const tmp = await mkdtemp(join(tmpdir(), 'chai-'))
+  const startedAt = Date.now()
+  const secs = () => `${((Date.now() - startedAt) / 1000).toFixed(1)} s`
 
   try {
     let videoPath = ''
@@ -170,10 +172,11 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
 
     const audioPath = join(tmp, 'audio.wav')
 
-    // ── Fast path for retranscription: download cached FLAC audio ────────────
-    const audioStoragePath = storagePath ? storagePath.replace(/\.[^.]+$/, '_audio.flac') : null
+    // ── Fast path: the video's audio kept in storage (FLAC) ─────────────────────
+    // Kept by the first whole-video reading, and by the editing copy (jobs/proxy.ts)
+    const audioStoragePath = storagePath ? audioKeyFor(storagePath) : null
     let audioCached = false
-    if (isRetranscribe && audioStoragePath) {
+    if ((isRetranscribe || isFullJob) && audioStoragePath) {
       try {
         const cachedBuf = await r2Download(audioStoragePath)
         const flacPath = join(tmp, 'cached.flac')
@@ -185,8 +188,8 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
           : []
         await execFileAsync('ffmpeg', [...clipRange, '-i', flacPath, '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', audioPath])
         audioCached = true
-        console.log(`[transcribe] retranscribe: used cached audio (${audioStoragePath})`)
-      } catch { /* fall through to full video download */ }
+        console.log(`[transcribe] used the kept audio (${audioStoragePath})`)
+      } catch { /* none kept: read it from the video */ }
     }
 
     if (!audioCached) {
@@ -214,32 +217,40 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
           }
           console.log(`[transcribe] link video ${payload.video_id} ready — captioning full video in background`)
         }
-      } else {
-        // Clip or retranscribe job: download video from storage (streamed to disk — a whole
-        // video held in memory could run the worker out of it)
-        await setProgress(payload.video_id, 30)
-        videoPath = join(tmp, 'video.mp4')
-        await r2DownloadToFile(storagePath, videoPath, signal)
-        await setProgress(payload.video_id, 55)
       }
 
       // Extract audio — for clip jobs, seek to clip range only (fast & cheap)
+      const extract = async (input: string) => {
+        await requireSound(input, signal)
+        // Over a link: carry on through a dropped connection instead of ending the audio early
+        const http = /^https?:/.test(input) ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5'] : []
+        const range = isClipJob
+          ? ['-ss', String(payload.clip_start_ms! / 1000), ...http, '-i', input, '-t', String((payload.clip_end_ms! - payload.clip_start_ms!) / 1000)]
+          : [...http, '-i', input]
+        await execFileAsync('ffmpeg', [...range, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', audioPath], { signal })
+      }
       await setProgress(payload.video_id, 60)
-      await requireSound(videoPath, signal)
-      if (isClipJob) {
-        const startSec = payload.clip_start_ms! / 1000
-        const durSec   = (payload.clip_end_ms! - payload.clip_start_ms!) / 1000
-        await execFileAsync('ffmpeg', [
-          '-ss', String(startSec), '-i', videoPath,
-          '-t', String(durSec),
-          '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', audioPath,
-        ], { signal })
+      if (isLinkJob) {
+        await extract(videoPath)
       } else {
-        await execFileAsync('ffmpeg', [
-          '-i', videoPath, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', audioPath,
-        ], { signal })
+        // In storage: the audio is read straight from it over a signed link, so a clip reads only
+        // its own part of the video and a whole video isn't saved to disk first. If that fails, the
+        // video is downloaded (streamed to disk — a whole video held in memory could run the
+        // worker out of it) and read from there.
+        const url = await r2SignedUrl(storagePath, 4 * 3600)
+        try {
+          await extract(url)
+        } catch (e) {
+          if (signal?.aborted || e instanceof UserFacingError) throw e
+          console.warn('[transcribe] reading the audio from storage failed, downloading the video first:', (e instanceof Error ? e.message : String(e)).split('\n')[0])
+          videoPath = join(tmp, 'video' + (storagePath.match(/\.[^./]+$/)?.[0] ?? '.mp4'))
+          await r2DownloadToFile(storagePath, videoPath, signal)
+          await extract(videoPath)
+        }
+      }
+      if (!isClipJob) {
         // Cache full-video audio as FLAC for fast retranscription
-        const cachePath = audioStoragePath ?? (storagePath ? storagePath.replace(/\.[^.]+$/, '_audio.flac') : null)
+        const cachePath = audioStoragePath ?? (storagePath ? audioKeyFor(storagePath) : null)
         if (cachePath) {
           const flacOut = join(tmp, 'audio_cache.flac')
           execFileAsync('ffmpeg', ['-i', audioPath, '-compression_level', '5', '-y', flacOut])
@@ -249,6 +260,8 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
         }
       }
     }
+
+    console.log(`[transcribe] audio ready after ${secs()}`)
 
     // ── Transcription ─────────────────────────────────────────────────────────
     // Progress only matters while the video is still 'transcribing' (not for background full-video captions)
@@ -275,17 +288,14 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
     const sarvamResult = await transcribeAudio(audioPath, (!isRetranscribe && !isClipJob && !videoReady) ? payload.video_id : undefined, languageCode, signal, kept, report)
     signal?.throwIfAborted()
 
-    // The slow part first — in the transcript's script and in Roman letters takes minutes for a long
-    // video — and only then is anything saved, all at once: a transcript saved before its words read
-    // as a whole video with no speech (Make my clips failed with "no speech" while it was being
-    // written, and for good when a restart cut it off half-saved)
+    // The words come spelled (transcribeAudio spells each chunk as it is read: in Roman letters, and
+    // English spoken inside a regional-language video in that language's script, so "Auto language"
+    // captions are all in one script; word_roman keeps the English spelling). Only then is anything
+    // saved, all at once: a transcript saved before its words read as a whole video with no speech
+    // (Make my clips failed with "no speech" while it was being written, and for good when a restart
+    // cut it off half-saved)
     const entries = sarvamResult.words
     const offsetMs = isClipJob ? payload.clip_start_ms! : 0
-    const romanized = entries.length ? await transliterateToRoman(entries, sarvamResult.language_code) : []
-    // English spoken inside a regional-language video: store it in that language's script too,
-    // so "Auto language" captions are all in one script (word_roman keeps the English spelling)
-    const native = entries.length ? await toNativeScript(entries, sarvamResult.language_code) : []
-    signal?.throwIfAborted()
 
     // Clip jobs (first transcription or retranscribe): replace only this clip's time range in the
     // video's transcript, so other clips of the same video keep their captions. The editor reads
@@ -317,10 +327,10 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
         transcriptId = inserted.id as string
       }
 
-      const words = entries.map((e, i) => ({
+      const words = entries.map(e => ({
         transcript_id: transcriptId,
-        word: native[i] ?? e.word,
-        word_roman: romanized[i] ?? null,
+        word: e.native ?? e.word,
+        word_roman: e.roman ?? null,
         start_ms: Math.round(e.start * 1000) + offsetMs,
         end_ms:   Math.round(e.end   * 1000) + offsetMs,
         speaker_id:  e.speaker ?? null,
@@ -334,20 +344,8 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
     // The transcript is saved: the kept chunks have done their job
     if (readingKey) await r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: readingKey })).catch(() => {})
 
-    if (!isRetranscribe && !isClipJob) {
-      let durationMs: number | null = null
-      try {
-        const { stdout } = await execFileAsync('ffprobe', [
-          '-v', 'error', '-show_entries', 'format=duration',
-          '-of', 'default=noprint_wrappers=1:nokey=1', videoPath,
-        ])
-        const secs = parseFloat(stdout.trim())
-        if (!isNaN(secs)) durationMs = Math.round(secs * 1000)
-      } catch { /* optional */ }
-      await db`UPDATE videos SET status = 'ready', storage_path = ${storagePath}, download_progress = 100, duration_ms = ${durationMs} WHERE id = ${payload.video_id}`
-    }
-
-    console.log(`[transcribe] ${isClipJob ? `clip ${payload.clip_id}` : `video ${payload.video_id}`} done — ${entries.length} words`)
+    // (the video was marked ready, with its length, before it was read)
+    console.log(`[transcribe] ${isClipJob ? `clip ${payload.clip_id}` : `video ${payload.video_id}`} done — ${entries.length} words in ${secs()}`)
   } catch (err) {
     // Only mark failed for fresh download jobs — retranscribe is called inline from ai_edit
     // on an already-ready video, and a failed background caption job leaves the video usable.
@@ -604,7 +602,12 @@ async function downloadWithYtDlp(videoId: string, tmp: string, signal?: AbortSig
   return { localPath, storagePath }
 }
 
-interface SarvamWord { word: string; start: number; end: number; speaker?: string; confidence?: number }
+interface SarvamWord {
+  word: string; start: number; end: number; speaker?: string; confidence?: number
+  /** In English letters (Tenglish, Hinglish…) and in the language's own script; null = none. Missing = not spelled yet */
+  roman?: string | null
+  native?: string | null
+}
 interface SarvamResponse { language_code: string; transcript?: string; words: SarvamWord[] }
 
 // ── fetch with timeout ──────────────────────────────────────────────────────
@@ -626,6 +629,14 @@ const GEMINI_API_KEY    = process.env.GEMINI_API_KEY
 const GEMINI_BASE       = 'https://generativelanguage.googleapis.com'
 const GEMINI_STT_MODEL  = 'gemini-3.5-transcribe'
 const GEMINI_CHUNK_SEC  = 300
+/**
+ * Chunks of one audio read at the same time (TRANSCRIBE_PARALLEL). Google charges per second of
+ * audio, so reading them together costs the same — but our Vertex quota for the Transcribe model
+ * lets through about one 5-minute chunk a minute (2026-10-22, 70-min video: one at a time 14.5 min;
+ * 6 at a time refused 120+ times and failed). Raise it once the quota is raised: at 6, an hour of
+ * video reads in ~3–4 min.
+ */
+const READ_PARALLEL     = Math.max(1, Number(process.env.TRANSCRIBE_PARALLEL) || 1)
 /** Seconds of audio read to detect the spoken language (see transcribeAudio) */
 const PROBE_SEC         = 60
 const GEMINI_MAX_TRIES  = 8
@@ -700,6 +711,39 @@ export function vertexAuthClient(): GoogleAuth {
   return vertexAuth
 }
 
+// Vertex answers 429 when its shared capacity is busy for a moment (there is no daily cap). Every
+// reading in this worker goes through one gate: after a 429 it lets half as many requests out at
+// once, and more again as they go through, so readings (several jobs on one worker, or chunks read
+// together) slow down together instead of each using up its retries.
+const STT_MAX_IN_FLIGHT = Math.max(1, Number(process.env.STT_MAX_IN_FLIGHT) || 8)
+/** Tries for a request Vertex refuses as busy (429): about 5 minutes of waiting in all */
+const VERTEX_BUSY_TRIES = 14
+let sttLimit = STT_MAX_IN_FLIGHT
+let sttOpen = 0
+let sttLastCut = 0
+const sttWaiting: (() => void)[] = []
+async function sttTurn<T>(send: () => Promise<T>): Promise<T> {
+  while (sttOpen >= Math.max(1, Math.floor(sttLimit))) await new Promise<void>(r => sttWaiting.push(r))
+  sttOpen++
+  try {
+    return await send()
+  } finally {
+    sttOpen--
+    for (const wake of sttWaiting.splice(0)) wake()
+  }
+}
+/** Busy: half as many at once (once per few seconds: refusals of requests already out count once) */
+function sttBusy() {
+  if (Date.now() - sttLastCut < 5000) return
+  sttLimit = Math.max(1, sttLimit / 2)
+  sttLastCut = Date.now()
+  console.warn(`[vertex] busy: at most ${Math.floor(sttLimit)} transcription request(s) at once for now`)
+}
+/** Went through: a little more again, back up to STT_MAX_IN_FLIGHT */
+function sttFine() {
+  sttLimit = Math.min(STT_MAX_IN_FLIGHT, sttLimit + 0.5)
+}
+
 async function vertexTranscribeChunk(buf: Buffer, languageCode?: string): Promise<SarvamWord[]> {
   const auth = vertexAuthClient()
   const host = VERTEX_LOCATION === 'global' ? 'aiplatform.googleapis.com' : `${VERTEX_LOCATION}-aiplatform.googleapis.com`
@@ -715,11 +759,13 @@ async function vertexTranscribeChunk(buf: Buffer, languageCode?: string): Promis
 
   for (let attempt = 1; ; attempt++) {
     const token = await auth.getAccessToken()
-    const res = await fetchWithTimeout(url, {
+    const res = await sttTurn(() => fetchWithTimeout(url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'x-goog-user-project': VERTEX_PROJECT!, 'Content-Type': 'application/json' },
       body,
-    }, 300_000)
+    }, 300_000))
+    if (res.status === 429) sttBusy()
+    else if (res.ok) sttFine()
     if (res.ok) {
       const raw = await res.json() as {
         candidates?: { content?: { parts?: { audioTranscription?: { speakerLabel?: string; words?: { word?: string; startOffset?: string; endOffset?: string }[] } }[] } }[]
@@ -737,7 +783,8 @@ async function vertexTranscribeChunk(buf: Buffer, languageCode?: string): Promis
     const text = await res.text()
     // 429 on Vertex means shared capacity is busy for a moment (there is no daily cap): retry
     const retryable = res.status === 429 || res.status >= 500
-    if (!retryable || attempt >= GEMINI_MAX_TRIES) throw new Error(`Vertex transcribe ${res.status}: ${text.slice(0, 300)}`)
+    const tries = res.status === 429 ? VERTEX_BUSY_TRIES : GEMINI_MAX_TRIES
+    if (!retryable || attempt >= tries) throw new Error(`Vertex transcribe ${res.status}: ${text.slice(0, 300)}`)
     // Spread out at random, so the many jobs a busy moment refused don't all come back together
     const delayMs = retryDelayMs(attempt, retryAfterMs(res.headers.get('retry-after')))
     console.warn(`[vertex] ${res.status} on attempt ${attempt}, retrying in ${(delayMs / 1000).toFixed(1)}s`)
@@ -843,7 +890,9 @@ export async function transcribeAudio(audioPath: string, videoId?: string, langu
   ])
   const totalSec = parseFloat(stdout.trim())
   const numChunks = Math.max(1, Math.ceil(totalSec / GEMINI_CHUNK_SEC))
-  console.log(`[transcribe] audio ${totalSec.toFixed(1)}s → ${numChunks} chunk(s)`)
+  console.log(`[transcribe] audio ${totalSec.toFixed(1)}s → ${numChunks} chunk(s), ${Math.min(READ_PARALLEL, numChunks)} at a time`)
+  const readStart = Date.now()
+  const since = () => `${((Date.now() - readStart) / 1000).toFixed(1)} s`
   if (videoId) await setProgress(videoId, 62)
 
   // Chunk i of the audio; `skipSec` starts it part-way (its first seconds were already read)
@@ -931,7 +980,7 @@ export async function transcribeAudio(audioPath: string, videoId?: string, langu
       // The start can be music or an English intro: check the middle before settling on auto
       if (!lang) lang = await sample(Math.max(PROBE_SEC, Math.min(totalSec / 2, totalSec - PROBE_SEC)), 'probe-middle')
     }
-    if (lang) console.log(`[transcribe] detected language: ${lang} — locking for all chunks`)
+    if (lang) console.log(`[transcribe] detected language: ${lang} — locking for all chunks (${since()})`)
   }
   const readChunk = async (i: number): Promise<SarvamWord[]> => {
     if (i === 0 && probe && !lang) return probe  // English / Latin script: keep auto result
@@ -953,26 +1002,64 @@ export async function transcribeAudio(audioPath: string, videoId?: string, langu
     // Chunk 1 was transcribed twice (auto + locked) — keep whichever caught more speech
     return i === 0 && probe && probe.length > words.length ? probe : words
   }
+  // A chunk's words in English letters and in the language's own script, as soon as it is read
+  // (while the other chunks are still being read). A chunk left on auto is English.
+  const spellChunk = async (words: SarvamWord[]): Promise<SarvamWord[]> => {
+    if (!words.length) return words
+    const code = lang ?? 'en-IN'
+    const [roman, native] = await Promise.all([transliterateToRoman(words, code), toNativeScript(words, code)])
+    return words.map((w, k) => ({ ...w, roman: roman[k] ?? null, native: native[k] ?? null }))
+  }
+  const spelled = (words: SarvamWord[]) => words.every(w => w.roman !== undefined)
   // Kept once the language is known and after every chunk. A save that fails only means that
-  // chunk is read again next time.
+  // chunk is read again next time. Chunks finish in any order: saves go one at a time.
   const reading: Reading = earlier ?? { v: 1, totalSec, chunkSec: GEMINI_CHUNK_SEC, lang: lang ?? null, chunks: {} }
-  const keep = async () => {
-    if (!kept || numChunks < 2) return
-    await kept.save(reading).catch(e => console.warn('[transcribe] could not keep the reading so far:', e instanceof Error ? e.message : e))
+  let saving = Promise.resolve()
+  const keep = () => {
+    const store = kept
+    if (!store || numChunks < 2) return saving
+    saving = saving.then(() => store.save(reading))
+      .catch(e => console.warn('[transcribe] could not keep the reading so far:', e instanceof Error ? e.message : e))
+    return saving
   }
   if (!earlier) await keep()
   // (telling how far it has got never stops the reading)
   const tell = async (done: number) => { try { await onRead?.(done, numChunks) } catch { /* only a progress note */ } }
-  for (let i = 0; i < numChunks; i++) {
-    const had = reading.chunks[i]
-    if (had) { allWords.push(...had); await tell(i + 1); continue }
-    if (videoId) await setProgress(videoId, Math.round(63 + (i / numChunks) * 33))
-    const got = await readChunk(i)
-    allWords.push(...got)
-    reading.chunks[i] = got
-    await keep()
-    await tell(i + 1)
+  // Chunks an earlier run read and spelled are used as they are; one it read but didn't spell
+  // (from before spelling was done per chunk) is only spelled
+  const todo = Array.from({ length: numChunks }, (_, i) => i).filter(i => !reading.chunks[i] || !spelled(reading.chunks[i]))
+  let done = numChunks - todo.length
+  if (done) await tell(done)
+  // READ_PARALLEL chunks at a time. After the first failure no new chunk starts; the ones
+  // under way finish and are kept, so the next run carries on from there.
+  let next = 0
+  let failure: unknown = null
+  const readNext = async () => {
+    while (next < todo.length && !failure) {
+      const i = todo[next++]
+      try {
+        const had = reading.chunks[i]
+        const got = had ?? await readChunk(i)
+        reading.chunks[i] = got
+        try {
+          reading.chunks[i] = await spellChunk(got)
+        } catch (e) {
+          console.warn(`[transcribe] chunk ${i + 1}/${numChunks}: spelling failed, words kept as read:`, e instanceof Error ? e.message : e)
+        }
+        await keep()
+        done++
+        if (videoId) await setProgress(videoId, Math.round(63 + (done / numChunks) * 33))
+        await tell(done)
+      } catch (e) {
+        failure ??= e
+      }
+    }
   }
+  await Promise.all(Array.from({ length: Math.min(READ_PARALLEL, todo.length) }, readNext))
+  await saving
+  if (failure) throw failure
+  console.log(`[transcribe] ${todo.length} chunk(s) read and spelled after ${since()}`)
+  for (let i = 0; i < numChunks; i++) allWords.push(...(reading.chunks[i] ?? []))
   const language = lang ?? (allWords.length ? 'en-IN' : 'unknown')
 
   // Gemini occasionally returns a word slightly out of order — keep the timeline monotonic

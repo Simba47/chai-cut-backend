@@ -14,7 +14,24 @@ const PROXY_TIMEOUT_MS = parseInt(process.env.PROXY_TIMEOUT_MS ?? String(90 * 60
 // clip's part of the video): one that runs this long has hung, and is stopped instead of holding
 // a worker slot for an hour
 const TRACK_TIMEOUT_MS = parseInt(process.env.TRACK_TIMEOUT_MS ?? String(8 * 60 * 1000), 10)
-const timeoutFor = (type: string) => (type === 'proxy' ? PROXY_TIMEOUT_MS : type === 'track_subjects' ? TRACK_TIMEOUT_MS : JOB_TIMEOUT_MS)
+// Reading a whole video (AI edit) grows with its length: a 4-hour video must not be stopped part-way
+const READING_TIMEOUT_MS = Math.max(JOB_TIMEOUT_MS, parseInt(process.env.READING_TIMEOUT_MS ?? String(60 * 60 * 1000), 10))
+const timeoutFor = (job: Job) => (job.type === 'proxy' ? PROXY_TIMEOUT_MS : job.type === 'track_subjects' ? TRACK_TIMEOUT_MS
+  : isWholeReading(job) ? READING_TIMEOUT_MS : JOB_TIMEOUT_MS)
+
+/** A whole-video reading (AI edit's captions): many minutes for a long video */
+function isWholeReading(job: Job): boolean {
+  const p = (typeof job.payload === 'string' ? JSON.parse(job.payload) : job.payload) as { transcribe_full?: unknown }
+  return job.type === 'transcribe' && p?.transcribe_full === true
+}
+
+// Whole-video readings (started as soon as someone picks AI edit) may take every slot but one: with
+// more than one slot, one is always kept for the quick jobs people wait on (a clip's captions,
+// renders, uploads, Subjects), so they never queue behind readings. AI edit itself is not held back:
+// it waits for its video's reading, which must be able to start next to it. Editing copies already
+// wait for everything else and are made one at a time.
+const LONG_SLOTS = CONCURRENCY > 1 ? CONCURRENCY - 1 : 1
+let readingsRunning = 0
 
 export function registerHandler(type: JobType, handler: JobHandler) {
   handlers.set(type, handler)
@@ -51,19 +68,36 @@ async function requeueStuck() {
   if (stuck.length) console.log(`[queue] Re-queued ${stuck.length} job(s) whose worker stopped`)
 }
 
+/** How long the queue is (every worker logs it): when the oldest job has waited over WAIT_WARN_MS, more workers are needed */
+const WAIT_WARN_MS = 5 * 60 * 1000
+async function reportQueue() {
+  const [q] = await db<{ waiting: number; running: number; oldest_s: number | null }[]>`
+    SELECT count(*) FILTER (WHERE status = 'queued')::int AS waiting,
+      count(*) FILTER (WHERE status = 'processing')::int AS running,
+      extract(epoch FROM now() - min(created_at) FILTER (WHERE status = 'queued'))::int AS oldest_s
+    FROM jobs WHERE status IN ('queued', 'processing') AND type <> 'proxy'`
+  if (!q || !q.waiting) return
+  const line = `[queue] ${q.waiting} job(s) waiting, ${q.running} running; the oldest has waited ${q.oldest_s ?? 0} s`
+  if ((q.oldest_s ?? 0) * 1000 > WAIT_WARN_MS) console.warn(`${line} — more workers needed`)
+  else console.log(line)
+}
+
 export async function startQueue() {
   await requeueStuck()
   // Keep rescuing jobs whose worker died, not only when this one starts
   setInterval(() => { requeueStuck().catch(err => console.error('[queue] Stuck-job sweep failed:', err)) }, STUCK_SWEEP_MS)
+  setInterval(() => { reportQueue().catch(() => { /* only a log line */ }) }, STUCK_SWEEP_MS)
 
-  console.log(`[queue] Worker started (concurrency=${CONCURRENCY}), polling for jobs…`)
+  console.log(`[queue] Worker started (concurrency=${CONCURRENCY}, whole-video readings at most ${LONG_SLOTS} at a time), polling for jobs…`)
   await Promise.all(Array.from({ length: CONCURRENCY }, (_, i) => runLoop(i)))
 }
 
 async function runLoop(id: number) {
   while (true) {
-    try { await tick() } catch (err) { console.error(`[queue] Unexpected error in loop ${id}:`, err) }
-    await sleep(JOB_POLL_INTERVAL_MS)
+    // Straight on to the next job after one is done; wait only when there was nothing to take
+    let ran = false
+    try { ran = await tick() } catch (err) { console.error(`[queue] Unexpected error in loop ${id}:`, err) }
+    if (!ran) await sleep(JOB_POLL_INTERVAL_MS)
   }
 }
 
@@ -72,7 +106,8 @@ async function runLoop(id: number) {
 // 'ai_edit' runs anywhere: it reads the video from storage and never uses yt-dlp.
 const isRailway = !!process.env.RAILWAY_ENVIRONMENT
 
-async function tick() {
+/** Takes and runs the next job; false when there was none */
+async function tick(): Promise<boolean> {
   // Only jobs this worker can run (a worker from before a new kind of job leaves those to others).
   // Editing copies (proxy) wait for everything else, and only one is made at a time: renders and
   // captions always have a slot.
@@ -81,12 +116,41 @@ async function tick() {
   // job, one winning and the rest sleeping a poll interval for nothing. The heartbeat starts in
   // the same statement, as before.
   const types = [...handlers.keys()]
+  // A reading may be taken only while a slot is left for quick jobs (counted before the claim, so
+  // two loops never both take the last one)
+  const mayRead = readingsRunning < LONG_SLOTS
+  if (mayRead) readingsRunning++
+  let job: Job | undefined
+  try {
+    job = await claim(types, mayRead)
+  } finally {
+    if (mayRead && !(job && isWholeReading(job))) readingsRunning--
+  }
+  if (!job) return false
+  try {
+    await run(job)
+  } finally {
+    if (mayRead && isWholeReading(job)) readingsRunning--
+  }
+  return true
+}
+
+async function claim(types: string[], mayRead: boolean): Promise<Job | undefined> {
   const [job] = await db<Job[]>`
     WITH next AS (
       SELECT id FROM jobs
       WHERE status = 'queued' AND type = ANY(${types})
       ${isRailway ? db`AND NOT (type = 'transcribe' AND payload @> '{"requires_ytdlp":true}'::jsonb)` : db``}
       AND NOT (type = 'proxy' AND EXISTS (SELECT 1 FROM jobs p WHERE p.type = 'proxy' AND p.status = 'processing'))
+      ${mayRead ? db`` : db`AND NOT (type = 'transcribe' AND COALESCE(payload->>'transcribe_full', '') = 'true')`}
+      -- One whole-video reading per person at a time (across all workers): one person's videos
+      -- never take every slot while someone else waits
+      AND NOT (type = 'transcribe' AND COALESCE(payload->>'transcribe_full', '') = 'true' AND EXISTS (
+        SELECT 1 FROM jobs p
+        JOIN videos pv ON pv.id::text = p.payload->>'video_id'
+        JOIN videos v ON v.id::text = jobs.payload->>'video_id'
+        WHERE p.type = 'transcribe' AND p.status = 'processing' AND COALESCE(p.payload->>'transcribe_full', '') = 'true'
+          AND pv.user_id = v.user_id))
       -- A whole-video reading (AI edit: many minutes for a long video) waits for the quick jobs that
       -- came after it — a clip's own captions (manual edit), renders, uploads — so they never queue
       -- behind it (COALESCE: a job without the field must sort as false, not as NULL, which goes last)
@@ -100,8 +164,10 @@ async function tick() {
     )
     SELECT * FROM claimed
   `
-  if (!job) return
+  return job
+}
 
+async function run(job: Job) {
   console.log(`[queue] Processing job ${job.id} (${job.type})`)
   const handler = handlers.get(job.type as JobType)
   if (!handler) { await fail(job.id, `No handler for type: ${job.type}`); return }
@@ -117,7 +183,7 @@ async function tick() {
   // worker ran more jobs than CONCURRENCY and a render's clip stayed "rendering".
   const ctrl = new AbortController()
   let timedOut = false
-  const timeoutMs = timeoutFor(job.type)
+  const timeoutMs = timeoutFor(job)
   const timer = setTimeout(() => {
     timedOut = true
     const msg = `job timed out after ${timeoutMs / 1000}s`
