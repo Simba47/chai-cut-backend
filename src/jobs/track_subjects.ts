@@ -875,10 +875,46 @@ async function setSubjects(ids: string[], patch: { status?: string; progress?: n
   `
 }
 
-export async function handleTrackSubjectsJob(job: Job, signal?: AbortSignal) {
+export async function handleTrackSubjectsJob(job: Job, queueSignal?: AbortSignal) {
   const { clip_id, start_ms, end_ms, auto, angles } = job.payload as unknown as TrackSubjectsJobPayload
-  if (auto) return subEditClip(job.id, clip_id, signal)
-  if (angles) return scanAngles(clip_id, start_ms, end_ms, signal)
+  if (auto) return subEditClip(job.id, clip_id, queueSignal)
+  // Stop in the editor's Subjects tool (user, 2026-10-24): the scan and the following stop like Sub-edit's.
+  // The editor puts the clip's rows back itself (services/subjects.ts stopSubjects): nothing is written here
+  const watch = stopWatch(job.id, queueSignal)
+  try {
+    if (angles) return await scanAngles(clip_id, start_ms, end_ms, watch.signal)
+    return await followMarked(clip_id, start_ms, end_ms, watch.signal)
+  } catch (e) {
+    if (watch.stopped()) {
+      console.log(`[track_subjects] clip ${clip_id}: ${angles ? 'scan' : 'following'} stopped by the user`)
+      throw new Error(STOPPED)
+    }
+    throw e
+  } finally {
+    watch.end()
+  }
+}
+
+/**
+ * Stopped by the user: the job row says so (status failed, error STOPPED) — checked every 2 s. Everything
+ * running (the download, FFmpeg, the face reading) is stopped through `signal`.
+ */
+function stopWatch(jobId: string, queueSignal?: AbortSignal) {
+  const stop = new AbortController()
+  const signal = queueSignal ? AbortSignal.any([queueSignal, stop.signal]) : stop.signal
+  const watch = setInterval(async () => {
+    try {
+      const [row] = await db<{ status: string; error: string | null }[]>`SELECT status, error FROM jobs WHERE id = ${jobId}`
+      if (row && row.status === 'failed' && row.error === STOPPED) stop.abort(new Error(STOPPED))
+    } catch { /* the next check */ }
+  }, 2000)
+  return { signal, stopped: () => stop.signal.aborted, end: () => clearInterval(watch) }
+}
+/** The signal was stopped by the user (not a timeout) */
+const isStop = (signal?: AbortSignal) => !!signal?.aborted && (signal.reason as Error | undefined)?.message === STOPPED
+
+/** Follow the subjects waiting (queued) through [start_ms, end_ms] of the source video */
+async function followMarked(clip_id: string, start_ms: number, end_ms: number, signal: AbortSignal) {
   // The subjects waiting when this job starts (ones marked later get a job of their own)
   const subjects = await db<{ id: string; mark_ms: number; mark_x: number; mark_y: number; shot: unknown }[]>`
     UPDATE clip_subjects SET status = 'running', progress = 5, error = NULL
@@ -941,7 +977,7 @@ export async function handleTrackSubjectsJob(job: Job, signal?: AbortSignal) {
     console.log(`[track_subjects] clip ${clip_id}: ${info.frames.length} frames, ${cuts.length} cut(s), subjects: ${seen || 'none'}, shots: ${shots.length} (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    await setSubjects(ids, { status: 'failed', error: `Tracking failed: ${msg}`, progress: 100 }).catch(() => {})
+    if (!isStop(signal)) await setSubjects(ids, { status: 'failed', error: `Tracking failed: ${msg}`, progress: 100 }).catch(() => {})
     throw err
   } finally {
     await rm(tmp, { recursive: true, force: true })
@@ -987,7 +1023,7 @@ async function scanAngles(clipId: string, from: number, to: number, signal?: Abo
     console.log(`[track_subjects] clip ${clipId}: ${angles.length} angle(s) from ${info.frames.length} frames, ${cuts.length} cut(s) (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    await db`UPDATE clip_angles SET status = 'failed', progress = 100, error = ${msg}, updated_at = now() WHERE clip_id = ${clipId}`.catch(() => {})
+    if (!isStop(signal)) await db`UPDATE clip_angles SET status = 'failed', progress = 100, error = ${msg}, updated_at = now() WHERE clip_id = ${clipId}`.catch(() => {})
     throw err
   } finally {
     await rm(tmp, { recursive: true, force: true })
@@ -1065,27 +1101,21 @@ async function subEditClip(jobId: string, clipId: string, queueSignal?: AbortSig
   const t0 = Date.now()
   // Stopped from the clip board: the job row says so. Checked every 2 s; everything running (the
   // download, FFmpeg, the face reading) is stopped through the signal
-  const stop = new AbortController()
-  const signal = queueSignal ? AbortSignal.any([queueSignal, stop.signal]) : stop.signal
-  const watch = setInterval(async () => {
-    try {
-      const [row] = await db<{ status: string; error: string | null }[]>`SELECT status, error FROM jobs WHERE id = ${jobId}`
-      if (row && row.status === 'failed' && row.error === STOPPED) stop.abort(new Error(STOPPED))
-    } catch { /* the next check */ }
-  }, 2000)
+  const watch = stopWatch(jobId, queueSignal)
+  const signal = watch.signal
   let created: string[] = []
   try {
     await subEditSteps(clipId, signal, ids => { created = ids }, t0)
   } catch (e) {
     // Stopped: nothing half-done stays (the people it had just registered go; the clip's framing was never touched)
-    if (stop.signal.aborted) {
+    if (watch.stopped()) {
       if (created.length) await db`DELETE FROM clip_subjects WHERE id = ANY(${created})`.catch(() => {})
       console.log(`[track_subjects] sub-edit clip ${clipId}: stopped by the user (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
       throw new Error(STOPPED)
     }
     throw e
   } finally {
-    clearInterval(watch)
+    watch.end()
   }
 }
 
