@@ -25,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges, heard_speech_ranges
 import emoji as emoji_art   # colour emoji (Twemoji 17), drawn locally
+import creator_captions     # the Creator caption styles (a template's `look`)
 from frames import is_frame, row_heights, row_order, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base, BLUR_SOURCE_SLOT, shown_main_slots, frame_background, bg_filter
 
 # ── Quality presets (identical to previous version) ───────────────────────────
@@ -183,7 +184,9 @@ def _write_ass(
     out_h: int,
     path: str,
     band_zones: list[tuple[int, int, int]] | None = None,
-) -> None:
+) -> dict:
+    """Writes the captions to `path`. Returns {"difference": a second file to blend in difference
+    mode or None, "behind": draw them under the person} (the Creator styles: creator_captions.py)."""
     font_id   = style.get("font") or "noto-sans-telugu"
     font_name = _ass_font_name(font_id)
     font_size = int(style.get("size") or 52)
@@ -224,16 +227,29 @@ def _write_ass(
         f"Style: Default,{font_name},{font_size},{primary},&H00FFFFFF,&H00000000,{shadow},"
         "0,0,0,0,100,100,0,0,1,3,2,5,10,10,10,1",
         *_preset_styles(style, font_name, font_size, latin=roman or _is_latin(" ".join(_word_display(w, roman) for w in words))),
+        creator_captions.style_line(),
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
 
+    tpl = _template(style)
+    if creator_captions.is_creator(tpl) and (roman or _is_latin(" ".join(_word_display(w, roman) for w in words))):
+        events, diff, behind = _creator_events(clip_words, style, tpl, out_w, out_h)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(emoji_art.colour_emoji_ass(lines + events)) + "\n")
+        diff_path = None
+        if diff:
+            diff_path = path[:-4] + "-difference.ass"
+            with open(diff_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines + diff) + "\n")
+        return {"difference": diff_path, "behind": behind}
+
     if _is_preset(style):
         lines += _preset_events(clip_words, style, out_w, out_h, band_zones or [])
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(emoji_art.colour_emoji_ass(lines)) + "\n")
-        return
+        return {"difference": None, "behind": False}
 
     # Karaoke: the spoken word in the highlight colour, lit until the next word starts (the
     # editor's drawCaptions does the same)
@@ -275,6 +291,30 @@ def _write_ass(
     # Emoji in full colour: stacked colour layers on top of the line (emoji.colour_emoji_ass)
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(emoji_art.colour_emoji_ass(lines)) + "\n")
+    return {"difference": None, "behind": False}
+
+
+def _creator_events(words: list[dict], style: dict, tpl: dict, out_w: int, out_h: int) -> tuple[list[str], list[str], bool]:
+    """A Creator style's events (creator_captions.events), its lines broken as the presets break them"""
+    roman = style.get("language") == "roman"
+    upper = bool(style.get("uppercase")) or bool(tpl.get("upper"))
+    per_line = max(1, int(style.get("words_per_line") or tpl.get("perLine") or 3))
+    emphasis = style.get("emphasis") or {}
+    if isinstance(emphasis, str):
+        try:
+            emphasis = json.loads(emphasis)
+        except ValueError:
+            emphasis = {}
+    lines = []
+    sentences = [s for s in _group_sentences(words, per_line) if s]
+    for sentence, (start_ms, end_ms) in zip(sentences, _line_times(sentences)):
+        if end_ms <= start_ms:
+            continue
+        shown = [(w, _word_display(w, roman)) for w in sentence]
+        shown = [(w, t.upper() if upper else t) for w, t in shown if t]
+        if shown:
+            lines.append((shown, start_ms, end_ms))
+    return creator_captions.events(lines, style, tpl, emphasis if isinstance(emphasis, dict) else {}, out_w, out_h, _caption_x(style, out_w))
 
 
 def _line_times(sentences: list[list[dict]]) -> list[tuple[int, int]]:
@@ -1847,11 +1887,12 @@ def main(
 
         # ── ASS captions ───────────────────────────────────────────────────────
         ass_path = None
+        ass_info = {"difference": None, "behind": False}
         # enabled False = the user turned captions off (styles saved before that field count as on)
         if clip_words and caption_style and caption_style.get("enabled") is not False:
             ass_path = os.path.join(tmp, "captions.ass")
-            _write_ass(clip_words, caption_style, clip_start_ms, out_w, out_h, ass_path,
-                       band_zones=caption_band_zones(segments, out_h))
+            ass_info = _write_ass(clip_words, caption_style, clip_start_ms, out_w, out_h, ass_path,
+                                  band_zones=caption_band_zones(segments, out_h))
 
         # ── Count how many times each source video is needed ───────────────────
         # FFmpeg requires explicit split() when a stream is consumed more than once.
@@ -2503,6 +2544,7 @@ def main(
             cur = "[veq]"
 
         # ── Subtitles (ASS captions) ───────────────────────────────────────────
+        behind_subs = None
         if ass_path:
             # Escape path for FFmpeg filter option: quoted, forward slashes, and inside the quotes
             # ':' (Windows drive letters) still needs escaping
@@ -2510,8 +2552,22 @@ def main(
                 return "'" + p.replace("\\", "/").replace(":", "\\:").replace("'", "") + "'"
             esc_ass   = _esc_path(ass_path)
             esc_fonts = _esc_path(_subtitle_fonts_dir(tmp))
-            fp.append(f"{cur}subtitles=filename={esc_ass}:fontsdir={esc_fonts}[vcap]")
-            cur = "[vcap]"
+            if ass_info["difference"]:
+                # Difference blend (a Creator style): those words drawn white on black, and the
+                # picture inverted where they are (in RGB, as the editor's canvas blends)
+                esc_diff = _esc_path(ass_info["difference"])
+                fp.append(f"{cur}split[vdf0][vdf1]")
+                fp.append(f"[vdf1]drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill,"
+                          f"subtitles=filename={esc_diff}:fontsdir={esc_fonts},format=gbrp[vdfw]")
+                fp.append(f"[vdf0]format=gbrp[vdfv]")
+                fp.append(f"[vdfv][vdfw]blend=all_mode=difference,format=yuv420p[vdiff]")
+                cur = "[vdiff]"
+            if ass_info["behind"]:
+                # Behind the person (a Creator style): burnt in after the render, under them (person_mask.py)
+                behind_subs = f"subtitles=filename={esc_ass}:fontsdir={esc_fonts}"
+            else:
+                fp.append(f"{cur}subtitles=filename={esc_ass}:fontsdir={esc_fonts}[vcap]")
+                cur = "[vcap]"
 
         # ── Text overlays (drawtext) ───────────────────────────────────────────
         for oi, ov in enumerate(text_overlays):
@@ -2837,10 +2893,7 @@ def main(
         fc_path = os.path.join(tmp, "graph.txt")
         with open(fc_path, "w", encoding="utf-8") as f:
             f.write(fc_str)
-        cmd = inputs + [
-            "-/filter_complex", fc_path,
-            "-map", "[vout]",
-            "-map", audio_map,
+        venc = [
             "-c:v", "libx264",
             # x264 defaults to ~1.5 threads per CPU core; on large Railway hosts that
             # makes encoder startup allocate GBs and fail ("Error while opening encoder")
@@ -2852,10 +2905,18 @@ def main(
             "-preset", qs["preset"],
             "-maxrate", qs["maxrate"],
             "-bufsize", qs["bufsize"],
+        ]
+        # Captions behind the person: this render goes without them, they're added after
+        rendered_path = os.path.join(tmp, "uncaptioned.mp4") if behind_subs else output_path
+        cmd = inputs + [
+            "-/filter_complex", fc_path,
+            "-map", "[vout]",
+            "-map", audio_map,
+            *venc,
             "-c:a", "aac",
             "-b:a", qs["audio_br"],
             "-shortest",
-            output_path,
+            rendered_path,
         ]
 
         print(f"[render] filter_complex ({len(fc_str)} chars): {fc_str[:800]}", flush=True)
@@ -2864,6 +2925,11 @@ def main(
         if result.returncode != 0:
             print(f"[render] FFmpeg stderr:\n{result.stderr[-4000:]}", flush=True)
             raise RuntimeError(f"FFmpeg render failed (exit {result.returncode})")
+
+        if behind_subs:
+            from person_mask import captions_behind
+            print("[render] Captions behind the person ...", flush=True)
+            captions_behind(rendered_path, behind_subs, output_path, tmp, venc)
 
     print(f"[render] Done → {output_path}", flush=True)
 
