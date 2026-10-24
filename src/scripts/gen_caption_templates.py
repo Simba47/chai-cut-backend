@@ -25,6 +25,14 @@ FONTS = {
     "instrument-serif-italic":     ("Instrument Serif", 0, 1, "InstrumentSerif-Italic.ttf", 0.769, 400, 0.762),
     "dm-serif-italic":             ("DM Serif Display", 0, 1, "DMSerifDisplay-Italic.ttf", 0.729, 400, 0.756),
     "gochi":                       ("Gochi Hand", 0, 0, "GochiHand-Regular.ttf", 0.848, 400, 0.654),
+    # (Creator styles in other scripts: the line's letters in these, the style's own weight and
+    #  slant put on them — creator_captions.py / creator.ts SCRIPTS)
+    "noto-telugu":                 ("Noto Sans Telugu", 0, 0, "NotoSansTelugu-Regular.ttf", 0.677, 400, 0.673),
+    "noto-devanagari":             ("Noto Sans Devanagari", 0, 0, "NotoSansDevanagari-Regular.ttf", 0.525, 400, 0.707),
+    "noto-tamil":                  ("Noto Sans Tamil", 0, 0, "NotoSansTamil-Regular.ttf", 0.806, 400, 0.702),
+    "noto-kannada":                ("Noto Sans Kannada", 0, 0, "NotoSansKannada-Regular.ttf", 0.608, 400, 0.672),
+    "noto-malayalam":              ("Noto Sans Malayalam", 0, 0, "NotoSansMalayalam-Regular.ttf", 0.802, 400, 0.693),
+    "noto-bengali":                ("Noto Sans Bengali", 0, 0, "NotoSansBengali-Regular.ttf", 0.713, 400, 0.709),
 }
 # how big each font is drawn (% of the caption size) so they all read about the same size
 SIZE = {"anton": 145, "bangers": 150, "bebas": 125, "kaushan": 110, "lilita": 90, "luckiest": 92,

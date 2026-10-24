@@ -290,7 +290,9 @@ export function viewOnFace(face: BoxPosition, view: { w: number; h: number }): B
   const cx = face.x + face.w / 2, cy = face.y + face.h / 2
   return {
     x: clamp(cx - view.w / 2, 0, Math.max(0, 1 - view.w)),
-    y: view.h >= 0.999 ? 0 : clamp(cy - view.h * 0.4, 0, Math.max(0, 1 - view.h)),
+    // (and its top at least half a face above the face's top: the face box ends at the forehead and
+    // a tight view put the hair outside it — user, 2026-10-24; as autoFormat.ts HEAD_ROOM)
+    y: view.h >= 0.999 ? 0 : clamp(Math.min(cy - view.h * 0.4, face.y - 0.5 * face.h), 0, Math.max(0, 1 - view.h)),
     w: view.w, h: view.h,
   }
 }

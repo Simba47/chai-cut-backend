@@ -92,6 +92,39 @@ def _font(key: str) -> dict:
     return _FONTS.get(key) or _FONTS.get("poppins") or {"family": "Roboto", "bold": 0, "italic": 0, "file": "Roboto-Regular.ttf", "em": 0.758, "asc": 0.75}
 
 
+# Lines in another script are drawn in its Noto font, with the style's own weight and slant put on
+# it (libass thickens / slants it; the editor's canvas does the same). Latin letters in such a line
+# are found by font fallback. The editor's creator.ts has the same list.
+SCRIPTS = [(0x0C00, 0x0C7F, "noto-telugu"), (0x0900, 0x097F, "noto-devanagari"), (0x0B80, 0x0BFF, "noto-tamil"),
+           (0x0C80, 0x0CFF, "noto-kannada"), (0x0D00, 0x0D7F, "noto-malayalam"), (0x0980, 0x09FF, "noto-bengali")]
+
+
+def script_font(text: str) -> str | None:
+    """The Noto font for the first non-Latin script in the text, None for Latin text"""
+    for ch in text:
+        o = ord(ch)
+        for lo, hi, key in SCRIPTS:
+            if lo <= o <= hi:
+                return key
+    return None
+
+
+def _scripted(key: str, script: str | None) -> str:
+    """The font a style's font `key` is drawn in for a line in `script` (a key of _FONTS)"""
+    if not script or script not in _FONTS:
+        return key
+    k = f"{script}|{key}"
+    if k not in _FONTS:
+        s, f = _FONTS[script], _font(key)
+        bold = int(f.get("weight", 400)) >= 600 or key in HEAVY
+        _FONTS[k] = {**s, "bold": 1 if bold else 0, "italic": int(f.get("italic", 0))}
+    return k
+
+
+# Display fonts that are one heavy weight though their files say regular (400)
+HEAVY = {"anton", "bangers", "bebas", "lilita", "luckiest"}
+
+
 def _fn(key: str, n: float) -> str:
     f = _font(key)
     return f"\\fn{f['family']}\\b{f['bold']}\\i{f['italic']}\\fs{n:.1f}"
@@ -170,7 +203,8 @@ def events(lines: list[tuple[list[tuple[dict, str]], int, int]], style: dict, tp
     hl = style.get("highlight_color") or tpl.get("hl") or "#FFE700"
     S = float(style.get("size") or 52) * float(tpl.get("size") or 100) / 100 * k
     key_n = S * float(tpl.get("keyScale") or 100) / 100
-    font, key_font = tpl["font"], tpl.get("keyFont") or tpl["font"]
+    base_font, base_key_font = tpl["font"], tpl.get("keyFont") or tpl["font"]
+    font, key_font = base_font, base_key_font
     shad = f"\\shad{float(tpl.get('shadow') or 0) * k:.1f}\\bord0"
     py = style.get("position_y")
     cy = float(py if py is not None else DEFAULT_Y[look]) * H
@@ -195,6 +229,9 @@ def events(lines: list[tuple[list[tuple[dict, str]], int, int]], style: dict, tp
 
     for li, (shown, a, b) in enumerate(lines):
         texts = [t for _, t in shown]
+        # (a line in another script: its Noto font, in the style's weight and slant)
+        script = script_font(" ".join(texts))
+        font, key_font = _scripted(base_font, script), _scripted(base_key_font, script)
         emph = [bool(emphasis.get(str(w.get("_src_start", w["start_ms"])))) for w, _ in shown]
         ons = [w["start_ms"] - a for w, _ in shown]
         offs = [(shown[j + 1][0]["start_ms"] if j + 1 < len(shown) else b) - a for j in range(len(shown))]

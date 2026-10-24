@@ -647,6 +647,12 @@ export interface Angle {
   faces: Array<{ x: number; y: number; w: number; h: number; person?: number }>
   /** Wherever the clip shows it: [start, end] ms from the start of the scan */
   spans: Turn[]
+  /**
+   * Who talks in each of `spans` (user, 2026-10-24: Auto format puts the speaker at the bottom):
+   * talk[i][k] is how long faces[k]'s person talks in spans[i] (ms; 0 when not known). None without
+   * a transcript.
+   */
+  talk?: number[][]
 }
 
 /**
@@ -654,7 +660,7 @@ export interface Angle {
  * one: the stretches between camera cuts, put together where they show the same shot (the same
  * people in the same places); stretches with no faces, or too short, are the last one (people: 0).
  */
-export function findAngles(frames: FrameDetection[], cuts: number[], durationMs: number): Angle[] {
+export function findAngles(frames: FrameDetection[], cuts: number[], durationMs: number, speech: SpokenWord[] = []): Angle[] {
   const fr: FrameDetection[] = [...frames]
     .sort((a, b) => a.frame_index - b.frame_index)
     .map(f => ({ ...f, faces: f.faces.filter(face => (face.score ?? 0) > 0) }))
@@ -791,13 +797,22 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
       return best[0]
     })
   }
+  // Each person's talking turns (by who they are: the transcript's words, each to whose lips move on it)
+  const everyone = [...new Set(personAt.values())]
+  const turns = speech.length && everyone.length
+    ? speakingTurns(fr.length, timeOf, everyone.map(String), (s, fi) => fr[fi].faces.find(f => personAt.get(f) === Number(s)), speech)
+    : null
+  const talking = (p: number | undefined, [a, b]: Turn) => p === undefined || !turns ? 0
+    : Math.round((turns.get(String(p)) ?? []).reduce((n, [x, y]) => n + Math.max(0, Math.min(b, y) - Math.max(a, x)), 0))
   const angles: Angle[] = found.flatMap((a, id) => {
     if (!kept.has(id)) return []
     const persons = personsOf(a.faces, id)
+    const spans = spansOf(s => s.angle === id)
     return [{
       people: a.faces.length, at: Math.round(a.at),
       faces: a.faces.map((f, i) => ({ x: round4(f.x), y: round4(f.y), w: round4(f.w), h: round4(f.h), ...(persons[i] !== undefined ? { person: persons[i] } : {}) })),
-      spans: spansOf(s => s.angle === id),
+      spans,
+      ...(turns ? { talk: spans.map(span => persons.map(p => talking(p, span))) } : {}),
     }]
   })
   const rest = spansOf(s => !kept.has(s.angle))
@@ -998,21 +1013,23 @@ async function scanAngles(clipId: string, from: number, to: number, signal?: Abo
   const t0 = Date.now()
   const tmp = await mkdtemp(join(tmpdir(), 'angles-'))
   try {
-    const [clip] = await db<{ storage_path: string | null; proxy_path: string | null }[]>`
-      SELECT v.storage_path, v.proxy_path FROM clips c JOIN videos v ON v.id = c.video_id WHERE c.id = ${clipId}
+    const [clip] = await db<{ storage_path: string | null; proxy_path: string | null; video_id: string }[]>`
+      SELECT v.storage_path, v.proxy_path, v.id AS video_id FROM clips c JOIN videos v ON v.id = c.video_id WHERE c.id = ${clipId}
     `
     if (!clip?.storage_path) throw new Error('The video of this clip could not be found')
     const videoPath = await clipVideo(clip, tmp, signal)
     await db`UPDATE clip_angles SET progress = 25, updated_at = now() WHERE clip_id = ${clipId}`
-    const [info, cuts] = await Promise.all([
+    const [info, cuts, speech] = await Promise.all([
       // The faces exactly as the tracker reads them (lips, people side by side, who is who): a face
       // listed here is one that can be followed. The list used to read every face its own way, so a
       // flower vase listed as a face, the tracker never found it, and marking it failed (2026-10-24)
       detectFaces(tmp, videoPath, from, to, signal, true, false, true),
       detectCuts(videoPath, from, to, signal),
+      // (who talks in each scene: Auto format's speaker)
+      spokenWords(clip.video_id, from, to),
     ])
     signal?.throwIfAborted()
-    const angles = findAngles(info.frames, cuts, to - from).map(a => ({
+    const angles = findAngles(info.frames, cuts, to - from, speech).map(a => ({
       ...a, at: a.at + from, spans: a.spans.map(([s, e]) => [s + from, e + from]),
     }))
     await db`
