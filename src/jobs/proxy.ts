@@ -3,7 +3,7 @@ import { promisify } from 'node:util'
 import { mkdtemp, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { DeleteObjectCommand } from '@aws-sdk/client-s3'
+import { DeleteObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3'
 import { r2, R2_BUCKET, r2DownloadToFile, r2UploadFile } from '../r2.js'
 import db from '../db.js'
 import type { Job, ProxyJobPayload } from '../types.js'
@@ -24,6 +24,33 @@ const PROXY_SHORT_SIDE = 720
 /** Where a video's editing copy is kept: next to it (deleted with it: see the frontend's deletes) */
 export function proxyKeyFor(storagePath: string): string {
   return storagePath.replace(/\.[^.]+$/, '') + '_proxy.mp4'
+}
+
+/**
+ * Where a video's audio is kept: 16 kHz mono FLAC, what captions read (jobs/transcribe.ts). Kept
+ * by the editing copy, or by the first whole-video reading; deleted with the video.
+ */
+export function audioKeyFor(storagePath: string): string {
+  return storagePath.replace(/\.[^.]+$/, '_audio.flac')
+}
+
+/**
+ * Keeps the video's audio in storage, from the video file already on disk (a minute's work for an
+ * hour of video): a whole-video reading (AI edit) then starts straight away, without reading the
+ * video again. Nothing to do when it is kept already or the video has no sound.
+ */
+async function keepAudio(storagePath: string, src: string, tmp: string, signal?: AbortSignal): Promise<void> {
+  const key = audioKeyFor(storagePath)
+  const kept = await r2.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: key })).then(() => true, () => false)
+  if (kept) return
+  const { stdout } = await execFileAsync('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', src], { signal })
+  if (!stdout.trim()) return
+  const out = join(tmp, 'audio.flac')
+  const started = Date.now()
+  await execFileAsync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', src, '-vn', '-ac', '1', '-ar', '16000',
+    '-c:a', 'flac', '-compression_level', '5', out], { signal, maxBuffer: 16 * 1024 * 1024 })
+  await r2UploadFile(key, out, 'audio/flac')
+  console.log(`[proxy] audio kept in ${Math.round((Date.now() - started) / 1000)} s (${key})`)
 }
 
 /** The ffmpeg arguments for the editing copy */
@@ -89,6 +116,8 @@ export async function handleProxyJob(job: Job, signal?: AbortSignal) {
     }
     const [a, b] = await Promise.all([stat(src), stat(out)])
     console.log(`[proxy] video ${video_id}: editing copy made in ${Math.round((Date.now() - started) / 1000)} s, ${(b.size / 1e6).toFixed(1)} MB (original ${(a.size / 1e6).toFixed(1)} MB)`)
+    await keepAudio(storagePath, src, tmp, signal)
+      .catch(e => console.warn(`[proxy] video ${video_id}: could not keep its audio:`, (e instanceof Error ? e.message : String(e)).split('\n')[0]))
   } finally {
     await rm(tmp, { recursive: true, force: true })
   }

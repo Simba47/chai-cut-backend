@@ -8,7 +8,7 @@ process.env.R2_ENDPOINT ??= 'http://127.0.0.1:1'
 process.env.R2_ACCESS_KEY_ID ??= 'test'
 process.env.R2_SECRET_ACCESS_KEY ??= 'test'
 process.env.R2_BUCKET ??= 'test'
-const { shotSpans, settleGroups } = await import('./track_subjects.js')
+const { shotSpans, settleGroups, whoIs, followSubjects, findAngles, findPeople } = await import('./track_subjects.js')
 
 // ── A made-up clip, 4 frames a second ──
 // A colour signature (24 numbers summing to 1) `d` away (L1) from person A's
@@ -78,5 +78,65 @@ test('a panel: a face more where someone sits in the marked shot is not another 
   }
   for (let n = 0; n * 250 + 100 < 15000; n++) fp.push({ frame_index: n, person_count: 0, faces: at(n * 250 + 100, n) })
   const { spans } = shotSpans(fp, [5000, 10000], 1100, 15000)
+  assert.deepEqual(spans, [[0, 5000], [10000, 15000]])
+})
+
+// ── Who is who: faces' identities (the detector's SFace `emb`) ──
+// Person k's identity, read a little differently in each frame n (unit length; the same person ~0.9 alike, others ~0)
+const emb = (k: number, n: number) => {
+  const v = Array.from({ length: 16 }, (_, i) => (i === k ? 1 : 0) + 0.15 * Math.sin(n * 7 + i * 3))
+  const len = Math.hypot(...v)
+  return v.map(x => x / len)
+}
+const person = (k: number, x: number, d: number, n: number, w = 0.14): CropBox => ({ ...face(x, d, w), emb: emb(k, n) })
+/** A made-up clip: `at(t, n)` the faces at a moment (ms) and frame */
+function made(dur: number, at: (t: number, n: number) => CropBox[]): FrameDetection[] {
+  const out: FrameDetection[] = []
+  for (let n = 0; n * 250 + 100 < dur; n++) { const faces = at(n * 250 + 100, n); out.push({ frame_index: n, person_count: faces.length, faces }) }
+  return out
+}
+// P in a close-up; Q in the same seat, colours alike (a man in black, a woman in white: 0.1 apart);
+// P again from another camera (another place, other colours: the light)
+const pq = made(15000, (t, n) => (t < 5000 ? [person(0, 0.5, 0.05, n)] : t < 10000 ? [person(1, 0.52, 0.15, n)] : [person(0, 0.3, 0.45, n)]))
+const pqCuts = [5000, 10000]
+
+test('who is who: the same person in another camera angle is one person; someone else whose colours read alike is not', () => {
+  const who = whoIs(pq, pqCuts)
+  const at = (t: number) => who.get(pq[Math.floor((t - 100) / 250)].faces[0])
+  assert.equal(at(1100), at(11100))
+  assert.notEqual(at(1100), at(6100))
+  assert.notEqual(at(1100), undefined)
+})
+
+test('marking the same person again, in another angle, is caught (no duplicate subject)', () => {
+  const [a, b] = followSubjects(pq, pqCuts, [{ id: 'a', t: 1100, x: 0.5, y: 0.4 }, { id: 'b', t: 11100, x: 0.3, y: 0.4 }])
+  assert.equal(a.error, undefined)
+  assert.match(b.error ?? '', /same person/)
+})
+
+test('a subject is followed into their other angles, and never onto someone else whose colours read alike', () => {
+  const [a] = followSubjects(pq, pqCuts, [{ id: 'a', t: 1100, x: 0.5, y: 0.4 }])
+  assert.ok(a.path.some(([t]) => t > 10000), 'seen in their other angle')
+  assert.ok(!a.path.some(([t]) => t > 5000 && t < 10000), 'not on the other person in their seat')
+})
+
+test('the scenes: someone else in the same seat is another scene; each face says who it is, the same in every scene', () => {
+  const angles = findAngles(pq, pqCuts, 15000)
+  assert.equal(angles.length, 3)
+  const [p1, q, p2] = angles.map(a => a.faces[0].person)
+  assert.notEqual(p1, undefined)
+  assert.equal(p1, p2)
+  assert.notEqual(p1, q)
+})
+
+test('sub-edit registers each person once, whichever angles they are in', () => {
+  assert.equal(findPeople(pq, pqCuts).length, 2)
+})
+
+test('a trio with one face never read through a camera shot is still the group', () => {
+  // Marked with all three read; the shot comes back at 10–15 s with the middle one's head turned all through
+  const trio = made(15000, t => t >= 5000 && t < 10000 ? [face(0.4, 0.9)]
+    : [face(0.2, 0.05, 0.06), ...(t < 10000 ? [face(0.5, 0.05, 0.06)] : []), face(0.8, 0.05, 0.06)])
+  const { spans } = shotSpans(trio, [5000, 10000], 1100, 15000)
   assert.deepEqual(spans, [[0, 5000], [10000, 15000]])
 })

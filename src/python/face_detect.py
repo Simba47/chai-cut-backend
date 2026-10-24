@@ -46,6 +46,13 @@ LANDMARKER_PATH = os.path.join(SCRIPT_DIR, 'face_landmarker.task')
 # wide shot) that BlazeFace short-range misses, and doesn't take faces in posters for people
 YUNET_PATH = os.path.join(SCRIPT_DIR, 'face_detection_yunet_2023mar.onnx')
 YUNET_SCORE = 0.6
+# OpenCV SFace (Apache-2.0, opencv_zoo, int8): a face's identity as 128 numbers, from YuNet's five
+# points — who is who across camera angles. The colours of face and clothes can't tell: the same
+# bearded man in two angles read 0.40 apart, him and a woman in white 0.42 (2026-10-24); SFace put
+# the same people at 0.54–0.93 alike and different people at 0.42 at most
+SFACE_PATH = os.path.join(SCRIPT_DIR, 'face_recognition_sface_2021dec_int8.onnx')
+# …read only on faces at least this wide (pixels of the 640 px frame): smaller ones say too little
+ID_MIN_PX = 24
 
 MIN_SCORE = 0.5        # ignore less confident MediaPipe faces
 # Ignore faces smaller than this share of the frame. Small enough for everyone at a table in a
@@ -155,14 +162,71 @@ class _YuNet:
             x, y = max(0.0, x), max(0.0, y)
             w, h = min(w, w_px - x), min(h, h_px - y)
             if w > 0 and h > 0:
-                out.append(_normalize(x, y, w, h, w_px, h_px, score))
+                # (_row: YuNet's own result in pixels, with the five points SFace aligns the face on)
+                out.append({**_normalize(x, y, w, h, w_px, h_px, score), "_row": [float(v) for v in r]})
         return out
 
+    def detect_near(self, bgr, box):
+        """YuNet's face at a face another detector found (box: fractions of the frame), looked for in
+        a close crop round it (made bigger when small), or None"""
+        import cv2
+        h_px, w_px = bgr.shape[:2]
+        side = max(box["w"] * w_px, box["h"] * h_px) * 2.2
+        cx, cy = (box["x"] + box["w"] / 2) * w_px, (box["y"] + box["h"] / 2) * h_px
+        x0, y0 = int(max(0, cx - side / 2)), int(max(0, cy - side / 2))
+        x1, y1 = int(min(w_px, cx + side / 2)), int(min(h_px, cy + side / 2))
+        if x1 - x0 < 16 or y1 - y0 < 16:
+            return None
+        k = max(1.0, 160.0 / max(x1 - x0, y1 - y0))
+        crop = cv2.resize(bgr[y0:y1, x0:x1], None, fx=k, fy=k, interpolation=cv2.INTER_LINEAR) if k > 1 else bgr[y0:y1, x0:x1]
+        self._det.setInputSize((crop.shape[1], crop.shape[0]))
+        _, faces = self._det.detect(crop)
+        best = None
+        for r in ([] if faces is None else faces):
+            # Back to the frame's pixels: the box and the five points
+            row = [float(v) for v in r]
+            for i in range(0, 14, 2):
+                row[i], row[i + 1] = row[i] / k + x0, row[i + 1] / k + y0
+            row[2], row[3] = float(r[2]) / k, float(r[3]) / k
+            mx, my = row[0] + row[2] / 2, row[1] + row[3] / 2
+            # Its middle inside the other detector's box: the same face
+            if not (box["x"] * w_px <= mx <= (box["x"] + box["w"]) * w_px and box["y"] * h_px <= my <= (box["y"] + box["h"]) * h_px):
+                continue
+            if best is None or row[-1] > best[-1]:
+                best = row
+        if best is None:
+            return None
+        x, y = max(0.0, best[0]), max(0.0, best[1])
+        w, h = min(best[2], w_px - x), min(best[3], h_px - y)
+        return {**_normalize(x, y, w, h, w_px, h_px, best[-1]), "_row": best} if w > 0 and h > 0 else None
 
-def _merge_faces(mp_boxes, yn_boxes):
+
+class _Identity:
+    """A face's identity (SFace): 128 numbers, unit length — two faces' dot product is how alike they are"""
+    def __init__(self):
+        import cv2
+        self._rec = cv2.FaceRecognizerSF.create(SFACE_PATH, "")
+
+    def of(self, bgr, face):
+        row = face.get("_row")
+        if row is None or face["w"] * bgr.shape[1] < ID_MIN_PX:
+            return None
+        v = self._rec.feature(self._rec.alignCrop(bgr, np.array(row, dtype=np.float32).reshape(1, -1))).flatten()
+        n = float(np.linalg.norm(v))
+        return [round(float(x) / n, 3) for x in v] if n > 0 else None
+
+
+def _merge_faces(mp_boxes, yn_boxes, people=False, yunet=None, bgr=None):
     """Faces from both detectors: those both found, YuNet's alone (small/distant faces), and
     MediaPipe's alone only when it is sure (side-on faces YuNet can miss; an unsure MediaPipe-only
-    face is usually a picture on the wall)"""
+    face is usually a picture on the wall).
+
+    `people` (the Subjects tool): every face in YuNet's box (a MediaPipe-only face is looked for again
+    by YuNet in a close crop), so a face is one size from frame to frame — MediaPipe, unsure on small
+    faces, came and went, and with it the box: one man on a sofa read 0.044 wide, then 0.080, then
+    0.046 (2026-10-24), so his group wasn't found there and his track broke. And only a sure face
+    sets the "too small next to the biggest" line: a weak YuNet box over a flower vase (61% sure,
+    half the frame) put the woman beside it under that line, and she wasn't found at all."""
     # Each face's size as YuNet measures it ("_size"): MediaPipe draws its box round the same face
     # about 2–3× bigger, so next to a MediaPipe box every YuNet-only face looked too small and was
     # dropped. Faces both found take YuNet's; MediaPipe-only ones are scaled by how much bigger
@@ -171,10 +235,15 @@ def _merge_faces(mp_boxes, yn_boxes):
     for m in mp_boxes:
         match = max(yn_boxes, key=lambda y: _iou(m, y), default=None)
         if match is not None and _iou(m, match) > 0.3:
-            out.append({**m, "score": max(m["score"], match["score"]), "_size": match["area"], "_sure": match["score"]})
+            score = max(m["score"], match["score"])
+            out.append({**(match if people else m), "score": score, "_size": match["area"], "_sure": match["score"]})
             ratios.append(m["area"] / max(1e-9, match["area"]))
         elif m["score"] >= UNSURE_FACE:
-            out.append({**m, "_size": None, "_sure": 0.0})
+            again = yunet.detect_near(bgr, m) if people and yunet is not None and bgr is not None else None
+            if again is not None:
+                out.append({**again, "score": max(m["score"], again["score"]), "_size": again["area"], "_sure": max(m["score"], again["score"])})
+            else:
+                out.append({**m, "_size": None, "_sure": m["score"] if people else 0.0})
     scale = float(np.median(ratios)) if ratios else 1.0
     for b in out:
         if b["_size"] is None:
@@ -186,7 +255,8 @@ def _merge_faces(mp_boxes, yn_boxes):
     out.sort(key=lambda b: -b["_size"])
     # Round a table, the person nearest the camera can look 2–3× bigger than those across it
     if out:
-        biggest = out[0]["_size"]
+        sure = [b for b in out if b["_sure"] >= SURE_SMALL_FACE] if people else []
+        biggest = (sure or out)[0]["_size"]
         out = [b for b in out if b["_size"] >= 0.25 * biggest]
     for b in out:
         b.pop("_size", None)
@@ -385,6 +455,15 @@ def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False
         except Exception as e:
             print(f"[detect] FaceLandmarker unavailable, no speaker tracking: {e}", file=sys.stderr)
 
+    # Who is who (people: the Subjects tool tells the same person apart across camera angles)
+    identity = None
+    if people and yunet is not None and os.path.exists(SFACE_PATH):
+        try:
+            identity = _Identity()
+        except Exception as e:
+            print(f"[detect] SFace unavailable, people told apart by colours only: {e}", file=sys.stderr)
+    id_faces = 0
+
     frame_files = sorted(
         f for f in os.listdir(frames_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))
     )
@@ -420,7 +499,7 @@ def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False
             except Exception as e:
                 print(f"[detect] YuNet failed on frame {fi}: {e}", file=sys.stderr)
         if mediapipe is not None or yunet is not None:
-            subjects = _merge_faces(mp_boxes, yn_boxes) if yunet is not None \
+            subjects = _merge_faces(mp_boxes, yn_boxes, people, yunet, img) if yunet is not None \
                 else _filter_by_size(sorted([b for b in mp_boxes if b["area"] >= MIN_FACE_AREA], key=lambda b: -b["area"]))
             if subjects:
                 method = "mediapipe"
@@ -492,6 +571,14 @@ def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False
                 before = len(subjects)
                 subjects = [s for s in subjects if not (s["score"] < UNSURE_FACE and s["lip"] is None and s["area"] >= UNREADABLE_MIN_AREA)]
                 unreadable += before - len(subjects)
+            if identity is not None:
+                for s in subjects:
+                    try:
+                        s["emb"] = identity.of(img, s)
+                    except Exception as e:
+                        s["emb"] = None
+                        print(f"[detect] SFace failed on frame {fi}: {e}", file=sys.stderr)
+                    id_faces += s["emb"] is not None
         method = methods[fi] if subjects else "none"
 
         # Position fallback — no (live) face: follow the motion, counted as 1 person
@@ -521,8 +608,8 @@ def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False
                 subjects = [max(subjects, key=lambda s: s["area"])]
 
         # all_faces keeps every face, so one face found twice (a small box inside a bigger one) must
-        # count once: the crop filters above used to hide it
-        if all_faces and len(subjects) >= 2:
+        # count once: the crop filters above used to hide it (people: the proximity filter is off too)
+        if (all_faces or people) and len(subjects) >= 2:
             kept = []
             for s in sorted(subjects, key=lambda s: -s["area"]):
                 if not any(_inside_share(s, k) > 0.6 for k in kept):
@@ -541,7 +628,8 @@ def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False
             "faces": [{"x": s["x"], "y": s["y"], "w": s["w"], "h": s["h"], "score": round(s["score"], 3),
                        **({"lip": s["lip"]} if s.get("lip") is not None else {}),
                        **({"ex": s["ex"]} if s.get("ex") is not None else {}),
-                       **({"sig": s["sig"]} if s.get("sig") is not None else {})}
+                       **({"sig": s["sig"]} if s.get("sig") is not None else {}),
+                       **({"emb": s["emb"]} if s.get("emb") is not None else {})}
                       for s in subjects[:MAX_FACES]],
         })
 
@@ -552,7 +640,8 @@ def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False
     print(
         f"[detect] {len(per_frame)} frames, faces/frame min={min(counts)} "
         f"avg={sum(counts) / len(counts):.2f} max={max(counts)}, by method {counts_by_method}, "
-        f"static faces dropped: {len(static)}, unreadable unsure faces dropped: {unreadable}, lips read on {lip_frames} frames",
+        f"static faces dropped: {len(static)}, unreadable unsure faces dropped: {unreadable}, lips read on {lip_frames} frames"
+        + (f", identities read on {id_faces} faces" if identity is not None else ""),
         file=sys.stderr,
     )
 
