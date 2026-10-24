@@ -26,7 +26,8 @@ const execFileAsync = promisify(execFile)
 
 /** Expression, 0–1 each (MediaPipe blendshapes): smile, jaw open, brows up, brows down, eyes wide, frown */
 export interface Expression { sm: number; jo: number; bu: number; bd: number; ew: number; fr: number }
-export interface CropBox { x: number; y: number; w: number; h: number; score?: number; lip?: number; ex?: Expression; sig?: number[] }
+/** `emb`: the face's identity (SFace, 128 numbers of unit length; people mode only, faces big enough) */
+export interface CropBox { x: number; y: number; w: number; h: number; score?: number; lip?: number; ex?: Expression; sig?: number[]; emb?: number[] }
 export interface FrameDetection { frame_index: number; person_count: number; faces: CropBox[] }
 export interface FaceInfo { face_count: number; face_boxes: CropBox[]; frames: FrameDetection[] }
 interface SlotKf { t_ms: number; x: number; y: number; w: number; h: number }

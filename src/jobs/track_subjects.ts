@@ -138,6 +138,73 @@ const l1 = (a: number[], b: number[]) => a.reduce((t, v, i) => t + Math.abs(v - 
 const meanOf = (sigs: number[][]) => sigs[0].map((_, k) => sigs.reduce((t, v) => t + v[k], 0) / sigs.length)
 const round4 = (v: number) => Math.round(v * 10000) / 10000
 
+// ── Who is who: the faces' identities (SFace, the detector's `emb`) ─────────────
+// The colours of face and clothes can't tell people apart across camera angles: the same bearded man
+// in two angles read 0.40 apart and him against a woman in white 0.42 (2026-10-24, a 7-person
+// interview) — so the woman's other close-ups listed as other people and the man's track took 54% of
+// the clip. Faces' identities, averaged over a track: the same person 0.45 alike or more, different
+// people 0.31 at most. Faces too small to read (a wide shot) have none: there the colours still decide.
+/** Two tracks' identities this alike (dot product of the means) or more: the same person */
+const ID_SAME = 0.45
+/** …under this: surely someone else (in between: not known, the colours decide) */
+const ID_OTHER = 0.3
+/** A track's identity is known from this many faces read */
+const ID_MIN_FACES = 3
+
+const dot = (a: number[], b: number[]) => a.reduce((t, v, i) => t + v * (b[i] ?? 0), 0)
+const unit = (v: number[]) => { const n = Math.hypot(...v); return n > 0 ? v.map(x => x / n) : v }
+
+/**
+ * The people in a scan: face tracks (trackFaces' ids, per frame) put together by identity — average
+ * likeness between groups of tracks, the most alike first, while at least ID_SAME. Two tracks seen in
+ * the same frame are two people, always. Returns each track's person (tracks with no identity have none)
+ * and each person's identity.
+ */
+export function identities(frames: FrameDetection[], ids: number[][]): { personOf: Map<number, number>; idOf: Map<number, number[]> } {
+  const embs = new Map<number, number[][]>(), seen = new Map<number, Set<number>>()
+  frames.forEach((f, fi) => ids[fi].forEach((id, k) => {
+    const e = f.faces[k]?.emb
+    if (e?.length) embs.set(id, [...(embs.get(id) ?? []), e])
+    seen.set(id, (seen.get(id) ?? new Set()).add(fi))
+  }))
+  const known = [...embs].filter(([, v]) => v.length >= ID_MIN_FACES).map(([id, v]) => ({ id, e: unit(meanOf(v)) }))
+  const sim = known.map(a => known.map(b => dot(a.e, b.e)))
+  const apart = known.map(a => known.map(b => a === b ? false : [...seen.get(a.id)!].some(fi => seen.get(b.id)!.has(fi))))
+  let groups = known.map((_, i) => [i])
+  for (;;) {
+    let best = ID_SAME, bi = -1, bj = -1
+    for (let i = 0; i < groups.length; i++) for (let j = i + 1; j < groups.length; j++) {
+      if (groups[i].some(a => groups[j].some(b => apart[a][b]))) continue
+      let s = 0
+      for (const a of groups[i]) for (const b of groups[j]) s += sim[a][b]
+      s /= groups[i].length * groups[j].length
+      if (s >= best) { best = s; bi = i; bj = j }
+    }
+    if (bi < 0) break
+    groups[bi] = [...groups[bi], ...groups[bj]]
+    groups = groups.filter((_, k) => k !== bj)
+  }
+  // (most seen first: person 0 is the one on screen most)
+  const size = (g: number[]) => g.reduce((t, i) => t + seen.get(known[i].id)!.size, 0)
+  groups.sort((a, b) => size(b) - size(a))
+  const personOf = new Map<number, number>(), idOf = new Map<number, number[]>()
+  groups.forEach((g, p) => {
+    for (const i of g) personOf.set(known[i].id, p)
+    idOf.set(p, unit(meanOf(g.flatMap(i => embs.get(known[i].id)!))))
+  })
+  return { personOf, idOf }
+}
+
+/** Who each face of a scan is (identities): face → person; faces too small to read aren't in it */
+export function whoIs(frames: FrameDetection[], cuts: number[]): Map<CropBox, number> {
+  const fr = [...frames].sort((a, b) => a.frame_index - b.frame_index).map(f => ({ ...f, faces: f.faces.filter(face => (face.score ?? 0) > 0) }))
+  const ids = trackFaces(fr, cuts.map(c => c - FRAME_SHOWS_MS))
+  const { personOf } = identities(fr, ids)
+  const who = new Map<CropBox, number>()
+  fr.forEach((f, fi) => ids[fi].forEach((id, k) => { const p = personOf.get(id); if (p !== undefined) who.set(f.faces[k], p) }))
+  return who
+}
+
 /**
  * How well a click points at a face: the face itself, or the person under it (their body is below
  * their head, a little wider). Lower is better; null when the click is not on that person.
@@ -163,6 +230,8 @@ export function followSubjects(frames: FrameDetection[], cuts: number[], marks: 
     .map(f => ({ ...f, faces: f.faces.filter(face => (face.score ?? 0) > 0) }))
   // (trackFaces times frames as frame_index × 250 ms: the cuts are moved to match)
   const ids = trackFaces(fr, cuts.map(c => c - FRAME_SHOWS_MS))
+  // Who is who, across camera angles (identities)
+  const { personOf } = identities(fr, ids)
   // Every track: the frames it is in (frame position → face) and its colours
   const tracks = new Map<number, Map<number, CropBox>>()
   fr.forEach((f, fi) => ids[fi].forEach((id, k) => {
@@ -217,24 +286,33 @@ export function followSubjects(frames: FrameDetection[], cuts: number[], marks: 
     }
     if (!best) { errors.set(mk.id, 'No face in the view here. Put the view on their face (where it can be seen) and mark them again.'); continue }
     const id = (best as { id: number }).id
-    const other = [...marked].find(([, t]) => t === id)
+    // (the same face, or the same person in another angle)
+    const other = [...marked].find(([, t]) => t === id || (personOf.has(id) && personOf.get(t) === personOf.get(id)))
     if (other) { errors.set(mk.id, 'This is the same person as another subject.'); continue }
     marked.set(mk.id, id)
   }
 
-  // The other tracks, given to the subject whose colours they match (clearly), nearest first
+  // Everywhere else the subject's person is seen (the tracks with their identity) is theirs
   const subjects = [...marked.keys()]
   const owned = new Map<string, Set<number>>(subjects.map(s => [s, new Set([marked.get(s)!])]))
-  const taken = new Set(marked.values())
+  const personOfSubject = new Map(subjects.map(s => [s, personOf.get(marked.get(s)!)]))
+  for (const s of subjects) {
+    const p = personOfSubject.get(s)
+    if (p !== undefined) for (const [id, q] of personOf) if (q === p) owned.get(s)!.add(id)
+  }
+  const taken = new Set([...owned.values()].flatMap(set => [...set]))
   const framesOf = (s: string) => {
     const set = new Set<number>()
     for (const id of owned.get(s)!) for (const fi of tracks.get(id)!.keys()) set.add(fi)
     return set
   }
+  // The other tracks, given to the subject whose colours they match (clearly), nearest first. A track
+  // whose identity is known is someone else's than a subject with another identity: never by colours
   const offers: Array<{ id: number; s: string; d: number }> = []
   for (const [id, sig] of sigOf) {
     if (taken.has(id)) continue
     const ds = subjects
+      .filter(s => !personOf.has(id) || personOfSubject.get(s) === undefined)
       .map(s => ({ s, d: sigOf.has(marked.get(s)!) ? l1(sig, sigOf.get(marked.get(s)!)!) : Infinity }))
       .sort((a, b) => a.d - b.d)
     const [first, second] = ds
@@ -324,8 +402,11 @@ export interface ShotResult {
 /**
  * Where the clip shows the shot marked at `markT` (ms from the start of the scan): [start, end]
  * stretches, and the people's box frame by frame. `cuts`: the camera cuts; `durationMs`: the scan.
+ * `who` (whoIs): who each face is — where both a face and the marked one are known, that decides
+ * whether they are the same people (colours can't: a man in black and a woman in white in close-ups
+ * from the same seat, 2026-10-24); the colours decide only for faces too small to read.
  */
-export function shotSpans(frames: FrameDetection[], cuts: number[], markT: number, durationMs: number): ShotResult {
+export function shotSpans(frames: FrameDetection[], cuts: number[], markT: number, durationMs: number, who?: Map<CropBox, number>): ShotResult {
   const fr: FrameDetection[] = [...frames]
     .sort((a, b) => a.frame_index - b.frame_index)
     .map(f => ({ ...f, faces: f.faces.filter(face => (face.score ?? 0) > 0) }))
@@ -360,6 +441,18 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
       .flatMap(x => x.f.faces.filter(face => near(face, r) !== null && face.sig?.length).slice(0, 1).map(face => face.sig!))
     return sigs.length ? meanOf(sigs) : r.sig?.length ? r.sig : null
   })
+  // …and who they are: the person seen most in each marked face's place through the marked camera shot
+  const refPersons = refFaces.map(r => {
+    if (!who) return undefined
+    const votes = new Map<number, number>()
+    for (const x of homeFrames) {
+      const face = x.f.faces.find(g => near(g, r) !== null && who.has(g))
+      if (!face) continue
+      const p = who.get(face)!
+      votes.set(p, (votes.get(p) ?? 0) + 1)
+    }
+    return [...votes].sort((p, q) => q[1] - p[1])[0]?.[0]
+  })
 
   // Each frame: the marked shot (every face where it was), part of it (some faces not read), another
   // shot, or no faces read. `apart`: how far its faces' colours are from the marked people's (their
@@ -368,7 +461,10 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
   // 2026-10-20): in a panel of seven the face reader sees 4 to 7 of them as heads turn, and a frame
   // with one more face counted as another shot, so a group marked on 5 faces wasn't found where the
   // same shot came back. Someone walking in (a place nobody was in) still is another shot
-  type State = 'match' | 'part' | 'other' | 'none'
+  // 'most': all the faces but one, each where it was (a group of 3 or more) — on a sofa of three the
+  // face reader often misses one turned head for a whole camera shot (user, 2026-10-24: 29 frames of
+  // the same three people, colours 0.10 apart, never all three read — the group wasn't found there)
+  type State = 'match' | 'most' | 'part' | 'other' | 'none'
   // Every face seen in the marked camera shot (any frame of it): the places of its people
   const seenPlaces = fr.filter((_, fi) => stretchOf(timeOf(fi)) === home).flatMap(f => f.faces.filter(face => face.w >= SHOT_BACKGROUND * smallest))
   const states = fr.map((f): { s: State; box?: CropBox; apart?: number } => {
@@ -377,6 +473,7 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
     const used = new Set<number>()
     let found = 0
     const apart: number[] = []
+    let someoneElse = false
     refFaces.forEach((r, ri) => {
       let best = -1, bestD = Infinity
       faces.forEach((face, k) => {
@@ -386,15 +483,24 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
       })
       if (best < 0) return
       used.add(best); found++
+      const p = who?.get(faces[best]), q = refPersons[ri]
+      if (p !== undefined && q !== undefined) {
+        // Known: the same person (as close as colours ever read), or surely someone else
+        if (p !== q) someoneElse = true
+        else apart.push(0)
+        return
+      }
       const sig = faces[best].sig, refSig = refSigs[ri]
       if (sig?.length && refSig) apart.push(l1(sig, refSig))
     })
+    // Someone else in a marked person's place (by who they are): another shot
+    if (someoneElse) return { s: 'other' }
     const far = apart.length ? apart.reduce((a, b) => a + b, 0) / apart.length : undefined
     // The same places, surely other people (another interview shot the same way)
     if (far !== undefined && far >= SHOT_OTHER_PEOPLE) return { s: 'other', apart: far }
     // Someone who isn't in the marked shot: a face more, in a place nobody was in the marked camera shot
     if (faces.some((face, k) => !used.has(k) && !seenPlaces.some(p => near(face, p) !== null))) return { s: 'other' }
-    if (found < refFaces.length) return { s: 'part', apart: far }
+    if (found < refFaces.length) return { s: found >= 2 && found >= refFaces.length - 1 ? 'most' : 'part', apart: far }
     // (the marked people's box: a face more isn't in it)
     const mine = [...used].map(k => faces[k])
     const xs = mine.flatMap(face => [face.x, face.x + face.w]), ys = mine.flatMap(face => [face.y, face.y + face.h])
@@ -419,7 +525,7 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
     let from = lo
     let piece: number[] = []
     const flush = (to: number) => {
-      const match = piece.filter(fi => states[fi].s === 'match').length
+      const match = piece.filter(fi => states[fi].s === 'match' || states[fi].s === 'most').length
       const other = piece.filter(fi => states[fi].s === 'other').length
       const apart = apartOf(piece)
       if (match && match >= other && to - from >= SHOT_MIN_MS && (apart === null || apart < SHOT_SAME_PEOPLE)) {
@@ -526,9 +632,12 @@ const SHORT_EDGE_MS = 150
 export interface Angle {
   /** How many people it shows; 0: the other shots (no faces, or too short to be an angle) */
   people: number
-  /** A moment that shows it (ms from the start of the scan), and the faces there, left to right */
+  /**
+   * A moment that shows it (ms from the start of the scan), and the faces there, left to right.
+   * `person`: who it is (identities) — the same number in every angle they are in; none when not known
+   */
   at: number
-  faces: Array<{ x: number; y: number; w: number; h: number }>
+  faces: Array<{ x: number; y: number; w: number; h: number; person?: number }>
   /** Wherever the clip shows it: [start, end] ms from the start of the scan */
   spans: Turn[]
 }
@@ -546,6 +655,13 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
   const bounds = [0, ...cuts.filter(c => c > 0 && c < durationMs).sort((a, b) => a - b), durationMs]
   const stretches = bounds.slice(0, -1).map((a, k) => ({ a, b: bounds[k + 1], angle: -1 }))
   const overlap = (s: { a: number; b: number }, spans: Turn[]) => spans.reduce((n, [a, b]) => n + Math.max(0, Math.min(b, s.b) - Math.max(a, s.a)), 0)
+  // Who each face is (identities; faces too small to read have no one)
+  const personAt = whoIs(fr, cuts)
+  /** Two faces surely the same person (true), surely not (false), or not known (null) */
+  const samePerson = (f: CropBox, g: CropBox) => {
+    const p = personAt.get(f), q = personAt.get(g)
+    return p === undefined || q === undefined ? null : p === q
+  }
 
   const found: Array<{ at: number; faces: CropBox[] }> = []
   stretches.forEach((st, k) => {
@@ -557,7 +673,7 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
     const want = [...counts].sort((p, q) => q[1] - p[1] || q[0] - p[0])[0]?.[0] ?? 0
     if (!want) return
     const withAll = inside.filter(x => x.n === want)
-    const shot = shotSpans(fr, cuts, withAll[Math.floor(withAll.length / 2)].t, durationMs)
+    const shot = shotSpans(fr, cuts, withAll[Math.floor(withAll.length / 2)].t, durationMs, personAt)
     if (shot.error || !shot.ref) return
     const id = found.push({ at: shot.ref.t, faces: [...shot.ref.faces].sort((p, q) => p.x - q.x) }) - 1
     st.angle = id
@@ -569,7 +685,9 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
     })
   })
 
-  // Light motion isn't another angle: an angle that is only the same people moved a little goes into the earlier one
+  // Light motion isn't another angle: an angle that is only the same people moved a little goes into
+  // the earlier one. The same people by identity where it is known (a man in black and a woman in white
+  // in close-ups from the same seat read alike by colours), else by colours
   const sameAngle = (p: { faces: CropBox[] }, q: { faces: CropBox[] }) => {
     if (p.faces.length !== q.faces.length) return false
     const apart: number[] = []
@@ -577,7 +695,9 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
       const f = p.faces[i], g = q.faces[i]
       const dx = Math.abs(f.x + f.w / 2 - (g.x + g.w / 2)), dy = Math.abs(f.y + f.h / 2 - (g.y + g.h / 2))
       if (dx > ANGLE_MOTION_X || dy > ANGLE_MOTION_Y || Math.max(f.w / g.w, g.w / f.w) > ANGLE_MOTION_SIZE) return false
-      if (f.sig?.length && g.sig?.length) apart.push(l1(f.sig, g.sig))
+      const same = samePerson(f, g)
+      if (same === false) return false
+      if (same === null && f.sig?.length && g.sig?.length) apart.push(l1(f.sig, g.sig))
     }
     return !apart.length || apart.reduce((a, b) => a + b, 0) / apart.length < SHOT_SAME_PEOPLE
   }
@@ -601,11 +721,12 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
         if (used.has(k)) return
         const dx = Math.abs(f.x + f.w / 2 - (r.x + r.w / 2)), dy = Math.abs(f.y + f.h / 2 - (r.y + r.h / 2))
         if (dx > SHOT_REACH_X || dy > SHOT_REACH_Y || Math.max(f.w / r.w, r.w / f.w) > SHOT_SIZE_RATIO) return
+        if (samePerson(f, r) === false) return
         if (dx + dy < bestD) { bestD = dx + dy; best = k }
       })
       if (best < 0) return false
       used.add(best)
-      if (faces[best].sig?.length && r.sig?.length) apart.push(l1(faces[best].sig!, r.sig!))
+      if (samePerson(faces[best], r) === null && faces[best].sig?.length && r.sig?.length) apart.push(l1(faces[best].sig!, r.sig!))
     }
     return !apart.length || apart.reduce((x, y) => x + y, 0) / apart.length < SHOT_SAME_PEOPLE
   }
@@ -635,11 +756,43 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
     }
     return out
   }
-  const angles: Angle[] = found.flatMap((a, id) => (kept.has(id) ? [{
-    people: a.faces.length, at: Math.round(a.at),
-    faces: a.faces.map(f => ({ x: round4(f.x), y: round4(f.y), w: round4(f.w), h: round4(f.h) })),
-    spans: spansOf(s => s.angle === id),
-  }] : []))
+  // Each face's person: its own, else whoever is seen most in its place through the angle (the
+  // angle's frame may catch a face too briefly to be read); nobody is two faces of one angle
+  const personsOf = (faces: CropBox[], id: number) => {
+    const used = new Set<number>()
+    const out = faces.map(face => personAt.get(face))
+    out.forEach(p => { if (p !== undefined) used.add(p) })
+    return out.map((own, i) => {
+      if (own !== undefined) return own
+      const face = faces[i], votes = new Map<number, number>()
+      fr.forEach((f, fi) => {
+        const t = timeOf(fi)
+        if (!stretches.some(s => s.angle === id && t >= s.a && t < s.b)) return
+        for (const g of f.faces) {
+          const p = personAt.get(g)
+          if (p === undefined || used.has(p)) continue
+          const dx = Math.abs(g.x + g.w / 2 - (face.x + face.w / 2)), dy = Math.abs(g.y + g.h / 2 - (face.y + face.h / 2))
+          const reach = SHOT_REACH_FACE * face.w
+          if (dx <= Math.max(SHOT_REACH_X, reach) && dy <= Math.max(SHOT_REACH_Y, reach) && Math.max(g.w / face.w, face.w / g.w) <= SHOT_SIZE_RATIO) {
+            votes.set(p, (votes.get(p) ?? 0) + 1)
+          }
+        }
+      })
+      const best = [...votes].sort((p, q) => q[1] - p[1])[0]
+      if (!best || best[1] < ID_MIN_FACES) return undefined
+      used.add(best[0])
+      return best[0]
+    })
+  }
+  const angles: Angle[] = found.flatMap((a, id) => {
+    if (!kept.has(id)) return []
+    const persons = personsOf(a.faces, id)
+    return [{
+      people: a.faces.length, at: Math.round(a.at),
+      faces: a.faces.map((f, i) => ({ x: round4(f.x), y: round4(f.y), w: round4(f.w), h: round4(f.h), ...(persons[i] !== undefined ? { person: persons[i] } : {}) })),
+      spans: spansOf(s => s.angle === id),
+    }]
+  })
   const rest = spansOf(s => !kept.has(s.angle))
   if (rest.length) angles.push({ people: 0, at: Math.round((rest[0][0] + rest[0][1]) / 2), faces: [], spans: rest })
   return angles
@@ -759,7 +912,8 @@ export async function handleTrackSubjectsJob(job: Job, signal?: AbortSignal) {
     // The camera cuts, in the source video's time (exact to the frame: the editor switches on them)
     const sourceCuts = cuts.map(c => Math.round(c + from))
     // (found together: a stretch two groups claim goes to the nearer one)
-    const found = settleGroups(shots.map(s => shotSpans(info.frames, cuts, s.mark_ms - from, to - from)), cuts, to - from)
+    const who = shots.length ? whoIs(info.frames, cuts) : undefined
+    const found = settleGroups(shots.map(s => shotSpans(info.frames, cuts, s.mark_ms - from, to - from, who)), cuts, to - from)
     for (const [k, s] of shots.entries()) await saveShot(s.id, found[k], from, to, sourceCuts)
     for (const r of results) {
       if (r.error) {
@@ -808,8 +962,10 @@ async function scanAngles(clipId: string, from: number, to: number, signal?: Abo
     const videoPath = await clipVideo(clip, tmp, signal)
     await db`UPDATE clip_angles SET progress = 25, updated_at = now() WHERE clip_id = ${clipId}`
     const [info, cuts] = await Promise.all([
-      // Every face in the clip, not the ones a crop would follow: the list is who is in it
-      detectFaces(tmp, videoPath, from, to, signal, false, true),
+      // The faces exactly as the tracker reads them (lips, people side by side, who is who): a face
+      // listed here is one that can be followed. The list used to read every face its own way, so a
+      // flower vase listed as a face, the tracker never found it, and marking it failed (2026-10-24)
+      detectFaces(tmp, videoPath, from, to, signal, true, false, true),
       detectCuts(videoPath, from, to, signal),
     ])
     signal?.throwIfAborted()
@@ -856,24 +1012,33 @@ export function findPeople(frames: FrameDetection[], cuts: number[]): Array<{ t:
     .map(f => ({ ...f, faces: f.faces.filter(face => (face.score ?? 0) > 0) }))
   if (!fr.length) return []
   const ids = trackFaces(fr, cuts.map(c => c - FRAME_SHOWS_MS))
+  const { personOf } = identities(fr, ids)
   const tracks = new Map<number, Array<{ fi: number; face: CropBox }>>()
   fr.forEach((f, fi) => ids[fi].forEach((id, k) => {
     const list = tracks.get(id) ?? []
     list.push({ fi, face: f.faces[k] })
     tracks.set(id, list)
   }))
-  const people: Array<{ sig: number[] | null; frames: number; best: { fi: number; face: CropBox } }> = []
-  for (const list of [...tracks.values()].sort((a, b) => b.length - a.length)) {
+  // Who they are first (identities, across camera angles); the tracks too small to read after,
+  // joining whoever their colours match
+  const people: Array<{ person?: number; sig: number[] | null; frames: number; best: { fi: number; face: CropBox } }> = []
+  const order = [...tracks].sort((a, b) => Number(personOf.has(b[0])) - Number(personOf.has(a[0])) || b[1].length - a[1].length)
+  for (const [id, list] of order) {
     const sigs = list.map(x => x.face.sig).filter((v): v is number[] => !!v && v.length > 0)
     const sig = sigs.length ? meanOf(sigs) : null
-    const same = sig ? people.find(p => p.sig && l1(sig, p.sig) < SAME_PERSON) : undefined
+    const person = personOf.get(id)
+    const same = person !== undefined
+      ? people.find(p => p.person === person)
+      : sig ? people.find(p => p.sig && l1(sig, p.sig) < SAME_PERSON) : undefined
     const biggest = list.reduce((a, b) => (b.face.w * b.face.h > a.face.w * a.face.h ? b : a))
     if (same) {
       same.frames += list.length
-      if (biggest.face.w * biggest.face.h > same.best.face.w * same.best.face.h) same.best = biggest
+      // (someone known by identity is marked where it can be read: the tracker finds the rest by it)
+      const readable = same.person === undefined || person !== undefined
+      if (readable && biggest.face.w * biggest.face.h > same.best.face.w * same.best.face.h) same.best = biggest
       continue
     }
-    people.push({ sig, frames: list.length, best: biggest })
+    people.push({ person, sig, frames: list.length, best: biggest })
   }
   return people
     .filter(p => p.frames >= MIN_PERSON_FRAMES)
@@ -939,7 +1104,8 @@ async function subEditSteps(clipId: string, signal: AbortSignal, onCreated: (ids
     // They become the clip's subjects (the Subjects tool shows them), replacing the people marked
     // before. Group subjects (marked shots) stay — the user's own choice — found again in this clip
     const groups = await db<{ id: string; mark_ms: number }[]>`SELECT id, mark_ms FROM clip_subjects WHERE clip_id = ${clipId} AND shot IS NOT NULL`
-    const settled = settleGroups(groups.map(g => shotSpans(info.frames, cuts, Number(g.mark_ms) - from, to - from)), cuts, to - from)
+    const who = groups.length ? whoIs(info.frames, cuts) : undefined
+    const settled = settleGroups(groups.map(g => shotSpans(info.frames, cuts, Number(g.mark_ms) - from, to - from, who)), cuts, to - from)
     for (const [k, g] of groups.entries()) await saveShot(g.id, settled[k], from, to, cuts.map(c => Math.round(c + from)))
     const marks = await db.begin(async tx => {
       await tx`DELETE FROM clip_subjects WHERE clip_id = ${clipId} AND shot IS NULL`
