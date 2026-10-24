@@ -469,7 +469,10 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
   const seenPlaces = fr.filter((_, fi) => stretchOf(timeOf(fi)) === home).flatMap(f => f.faces.filter(face => face.w >= SHOT_BACKGROUND * smallest))
   const states = fr.map((f): { s: State; box?: CropBox; apart?: number } => {
     const faces = f.faces.filter(face => face.w >= SHOT_BACKGROUND * smallest)
-    if (!faces.length) return { s: 'none' }
+    // Faces, but all far smaller than the marked ones: a wider shot, not a moment of no faces (user,
+    // 2026-10-24: a round-table wide shot of four, cut into a close-up, counted as "no faces" and went
+    // with the close-up's scene — one frame on the cut showing the close-up was enough)
+    if (!faces.length) return { s: f.faces.length ? 'other' : 'none' }
     const used = new Set<number>()
     let found = 0
     const apart: number[] = []
@@ -525,8 +528,12 @@ export function shotSpans(frames: FrameDetection[], cuts: number[], markT: numbe
     let from = lo
     let piece: number[] = []
     const flush = (to: number) => {
-      const match = piece.filter(fi => states[fi].s === 'match' || states[fi].s === 'most').length
-      const other = piece.filter(fi => states[fi].s === 'other').length
+      // A frame right on a camera cut may already show the next shot (a frame shows its time ±0.1 s):
+      // it doesn't decide the stretch when there are others (the clip's own start and end aren't cuts)
+      const core = piece.filter(fi => (lo <= 0 || timeOf(fi) - lo >= SHORT_EDGE_MS) && (hi >= durationMs || hi - timeOf(fi) >= SHORT_EDGE_MS))
+      const judged = core.length ? core : piece
+      const match = judged.filter(fi => states[fi].s === 'match' || states[fi].s === 'most').length
+      const other = judged.filter(fi => states[fi].s === 'other').length
       const apart = apartOf(piece)
       if (match && match >= other && to - from >= SHOT_MIN_MS && (apart === null || apart < SHOT_SAME_PEOPLE)) {
         parts.push({ span: [Math.round(from), Math.round(to)], apart })

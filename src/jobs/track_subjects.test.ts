@@ -140,3 +140,11 @@ test('a trio with one face never read through a camera shot is still the group',
   const { spans } = shotSpans(trio, [5000, 10000], 1100, 15000)
   assert.deepEqual(spans, [[0, 5000], [10000, 15000]])
 })
+
+test('a short wide shot between close-ups is not the close-up, even with a frame on the cut showing the close-up', () => {
+  // B's close-up; a 1.5 s wide shot of four (faces far smaller) at 5–6.5 s whose last frame, right on the
+  // cut, already shows B again; then B
+  const fw = made(10000, t => (t >= 5000 && t < 6340 ? [0.11, 0.34, 0.65, 0.9].map(x => face(x, 0.4, 0.036)) : [face(0.5, 0.05, 0.1)]))
+  const { spans } = shotSpans(fw, [5000, 6500], 1100, 10000)
+  assert.deepEqual(spans, [[0, 5000], [6500, 10000]])
+})
