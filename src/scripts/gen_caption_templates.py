@@ -2,29 +2,36 @@
 import json, sys
 
 FONTS = {
-    # key: (family libass finds it by, bold, italic, file, em = unitsPerEm / (winAscent + winDescent), css weight)
-    "anton":                       ("Anton", 0, 0, "Anton-Regular.ttf", 0.577, 400),
-    "bangers":                     ("Bangers", 0, 0, "Bangers-Regular.ttf", 0.569, 400),
-    "bebas":                       ("Bebas Neue", 0, 0, "BebasNeue-Regular.ttf", 0.769, 400),
-    "kaushan":                     ("Kaushan Script", 0, 0, "KaushanScript-Regular.ttf", 0.689, 400),
-    "lilita":                      ("Lilita One", 0, 0, "LilitaOne-Regular.ttf", 0.875, 400),
-    "luckiest":                    ("Luckiest Guy", 0, 0, "LuckiestGuy-Regular.ttf", 0.816, 400),
-    "merriweather-bold":           ("Merriweather", 1, 0, "Merriweather-Bold.ttf", 0.577, 700),
-    "merriweather-bold-italic":    ("Merriweather", 1, 1, "Merriweather-BoldItalic.ttf", 0.577, 700),
-    "montserrat-bold":             ("Montserrat Bold", 1, 0, "Montserrat-Bold.ttf", 0.640, 700),
-    "montserrat-black":            ("Montserrat Black", 1, 0, "Montserrat-Black.ttf", 0.640, 900),
-    "montserrat-extrabold-italic": ("Montserrat ExtraBold", 1, 1, "Montserrat-ExtraBoldItalic.ttf", 0.640, 800),
-    "oswald-bold":                 ("Oswald", 1, 0, "Oswald-Bold.ttf", 0.588, 700),
-    "pacifico":                    ("Pacifico", 0, 0, "Pacifico-Regular.ttf", 0.517, 400),
-    "poppins":                     ("Poppins", 0, 0, "Poppins-Regular.ttf", 0.568, 400),
-    "poppins-extrabold":           ("Poppins ExtraBold", 1, 0, "Poppins-ExtraBold.ttf", 0.568, 800),
-    "space-mono-bold":             ("Space Mono", 1, 0, "SpaceMono-Bold.ttf", 0.675, 700),
+    # key: (family libass finds it by, bold, italic, file, em = unitsPerEm / (winAscent + winDescent), css weight,
+    #       asc = winAscent / (winAscent + winDescent): where the baseline is, as a share of the full height)
+    "anton":                       ("Anton", 0, 0, "Anton-Regular.ttf", 0.577, 400, 0.810),
+    "bangers":                     ("Bangers", 0, 0, "Bangers-Regular.ttf", 0.569, 400, 0.797),
+    "bebas":                       ("Bebas Neue", 0, 0, "BebasNeue-Regular.ttf", 0.769, 400, 0.731),
+    "kaushan":                     ("Kaushan Script", 0, 0, "KaushanScript-Regular.ttf", 0.689, 400, 0.747),
+    "lilita":                      ("Lilita One", 0, 0, "LilitaOne-Regular.ttf", 0.875, 400, 0.808),
+    "luckiest":                    ("Luckiest Guy", 0, 0, "LuckiestGuy-Regular.ttf", 0.816, 400, 0.799),
+    "merriweather-bold":           ("Merriweather", 1, 0, "Merriweather-Bold.ttf", 0.577, 700, 0.715),
+    "merriweather-bold-italic":    ("Merriweather", 1, 1, "Merriweather-BoldItalic.ttf", 0.577, 700, 0.715),
+    "montserrat-bold":             ("Montserrat Bold", 1, 0, "Montserrat-Bold.ttf", 0.640, 700, 0.710),
+    "montserrat-black":            ("Montserrat Black", 1, 0, "Montserrat-Black.ttf", 0.640, 900, 0.710),
+    "montserrat-extrabold-italic": ("Montserrat ExtraBold", 1, 1, "Montserrat-ExtraBoldItalic.ttf", 0.640, 800, 0.710),
+    "oswald-bold":                 ("Oswald", 1, 0, "Oswald-Bold.ttf", 0.588, 700, 0.778),
+    "pacifico":                    ("Pacifico", 0, 0, "Pacifico-Regular.ttf", 0.517, 400, 0.764),
+    "poppins":                     ("Poppins", 0, 0, "Poppins-Regular.ttf", 0.568, 400, 0.644),
+    "poppins-extrabold":           ("Poppins ExtraBold", 1, 0, "Poppins-ExtraBold.ttf", 0.568, 800, 0.644),
+    "space-mono-bold":             ("Space Mono", 1, 0, "SpaceMono-Bold.ttf", 0.675, 700, 0.756),
+    # (the Creator styles' own)
+    "instrument-serif":            ("Instrument Serif", 0, 0, "InstrumentSerif-Regular.ttf", 0.769, 400, 0.762),
+    "instrument-serif-italic":     ("Instrument Serif", 0, 1, "InstrumentSerif-Italic.ttf", 0.769, 400, 0.762),
+    "dm-serif-italic":             ("DM Serif Display", 0, 1, "DMSerifDisplay-Italic.ttf", 0.729, 400, 0.756),
+    "gochi":                       ("Gochi Hand", 0, 0, "GochiHand-Regular.ttf", 0.848, 400, 0.654),
 }
 # how big each font is drawn (% of the caption size) so they all read about the same size
 SIZE = {"anton": 145, "bangers": 150, "bebas": 125, "kaushan": 110, "lilita": 90, "luckiest": 92,
         "merriweather-bold": 105, "merriweather-bold-italic": 105, "montserrat-bold": 100, "montserrat-black": 100,
         "montserrat-extrabold-italic": 105, "oswald-bold": 130, "pacifico": 125, "poppins": 110,
-        "poppins-extrabold": 110, "space-mono-bold": 95}
+        "poppins-extrabold": 110, "space-mono-bold": 95,
+        "instrument-serif": 110, "instrument-serif-italic": 110, "dm-serif-italic": 110, "gochi": 110}
 
 W, Y, K = "#FFFFFF", "#FFE600", "#111111"
 
@@ -34,7 +41,23 @@ def t(group, id, label, base, font, color=W, hl=Y, per=3, **kw):
     d.update(kw)
     return d
 
-T = [
+# ── Trending (added as they are, not through t(): their sizes and fields are their own)
+TRENDING = [
+    {"id": "tpl:beast", "label": "Beast", "group": "Trending", "base": "pop", "font": "luckiest", "perLine": 2, "size": 120, "color": "#FFFFFF", "hl": "#FFE600", "upper": True, "stroke": 6},
+    {"id": "tpl:hormozi-green", "label": "Hormozi green", "group": "Trending", "base": "hormozi", "font": "montserrat-black", "perLine": 3, "size": 100, "color": "#FFFFFF", "hl": "#39FF14", "upper": True, "scale": 130, "stroke": 4, "shadow": 4},
+    {"id": "tpl:ali", "label": "Ali", "group": "Trending", "base": "highlight", "font": "poppins-extrabold", "perLine": 3, "size": 105, "color": "#FFFFFF", "hl": "#8B5CF6", "stroke": 0, "shadow": 3},
+    {"id": "tpl:iman", "label": "Iman", "group": "Trending", "base": "plain", "font": "montserrat-extrabold-italic", "perLine": 3, "size": 105, "color": "#FFFFFF", "hl": "#FFD60A", "upper": True, "stroke": 0, "shadow": 5},
+    {"id": "tpl:viral-pop", "label": "Viral pop", "group": "Trending", "base": "pop", "font": "poppins-extrabold", "perLine": 2, "size": 125, "color": "#FFFFFF", "hl": "#00E5FF", "stroke": 5},
+    {"id": "tpl:podcast", "label": "Podcast", "group": "Trending", "base": "box", "font": "poppins-extrabold", "perLine": 4, "size": 95, "color": "#FFFFFF", "hl": "#C8FF00"},
+    {"id": "tpl:hype", "label": "Hype", "group": "Trending", "base": "highlight", "font": "anton", "perLine": 2, "size": 140, "color": "#FFFFFF", "hl": "#FF2D2D", "upper": True, "stroke": 3},
+    {"id": "tpl:fade-words", "label": "Fade words", "group": "Trending", "base": "plain", "font": "poppins-extrabold", "perLine": 4, "size": 95, "color": "#8A8A8A", "hl": "#FFFFFF", "stroke": 0, "shadow": 3},
+    {"id": "tpl:gamer", "label": "Gamer", "group": "Trending", "base": "pop", "font": "bangers", "perLine": 2, "size": 150, "color": "#FFFFFF", "hl": "#39FF14", "upper": True, "stroke": 7},
+    {"id": "tpl:lime-box", "label": "Lime box", "group": "Trending", "base": "box", "font": "montserrat-black", "perLine": 3, "size": 95, "color": "#0A0A0A", "hl": "#C8FF00", "upper": True, "box": "hl", "liveText": True},
+    {"id": "tpl:bubble", "label": "Bubble", "group": "Trending", "base": "pop", "font": "lilita", "perLine": 3, "size": 115, "color": "#FFFFFF", "hl": "#FF4FD8", "stroke": 5},
+    {"id": "tpl:big-italic", "label": "Big italic", "group": "Trending", "base": "hormozi", "font": "montserrat-extrabold-italic", "perLine": 2, "size": 110, "color": "#FFFFFF", "hl": "#FF8A00", "upper": True, "scale": 135, "stroke": 0, "shadow": 5},
+]
+
+T = TRENDING + [
     # ── Bold: the spoken word changes colour (and maybe size)
     t("Bold", "spotlight", "Spotlight", "plain", "poppins-extrabold", hl="#E4F13A", stroke=3),
     t("Bold", "impact", "Impact", "plain", "anton", hl="#7CFC00", upper=True, stroke=3),
@@ -100,12 +123,25 @@ T = [
     t("Stacked", "pink-stack", "Pink stack", "plain", "montserrat-black", hl="#FF7EB6", upper=True, per=2, stack=True, stroke=4),
     t("Stacked", "shout", "Shout", "hormozi", "poppins-extrabold", hl="#6BFF3A", stack=True, scale=150, stroke=0, shadow=4),
     t("Stacked", "stack-script", "Stack script", "hormozi", "poppins-extrabold", liveFont="kaushan", hl="#5CFF4A", stack=True, scale=135, stroke=0, shadow=4),
+
+    # ── Creator: laid out and animated their own way (`look`: creator_captions.py / creator.ts).
+    #    `base` is what a worker from before them draws; keyFont / keyScale (%): the line's key word
+    t("Creator", "cr-behind-bold", "Behind bold", "word", "anton", color="#F5D63D", hl="#F5D63D", per=1, size=1000, upper=True, stroke=0, shadow=0, look="behind"),
+    t("Creator", "cr-behind-serif", "Behind serif", "word", "dm-serif-italic", color="#E8322A", hl="#E8322A", per=1, size=950, upper=True, stroke=0, shadow=0, look="behind"),
+    t("Creator", "cr-invert", "Invert", "pop", "poppins", keyFont="poppins-extrabold", keyScale=220, color=W, hl=W, per=4, size=220, stroke=0, shadow=0, look="difference"),
+    t("Creator", "cr-center-stack", "Center stack", "hormozi", "montserrat-black", color=W, hl="#FF9F1C", per=3, size=320, upper=True, stroke=0, shadow=4, look="build"),
+    t("Creator", "cr-corners-gold", "Corners gold", "pop", "instrument-serif", keyFont="instrument-serif-italic", keyScale=190, color="#E9B949", hl="#E9B949", per=4, size=175, stroke=0, shadow=2, look="multi"),
+    t("Creator", "cr-corners", "Corners", "pop", "poppins", keyFont="instrument-serif-italic", keyScale=180, color=W, hl=W, per=4, size=195, stroke=0, shadow=2, look="multi"),
+    t("Creator", "cr-teleprompter", "Teleprompter", "word", "montserrat-black", color=W, hl="#B5E61D", per=5, size=365, upper=True, stroke=0, shadow=3, look="scroll"),
+    t("Creator", "cr-serif-pop", "Serif pop", "hormozi", "poppins", keyFont="instrument-serif-italic", keyScale=160, color=W, hl="#D6E26A", per=4, size=185, stroke=0, shadow=2, look="split"),
+    t("Creator", "cr-subtitle", "Subtitle", "plain", "poppins", color=W, hl=W, per=6, size=190, stroke=0, shadow=2, liveText=True, look="subtitle"),
+    t("Creator", "cr-scribble", "Scribble", "plain", "gochi", color=W, hl="#FFD21F", per=5, size=200, stroke=0, shadow=2, liveText=True, look="scribble"),
 ]
 
 assert len({x["id"] for x in T}) == len(T)
-fonts = {k: {"family": v[0], "bold": v[1], "italic": v[2], "file": v[3], "em": v[4], "weight": v[5]} for k, v in FONTS.items()}
+fonts = {k: {"family": v[0], "bold": v[1], "italic": v[2], "file": v[3], "em": v[4], "weight": v[5], "asc": v[6]} for k, v in FONTS.items()}
 for x in T:
-    assert x["font"] in fonts and x.get("liveFont", x["font"]) in fonts, x["id"]
+    assert x["font"] in fonts and x.get("liveFont", x["font"]) in fonts and x.get("keyFont", x["font"]) in fonts, x["id"]
 doc = {"_": "Caption styles. The SAME file is in both repos (frontend src/modules/captions, backend src/python): keep them identical. See templates.ts / render.py for what each field does.",
        "fonts": fonts, "templates": T}
 for path in sys.argv[1:]:

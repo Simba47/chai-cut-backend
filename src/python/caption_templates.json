@@ -7,7 +7,8 @@
    "italic": 0,
    "file": "Anton-Regular.ttf",
    "em": 0.577,
-   "weight": 400
+   "weight": 400,
+   "asc": 0.81
   },
   "bangers": {
    "family": "Bangers",
@@ -15,7 +16,8 @@
    "italic": 0,
    "file": "Bangers-Regular.ttf",
    "em": 0.569,
-   "weight": 400
+   "weight": 400,
+   "asc": 0.797
   },
   "bebas": {
    "family": "Bebas Neue",
@@ -23,7 +25,8 @@
    "italic": 0,
    "file": "BebasNeue-Regular.ttf",
    "em": 0.769,
-   "weight": 400
+   "weight": 400,
+   "asc": 0.731
   },
   "kaushan": {
    "family": "Kaushan Script",
@@ -31,7 +34,8 @@
    "italic": 0,
    "file": "KaushanScript-Regular.ttf",
    "em": 0.689,
-   "weight": 400
+   "weight": 400,
+   "asc": 0.747
   },
   "lilita": {
    "family": "Lilita One",
@@ -39,7 +43,8 @@
    "italic": 0,
    "file": "LilitaOne-Regular.ttf",
    "em": 0.875,
-   "weight": 400
+   "weight": 400,
+   "asc": 0.808
   },
   "luckiest": {
    "family": "Luckiest Guy",
@@ -47,7 +52,8 @@
    "italic": 0,
    "file": "LuckiestGuy-Regular.ttf",
    "em": 0.816,
-   "weight": 400
+   "weight": 400,
+   "asc": 0.799
   },
   "merriweather-bold": {
    "family": "Merriweather",
@@ -55,7 +61,8 @@
    "italic": 0,
    "file": "Merriweather-Bold.ttf",
    "em": 0.577,
-   "weight": 700
+   "weight": 700,
+   "asc": 0.715
   },
   "merriweather-bold-italic": {
    "family": "Merriweather",
@@ -63,7 +70,8 @@
    "italic": 1,
    "file": "Merriweather-BoldItalic.ttf",
    "em": 0.577,
-   "weight": 700
+   "weight": 700,
+   "asc": 0.715
   },
   "montserrat-bold": {
    "family": "Montserrat Bold",
@@ -71,7 +79,8 @@
    "italic": 0,
    "file": "Montserrat-Bold.ttf",
    "em": 0.64,
-   "weight": 700
+   "weight": 700,
+   "asc": 0.71
   },
   "montserrat-black": {
    "family": "Montserrat Black",
@@ -79,7 +88,8 @@
    "italic": 0,
    "file": "Montserrat-Black.ttf",
    "em": 0.64,
-   "weight": 900
+   "weight": 900,
+   "asc": 0.71
   },
   "montserrat-extrabold-italic": {
    "family": "Montserrat ExtraBold",
@@ -87,7 +97,8 @@
    "italic": 1,
    "file": "Montserrat-ExtraBoldItalic.ttf",
    "em": 0.64,
-   "weight": 800
+   "weight": 800,
+   "asc": 0.71
   },
   "oswald-bold": {
    "family": "Oswald",
@@ -95,7 +106,8 @@
    "italic": 0,
    "file": "Oswald-Bold.ttf",
    "em": 0.588,
-   "weight": 700
+   "weight": 700,
+   "asc": 0.778
   },
   "pacifico": {
    "family": "Pacifico",
@@ -103,7 +115,8 @@
    "italic": 0,
    "file": "Pacifico-Regular.ttf",
    "em": 0.517,
-   "weight": 400
+   "weight": 400,
+   "asc": 0.764
   },
   "poppins": {
    "family": "Poppins",
@@ -111,7 +124,8 @@
    "italic": 0,
    "file": "Poppins-Regular.ttf",
    "em": 0.568,
-   "weight": 400
+   "weight": 400,
+   "asc": 0.644
   },
   "poppins-extrabold": {
    "family": "Poppins ExtraBold",
@@ -119,7 +133,8 @@
    "italic": 0,
    "file": "Poppins-ExtraBold.ttf",
    "em": 0.568,
-   "weight": 800
+   "weight": 800,
+   "asc": 0.644
   },
   "space-mono-bold": {
    "family": "Space Mono",
@@ -127,7 +142,44 @@
    "italic": 0,
    "file": "SpaceMono-Bold.ttf",
    "em": 0.675,
-   "weight": 700
+   "weight": 700,
+   "asc": 0.756
+  },
+  "instrument-serif": {
+   "family": "Instrument Serif",
+   "bold": 0,
+   "italic": 0,
+   "file": "InstrumentSerif-Regular.ttf",
+   "em": 0.769,
+   "weight": 400,
+   "asc": 0.762
+  },
+  "instrument-serif-italic": {
+   "family": "Instrument Serif",
+   "bold": 0,
+   "italic": 1,
+   "file": "InstrumentSerif-Italic.ttf",
+   "em": 0.769,
+   "weight": 400,
+   "asc": 0.762
+  },
+  "dm-serif-italic": {
+   "family": "DM Serif Display",
+   "bold": 0,
+   "italic": 1,
+   "file": "DMSerifDisplay-Italic.ttf",
+   "em": 0.729,
+   "weight": 400,
+   "asc": 0.756
+  },
+  "gochi": {
+   "family": "Gochi Hand",
+   "bold": 0,
+   "italic": 0,
+   "file": "GochiHand-Regular.ttf",
+   "em": 0.848,
+   "weight": 400,
+   "asc": 0.654
   }
  },
  "templates": [
@@ -1014,6 +1066,160 @@
    "scale": 135,
    "stroke": 0,
    "shadow": 4
+  },
+  {
+   "id": "tpl:cr-behind-bold",
+   "label": "Behind bold",
+   "group": "Creator",
+   "base": "word",
+   "font": "anton",
+   "perLine": 1,
+   "size": 1000,
+   "color": "#F5D63D",
+   "hl": "#F5D63D",
+   "upper": true,
+   "stroke": 0,
+   "shadow": 0,
+   "look": "behind"
+  },
+  {
+   "id": "tpl:cr-behind-serif",
+   "label": "Behind serif",
+   "group": "Creator",
+   "base": "word",
+   "font": "dm-serif-italic",
+   "perLine": 1,
+   "size": 950,
+   "color": "#E8322A",
+   "hl": "#E8322A",
+   "upper": true,
+   "stroke": 0,
+   "shadow": 0,
+   "look": "behind"
+  },
+  {
+   "id": "tpl:cr-invert",
+   "label": "Invert",
+   "group": "Creator",
+   "base": "pop",
+   "font": "poppins",
+   "perLine": 4,
+   "size": 220,
+   "color": "#FFFFFF",
+   "hl": "#FFFFFF",
+   "keyFont": "poppins-extrabold",
+   "keyScale": 220,
+   "stroke": 0,
+   "shadow": 0,
+   "look": "difference"
+  },
+  {
+   "id": "tpl:cr-center-stack",
+   "label": "Center stack",
+   "group": "Creator",
+   "base": "hormozi",
+   "font": "montserrat-black",
+   "perLine": 3,
+   "size": 320,
+   "color": "#FFFFFF",
+   "hl": "#FF9F1C",
+   "upper": true,
+   "stroke": 0,
+   "shadow": 4,
+   "look": "build"
+  },
+  {
+   "id": "tpl:cr-corners-gold",
+   "label": "Corners gold",
+   "group": "Creator",
+   "base": "pop",
+   "font": "instrument-serif",
+   "perLine": 4,
+   "size": 175,
+   "color": "#E9B949",
+   "hl": "#E9B949",
+   "keyFont": "instrument-serif-italic",
+   "keyScale": 190,
+   "stroke": 0,
+   "shadow": 2,
+   "look": "multi"
+  },
+  {
+   "id": "tpl:cr-corners",
+   "label": "Corners",
+   "group": "Creator",
+   "base": "pop",
+   "font": "poppins",
+   "perLine": 4,
+   "size": 195,
+   "color": "#FFFFFF",
+   "hl": "#FFFFFF",
+   "keyFont": "instrument-serif-italic",
+   "keyScale": 180,
+   "stroke": 0,
+   "shadow": 2,
+   "look": "multi"
+  },
+  {
+   "id": "tpl:cr-teleprompter",
+   "label": "Teleprompter",
+   "group": "Creator",
+   "base": "word",
+   "font": "montserrat-black",
+   "perLine": 5,
+   "size": 365,
+   "color": "#FFFFFF",
+   "hl": "#B5E61D",
+   "upper": true,
+   "stroke": 0,
+   "shadow": 3,
+   "look": "scroll"
+  },
+  {
+   "id": "tpl:cr-serif-pop",
+   "label": "Serif pop",
+   "group": "Creator",
+   "base": "hormozi",
+   "font": "poppins",
+   "perLine": 4,
+   "size": 185,
+   "color": "#FFFFFF",
+   "hl": "#D6E26A",
+   "keyFont": "instrument-serif-italic",
+   "keyScale": 160,
+   "stroke": 0,
+   "shadow": 2,
+   "look": "split"
+  },
+  {
+   "id": "tpl:cr-subtitle",
+   "label": "Subtitle",
+   "group": "Creator",
+   "base": "plain",
+   "font": "poppins",
+   "perLine": 6,
+   "size": 190,
+   "color": "#FFFFFF",
+   "hl": "#FFFFFF",
+   "stroke": 0,
+   "shadow": 2,
+   "liveText": true,
+   "look": "subtitle"
+  },
+  {
+   "id": "tpl:cr-scribble",
+   "label": "Scribble",
+   "group": "Creator",
+   "base": "plain",
+   "font": "gochi",
+   "perLine": 5,
+   "size": 200,
+   "color": "#FFFFFF",
+   "hl": "#FFD21F",
+   "stroke": 0,
+   "shadow": 2,
+   "liveText": true,
+   "look": "scribble"
   }
  ]
 }
