@@ -970,6 +970,8 @@ export async function transcribeAudio(audioPath: string, videoId?: string, langu
     if (totalSec <= PROBE_SEC * 1.5) {
       probe = await chunkWords(0, undefined)
       lang = detectSarvamLang(probe.map(w => w.word).join(' '))
+      // Read as English: what it left out may be Telugu, Hindi… (languageInGaps)
+      if (!lang) lang = await languageInGaps(audioPath, 0, Math.min(totalSec, GEMINI_CHUNK_SEC), probe, 'probe')
     } else {
       const sample = async (from: number, tag: string) => {
         const words = await rangeWords(from, PROBE_SEC, undefined, tag)
@@ -979,6 +981,13 @@ export async function transcribeAudio(audioPath: string, videoId?: string, langu
       lang = await sample(0, 'probe-start')
       // The start can be music or an English intro: check the middle before settling on auto
       if (!lang) lang = await sample(Math.max(PROBE_SEC, Math.min(totalSec / 2, totalSec - PROBE_SEC)), 'probe-middle')
+      // Both read as English: what they left out may be Telugu, Hindi… (languageInGaps; the
+      // samples' words are back at the audio's times, the gaps are found from their own)
+      for (const [k, sm] of samples.entries()) {
+        if (lang) break
+        const rel = sm.words.map(w => ({ ...w, start: w.start - sm.from, end: w.end - sm.from }))
+        lang = await languageInGaps(audioPath, sm.from, Math.min(PROBE_SEC, totalSec - sm.from), rel, `probe-${k + 1}`)
+      }
     }
     if (lang) console.log(`[transcribe] detected language: ${lang} — locking for all chunks (${since()})`)
   }
@@ -1088,7 +1097,26 @@ const GAP_MIN_SEC = 1.8
 const GAP_PAD_SEC = 0.15
 const GAP_SEPARATOR_SEC = 0.6
 
+/**
+ * The other way round: on automatic (the start sounded English) Gemini drops a lot of Telugu, so
+ * a clip that opens in English and goes on in Telugu came back with only its English words. The
+ * stretches it left empty (with sound) are read on their own, on automatic; if what is said there
+ * is in an Indian script, that is the language — the caller locks it, and the English gap pass
+ * above then brings the English sentences back.
+ */
+async function languageInGaps(audioPath: string, startSec: number, durSec: number, words: SarvamWord[], tag: string): Promise<string | undefined> {
+  const found = await gapPass(audioPath.replace('.wav', `_lgap${tag}.wav`), audioPath, startSec, durSec, words, 'auto')
+  const lang = detectSarvamLang(found.map(w => w.word).join(' '))
+  console.log(`[transcribe] ${tag}: what the English reading left out — ${found.length} words${lang ? `, in ${lang}` : ', none in an Indian script'}`)
+  return lang
+}
+
 async function englishGapPass(chunkPathHint: string, audioPath: string, chunkStartSec: number, chunkSec: number, words: SarvamWord[]): Promise<SarvamWord[]> {
+  return gapPass(chunkPathHint, audioPath, chunkStartSec, chunkSec, words, 'en-IN')
+}
+
+/** The stretches of a chunk with no words (and sound), read in `lang` ('auto' = automatic) and placed back at their times */
+async function gapPass(chunkPathHint: string, audioPath: string, chunkStartSec: number, chunkSec: number, words: SarvamWord[], lang: string): Promise<SarvamWord[]> {
   const gaps: [number, number][] = []
   let cursor = 0
   for (const w of [...words].sort((a, b) => a.start - b.start)) {
@@ -1101,7 +1129,7 @@ async function englishGapPass(chunkPathHint: string, audioPath: string, chunkSta
   const voiced = await voicedParts(audioPath, chunkStartSec, chunkSec, gaps)
   if (voiced.length < gaps.length || voiced.some((v, k) => v[1] - v[0] < gaps[k][1] - gaps[k][0])) {
     const before = gaps.reduce((t, [a, b]) => t + b - a, 0), after = voiced.reduce((t, [a, b]) => t + b - a, 0)
-    console.log(`[gemini] English gap pass: ${after.toFixed(0)}s with sound of ${before.toFixed(0)}s of gaps`)
+    console.log(`[gemini] ${lang === 'auto' ? 'Language' : 'English'} gap pass: ${after.toFixed(0)}s with sound of ${before.toFixed(0)}s of gaps`)
   }
   gaps.splice(0, gaps.length, ...voiced)
   if (!gaps.length) return []
@@ -1122,7 +1150,7 @@ async function englishGapPass(chunkPathHint: string, audioPath: string, chunkSta
       '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', gapPath])
     const buf = await readFile(gapPath)
     if (buf.length < 16_000) return []
-    const found = await geminiTranscribeChunk(buf, 'en-IN')
+    const found = await geminiTranscribeChunk(buf, lang === 'auto' ? undefined : lang)
     const out: SarvamWord[] = []
     for (const w of found) {
       const p = placed.find(x => w.start >= x.at - 0.05 && w.start < x.at + (x.to - x.from))
@@ -1131,11 +1159,11 @@ async function englishGapPass(chunkPathHint: string, audioPath: string, chunkSta
       const end = Math.min(p.to, p.from + (w.end - p.at))
       // Only keep words inside a real gap, so nothing overlaps what the main pass found
       if (!gaps.some(([a, b]) => start >= a - GAP_PAD_SEC && start < b)) continue
-      out.push({ ...w, start, end: Math.max(end, start + 0.08), speaker: w.speaker ? `en:${w.speaker}` : undefined })
+      out.push({ ...w, start, end: Math.max(end, start + 0.08), speaker: w.speaker ? `${lang === 'auto' ? 'g' : 'en'}:${w.speaker}` : undefined })
     }
     return out
   } catch (e) {
-    console.warn('[gemini] English gap pass failed, keeping the main pass only:', e)
+    console.warn(`[gemini] ${lang === 'auto' ? 'Language' : 'English'} gap pass failed, keeping the main pass only:`, e)
     return []
   } finally {
     await unlink(gapPath).catch(() => {})
