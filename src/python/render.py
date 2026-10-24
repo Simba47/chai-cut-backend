@@ -234,7 +234,8 @@ def _write_ass(
     ]
 
     tpl = _template(style)
-    if creator_captions.is_creator(tpl) and (roman or _is_latin(" ".join(_word_display(w, roman) for w in words))):
+    # (any script: a line in Telugu, Hindi… is drawn in its Noto font, creator_captions.script_font)
+    if creator_captions.is_creator(tpl):
         events, diff, behind = _creator_events(clip_words, style, tpl, out_w, out_h)
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(emoji_art.colour_emoji_ass(lines + events)) + "\n")
