@@ -24,14 +24,20 @@ function isWholeReading(job: Job): boolean {
   const p = (typeof job.payload === 'string' ? JSON.parse(job.payload) : job.payload) as { transcribe_full?: unknown }
   return job.type === 'transcribe' && p?.transcribe_full === true
 }
+/** A long job: a whole-video reading, or an editing copy (proxy) — both many minutes for a long video */
+function isLong(job: Job): boolean {
+  return job.type === 'proxy' || isWholeReading(job)
+}
 
-// Whole-video readings (started as soon as someone picks AI edit) may take every slot but one: with
-// more than one slot, one is always kept for the quick jobs people wait on (a clip's captions,
-// renders, uploads, Subjects), so they never queue behind readings. AI edit itself is not held back:
-// it waits for its video's reading, which must be able to start next to it. Editing copies already
-// wait for everything else and are made one at a time.
+// Long jobs — whole-video readings (started as soon as someone picks AI edit) and editing copies
+// (proxy) — may take every slot but one together: with more than one slot, one is always kept for
+// the quick jobs people wait on (a clip's captions, renders, Subjects), so they never queue behind
+// them. (User, 2026-10-24: a 2-hour upload's editing copy and its reading took both slots, and a
+// Subjects job waited 7+ minutes — editing copies weren't counted.) AI edit itself is not held
+// back: it waits for its video's reading, which must be able to start next to it. Editing copies
+// also wait for everything else queued and are made one at a time.
 const LONG_SLOTS = CONCURRENCY > 1 ? CONCURRENCY - 1 : 1
-let readingsRunning = 0
+let longRunning = 0
 
 export function registerHandler(type: JobType, handler: JobHandler) {
   handlers.set(type, handler)
@@ -71,13 +77,16 @@ async function requeueStuck() {
 /** How long the queue is (every worker logs it): when the oldest job has waited over WAIT_WARN_MS, more workers are needed */
 const WAIT_WARN_MS = 5 * 60 * 1000
 async function reportQueue() {
-  const [q] = await db<{ waiting: number; running: number; oldest_s: number | null }[]>`
-    SELECT count(*) FILTER (WHERE status = 'queued')::int AS waiting,
+  // (editing copies count among the running; a queued one waits for everything else by design, so
+  // it isn't counted as waiting)
+  const [q] = await db<{ waiting: number; running: number; copies: number; oldest_s: number | null }[]>`
+    SELECT count(*) FILTER (WHERE status = 'queued' AND type <> 'proxy')::int AS waiting,
       count(*) FILTER (WHERE status = 'processing')::int AS running,
-      extract(epoch FROM now() - min(created_at) FILTER (WHERE status = 'queued'))::int AS oldest_s
-    FROM jobs WHERE status IN ('queued', 'processing') AND type <> 'proxy'`
+      count(*) FILTER (WHERE status = 'processing' AND type = 'proxy')::int AS copies,
+      extract(epoch FROM now() - min(created_at) FILTER (WHERE status = 'queued' AND type <> 'proxy'))::int AS oldest_s
+    FROM jobs WHERE status IN ('queued', 'processing')`
   if (!q || !q.waiting) return
-  const line = `[queue] ${q.waiting} job(s) waiting, ${q.running} running; the oldest has waited ${q.oldest_s ?? 0} s`
+  const line = `[queue] ${q.waiting} job(s) waiting, ${q.running} running${q.copies ? ` (${q.copies} an editing copy)` : ''}; the oldest has waited ${q.oldest_s ?? 0} s`
   if ((q.oldest_s ?? 0) * 1000 > WAIT_WARN_MS) console.warn(`${line} — more workers needed`)
   else console.log(line)
 }
@@ -88,7 +97,7 @@ export async function startQueue() {
   setInterval(() => { requeueStuck().catch(err => console.error('[queue] Stuck-job sweep failed:', err)) }, STUCK_SWEEP_MS)
   setInterval(() => { reportQueue().catch(() => { /* only a log line */ }) }, STUCK_SWEEP_MS)
 
-  console.log(`[queue] Worker started (concurrency=${CONCURRENCY}, whole-video readings at most ${LONG_SLOTS} at a time), polling for jobs…`)
+  console.log(`[queue] Worker started (concurrency=${CONCURRENCY}, long jobs (whole-video readings, editing copies) at most ${LONG_SLOTS} at a time), polling for jobs…`)
   await Promise.all(Array.from({ length: CONCURRENCY }, (_, i) => runLoop(i)))
 }
 
@@ -116,33 +125,33 @@ async function tick(): Promise<boolean> {
   // job, one winning and the rest sleeping a poll interval for nothing. The heartbeat starts in
   // the same statement, as before.
   const types = [...handlers.keys()]
-  // A reading may be taken only while a slot is left for quick jobs (counted before the claim, so
+  // A long job may be taken only while a slot is left for quick jobs (counted before the claim, so
   // two loops never both take the last one)
-  const mayRead = readingsRunning < LONG_SLOTS
-  if (mayRead) readingsRunning++
+  const mayLong = longRunning < LONG_SLOTS
+  if (mayLong) longRunning++
   let job: Job | undefined
   try {
-    job = await claim(types, mayRead)
+    job = await claim(types, mayLong)
   } finally {
-    if (mayRead && !(job && isWholeReading(job))) readingsRunning--
+    if (mayLong && !(job && isLong(job))) longRunning--
   }
   if (!job) return false
   try {
     await run(job)
   } finally {
-    if (mayRead && isWholeReading(job)) readingsRunning--
+    if (mayLong && isLong(job)) longRunning--
   }
   return true
 }
 
-async function claim(types: string[], mayRead: boolean): Promise<Job | undefined> {
+async function claim(types: string[], mayLong: boolean): Promise<Job | undefined> {
   const [job] = await db<Job[]>`
     WITH next AS (
       SELECT id FROM jobs
       WHERE status = 'queued' AND type = ANY(${types})
       ${isRailway ? db`AND NOT (type = 'transcribe' AND payload @> '{"requires_ytdlp":true}'::jsonb)` : db``}
       AND NOT (type = 'proxy' AND EXISTS (SELECT 1 FROM jobs p WHERE p.type = 'proxy' AND p.status = 'processing'))
-      ${mayRead ? db`` : db`AND NOT (type = 'transcribe' AND COALESCE(payload->>'transcribe_full', '') = 'true')`}
+      ${mayLong ? db`` : db`AND NOT (type = 'proxy' OR (type = 'transcribe' AND COALESCE(payload->>'transcribe_full', '') = 'true'))`}
       -- One whole-video reading per person at a time (across all workers): one person's videos
       -- never take every slot while someone else waits
       AND NOT (type = 'transcribe' AND COALESCE(payload->>'transcribe_full', '') = 'true' AND EXISTS (
