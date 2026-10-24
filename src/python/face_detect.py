@@ -69,6 +69,12 @@ MAX_FACES = 12
 # A face the detector is unsure of that the landmark model also can't read is a picture (a
 # poster, a photo on the wall), not a person
 UNSURE_FACE = 0.7
+# A face only MediaPipe finds, that YuNet can't find even in a close crop round it, is a face only when
+# MediaPipe is this sure (people mode). A dark, blurred shelf on a set read 76% sure in 97 frames and was
+# a second person — the scene became a Split with an empty view (user, 2026-10-24); a hand read 77%.
+# Every such face in three test clips scored 0.70–0.79, all of them fakes; the face reader can't tell
+# (it found "lips" in the blur)
+CONFIRM_SURE = 0.9
 # …judged only on faces of close-up size (small distant faces are naturally hard to read)
 UNREADABLE_MIN_AREA = 0.012
 # A face at least this share of the frame is a close-up (anything smaller is a wide shot)
@@ -243,7 +249,9 @@ def _merge_faces(mp_boxes, yn_boxes, people=False, yunet=None, bgr=None):
             if again is not None:
                 out.append({**again, "score": max(m["score"], again["score"]), "_size": again["area"], "_sure": max(m["score"], again["score"])})
             else:
-                out.append({**m, "_size": None, "_sure": m["score"] if people else 0.0})
+                # (people: not confirmed by YuNet even close up — kept only when MediaPipe is very sure)
+                if not people or m["score"] >= CONFIRM_SURE:
+                    out.append({**m, "_size": None, "_sure": m["score"] if people else 0.0})
     scale = float(np.median(ratios)) if ratios else 1.0
     for b in out:
         if b["_size"] is None:
