@@ -64,6 +64,19 @@ MIN_FACE_AREA = 0.002
 # reads smaller and less sure (0.08%, 65% there).
 SURE_SMALL_FACE = 0.8
 SURE_SMALL_FACE_AREA = 0.0008
+# People mode: a tiny face sitting in a row with sure faces (similar size, about the same height, at
+# least ROW_SUPPORT of them SURE_SMALL_FACE sure) is a person from ROW_FACE_SURE — a woman at the end of a
+# row of seven read 76–81% in every frame and was dropped, so a wide shot "had six" (user, 2026-10-25:
+# "our main motto is not to lose any subject")
+ROW_FACE_SURE = 0.65
+ROW_SUPPORT = 2
+ROW_SAME_HEIGHT = 0.08   # faces' middles at most this far apart (share of the frame's height)
+ROW_SIZE_RATIO = 2.0     # widths within this ratio
+# The "too small next to the biggest face" line (faces' areas): 0.25 for a crop; people mode 0.12 —
+# round a table one man's face read 0.041 wide and another's 0.019 and the second was dropped. A real
+# close-up still keeps only its face (the prominence filter, detect_subjects)
+BIGGEST_SHARE = 0.25
+BIGGEST_SHARE_PEOPLE = 0.12
 # The most faces reported in a frame (a wide shot of a panel can show seven or more)
 MAX_FACES = 12
 # A face the detector is unsure of that the landmark model also can't read is a picture (a
@@ -259,13 +272,20 @@ def _merge_faces(mp_boxes, yn_boxes, people=False, yunet=None, bgr=None):
     for y in yn_boxes:
         if all(_iou(y, m) <= 0.3 for m in mp_boxes):
             out.append({**y, "_size": y["area"], "_sure": y["score"]})
-    out = [b for b in out if b["area"] >= MIN_FACE_AREA or (b["_sure"] >= SURE_SMALL_FACE and b["_size"] >= SURE_SMALL_FACE_AREA)]
+    def in_a_row(b):
+        """People mode: at least ROW_SUPPORT sure faces about the same size, at about the same height"""
+        cy = b["y"] + b["h"] / 2
+        return sum(1 for o in out if o is not b and o["_sure"] >= SURE_SMALL_FACE
+                   and abs(o["y"] + o["h"] / 2 - cy) <= ROW_SAME_HEIGHT
+                   and max(o["w"], b["w"]) <= ROW_SIZE_RATIO * min(o["w"], b["w"])) >= ROW_SUPPORT
+    out = [b for b in out if b["area"] >= MIN_FACE_AREA or (b["_size"] >= SURE_SMALL_FACE_AREA and (
+        b["_sure"] >= SURE_SMALL_FACE or (people and b["_sure"] >= ROW_FACE_SURE and in_a_row(b))))]
     out.sort(key=lambda b: -b["_size"])
     # Round a table, the person nearest the camera can look 2–3× bigger than those across it
     if out:
         sure = [b for b in out if b["_sure"] >= SURE_SMALL_FACE] if people else []
         biggest = (sure or out)[0]["_size"]
-        out = [b for b in out if b["_size"] >= 0.25 * biggest]
+        out = [b for b in out if b["_size"] >= (BIGGEST_SHARE_PEOPLE if people else BIGGEST_SHARE) * biggest]
     for b in out:
         b.pop("_size", None)
         b.pop("_sure", None)
@@ -388,6 +408,10 @@ STATIC_RATIO = 0.85     # a face changing less than this × its surroundings is 
 STATIC_RATIO_UNSURE = 1.0
 UNSURE_SCORE = 0.9
 STATIC_MIN_FRAMES = 8   # judged only on faces seen for at least this many frames (2 s at 4 fps)
+# People mode: judged only on faces at least this wide (share of the frame). A tiny face in a dark wide
+# shot changes too few pixels to tell a still person from a picture: three people sitting still at the back
+# of a dark set read "static" and were dropped (2026-10-25: never lose a subject)
+STATIC_MIN_WIDTH_PEOPLE = 0.05
 
 
 def _change_ratio(prev_gray, gray, b, margin=0.6):
@@ -538,14 +562,18 @@ def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False
             if f["change"] is not None:
                 changes.setdefault(tid, []).append(f["change"])
     scores: dict[int, list[float]] = {}
+    widths: dict[int, list[float]] = {}
     for faces, ids in zip(raw, track_ids):
         for f, tid in zip(faces, ids):
             scores.setdefault(tid, []).append(f["score"])
+            widths.setdefault(tid, []).append(f["w"])
     static = set()
     for tid, d in changes.items():
         # all_faces (listing who is in a clip): a still face is a person standing still, or a picture,
         # and both are in the clip
         if all_faces or len(d) < STATIC_MIN_FRAMES:
+            continue
+        if people and float(np.median(widths[tid])) < STATIC_MIN_WIDTH_PEOPLE:
             continue
         ratio, score = float(np.median(d)), float(np.median(scores[tid]))
         if ratio < STATIC_RATIO or (ratio < STATIC_RATIO_UNSURE and score < UNSURE_SCORE):
