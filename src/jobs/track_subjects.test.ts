@@ -148,3 +148,13 @@ test('a short wide shot between close-ups is not the close-up, even with a frame
   const { spans } = shotSpans(fw, [5000, 6500], 1100, 10000)
   assert.deepEqual(spans, [[0, 5000], [6500, 10000]])
 })
+
+test('who is in an angle: someone seen in under half its frames (PRESENCE_MIN) does not count', () => {
+  // One camera shot of P; Q sits in for 3 s, then R for 3 s (each 30% of the shot): two faces in most
+  // frames, but P is the only one there for half of it
+  const fw = made(10000, (t, n) => [person(0, 0.5, 0.05, n, 0.12),
+    ...(t < 3000 ? [person(1, 0.15, 0.6, n, 0.12)] : []), ...(t >= 4000 && t < 7000 ? [person(2, 0.85, 0.9, n, 0.12)] : [])])
+  const [angle] = findAngles(fw, [], 10000)
+  assert.equal(angle.people, 1)
+  assert.ok(Math.abs(angle.faces[0].x + angle.faces[0].w / 2 - 0.5) < 0.02, JSON.stringify(angle.faces))
+})
