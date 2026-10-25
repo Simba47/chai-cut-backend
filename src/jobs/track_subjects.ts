@@ -635,6 +635,12 @@ const ANGLE_MOTION_Y = 0.15
 const ANGLE_MOTION_SIZE = 2.2
 /** A frame this close to a camera cut may already show the next shot: a short stretch is judged without it when it has others */
 const SHORT_EDGE_MS = 150
+/**
+ * Who is in an angle (the Auto format Rulebook, 2026-10-25, PRESENCE_MIN — as the editor's AUTO_FORMAT):
+ * a person counts when a face is seen in their place in at least this share of the angle's frames, so
+ * someone walking through doesn't change its format
+ */
+const PRESENCE_MIN = 0.5
 
 export interface Angle {
   /** How many people it shows; 0: the other shots (no faces, or too short to be an angle) */
@@ -804,13 +810,26 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
     : null
   const talking = (p: number | undefined, [a, b]: Turn) => p === undefined || !turns ? 0
     : Math.round((turns.get(String(p)) ?? []).reduce((n, [x, y]) => n + Math.max(0, Math.min(b, y) - Math.max(a, x)), 0))
+  /** The angle's faces seen in their place in at least PRESENCE_MIN of its frames (the most present one at least) */
+  const present = (faces: CropBox[], id: number) => {
+    const inAngle = fr.filter((_, fi) => { const t = timeOf(fi); return stretches.some(s => s.angle === id && t >= s.a && t < s.b) })
+    if (!inAngle.length) return faces
+    const share = faces.map(r => inAngle.filter(f => f.faces.some(g => {
+      const reach = Math.max(SHOT_REACH_X, SHOT_REACH_FACE * r.w)
+      return Math.abs(g.x + g.w / 2 - (r.x + r.w / 2)) <= reach && Math.abs(g.y + g.h / 2 - (r.y + r.h / 2)) <= Math.max(SHOT_REACH_Y, reach)
+        && Math.max(g.w / r.w, r.w / g.w) <= SHOT_SIZE_RATIO
+    })).length / inAngle.length)
+    const most = Math.max(...share)
+    return faces.filter((_, k) => share[k] >= PRESENCE_MIN || share[k] === most)
+  }
   const angles: Angle[] = found.flatMap((a, id) => {
     if (!kept.has(id)) return []
-    const persons = personsOf(a.faces, id)
+    const faces = present(a.faces, id)
+    const persons = personsOf(faces, id)
     const spans = spansOf(s => s.angle === id)
     return [{
-      people: a.faces.length, at: Math.round(a.at),
-      faces: a.faces.map((f, i) => ({ x: round4(f.x), y: round4(f.y), w: round4(f.w), h: round4(f.h), ...(persons[i] !== undefined ? { person: persons[i] } : {}) })),
+      people: faces.length, at: Math.round(a.at),
+      faces: faces.map((f, i) => ({ x: round4(f.x), y: round4(f.y), w: round4(f.w), h: round4(f.h), ...(persons[i] !== undefined ? { person: persons[i] } : {}) })),
       spans,
       ...(turns ? { talk: spans.map(span => persons.map(p => talking(p, span))) } : {}),
     }]
