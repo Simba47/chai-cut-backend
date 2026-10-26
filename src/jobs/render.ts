@@ -282,11 +282,15 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
       const rel = Number(w.start_ms) - clipStart
       if (rel < 0) return [w]
       const mid = (Number(w.start_ms) + Number(w.end_ms)) / 2 - clipStart
-      if (!pieces.some(p => p.from != null && mid >= p.from && mid < p.from + p.ms * (p.speed ?? 1))) return []
+      // (nor a word only in empty space a part left: nothing of it is seen or heard, as in the editor)
+      if (!pieces.some(p => p.from != null && !p.blank && mid >= p.from && mid < p.from + p.ms * (p.speed ?? 1))) return []
       // (each end: in a part played faster or slower the word is shorter or longer too)
       const a = timelineAtPieces(pieces, rel), b = Math.max(a + 1, timelineAtPieces(pieces, Number(w.end_ms) - clipStart))
       return a === rel && b === Number(w.end_ms) - clipStart ? [w] : [{ ...w, start_ms: clipStart + a, end_ms: clipStart + b }]
     })
+      // (in the order they are heard: a part moved later takes its words with it, and captions are
+      // grouped in this order — as the editor's preview sorts them)
+      .sort((x, y) => Number(x.start_ms) - Number(y.start_ms))
     : words
   const piecesLen = pieces.length ? pieces[pieces.length - 1].at + pieces[pieces.length - 1].ms : 0
   return {
@@ -503,6 +507,11 @@ async function loudPauses(cuts: Range[], words: Array<{ start_ms: number; end_ms
  * (segments, crop keyframes, text, overlays, frame lane items) and word time moves to where
  * that moment now plays. Cut words are dropped; anything left with no time is dropped.
  */
+/** The empty space a part left in the main row (the editor's visibility.ts isGapPart): hidden and muted, its picture box hidden too */
+function isGapRow(s: Row, mainVideoId: string): boolean {
+  return !!s.hidden && !!s.muted && !!(s.crop_boxes ?? [])[0]?.hidden && !String(s.layout).startsWith('frame_') && !addedVideo(s, mainVideoId)
+}
+
 /** The video added over the main video in a section (B-roll), if any: its crop box */
 function addedVideo(s: Row, mainVideoId: string): Row | null {
   const b = (s.crop_boxes ?? [])[0]
@@ -571,7 +580,8 @@ export function insertSpans(segments: Row[], mainVideoId: string): InsertSpan[] 
 
 /** A stretch of the timeline [at, at + ms): the main video from `from` on, or held at `hold` (clip ms) */
 /** `speed` (1 when not given): the piece's `ms` of timeline plays `ms · speed` of the main video */
-export type Piece = { at: number; ms: number; from?: number; hold?: number; speed?: number }
+/** `blank`: the empty space a part left in the main row (hidden and silent: nothing of it is seen or heard) */
+export type Piece = { at: number; ms: number; from?: number; hold?: number; speed?: number; blank?: boolean }
 /** A part's speed range (the editor's Speed, lib/shared/constants.ts SPEED_MIN / SPEED_MAX; python/render.py too) */
 export const SPEED_MIN = 0.1, SPEED_MAX = 10
 /** A part's speed (the editor's Speed): SPEED_MIN to SPEED_MAX, else 1 */
@@ -599,7 +609,7 @@ export function piecesOfRows(rows: Row[], mainVideoId: string): Piece[] {
       // (a part of the main video plays at its own speed; a video on top doesn't change the main video's)
       const speed = main ? rowSpeed(s) : 1
       const from = (main && main.source_offset_ms != null ? Number(main.source_offset_ms) : videoNow) + (at - s0) * speed
-      out.push({ at, ms, from, ...(speed !== 1 ? { speed } : {}) })
+      out.push({ at, ms, from, ...(speed !== 1 ? { speed } : {}), ...(isGapRow(s, mainVideoId) ? { blank: true } : {}) })
       videoNow = from + ms * speed
     }
     cursor = at + ms
@@ -615,9 +625,15 @@ export function videoAtPieces(pieces: Piece[], t: number): number {
   return p.hold != null ? p.hold : (p.from ?? 0) + Math.min(p.ms, Math.max(0, t - p.at)) * (p.speed ?? 1)
 }
 
-/** Where on the timeline the main video shows its moment `v` (clip ms); a moment cut out lands where the clip goes on after it */
+/**
+ * Where on the timeline the main video shows its moment `v` (clip ms); a moment cut out lands where
+ * the clip goes on after it. Where it is seen first: a part moved away in the editor leaves empty
+ * space (blank) that still runs its moment, and its words go with the part.
+ */
 export function timelineAtPieces(pieces: Piece[], v: number): number {
-  for (const p of pieces) if (p.from != null && v >= p.from && v < p.from + p.ms * (p.speed ?? 1)) return p.at + (v - p.from) / (p.speed ?? 1)
+  for (const blank of [false, true]) {
+    for (const p of pieces) if (!!p.blank === blank && p.from != null && v >= p.from && v < p.from + p.ms * (p.speed ?? 1)) return p.at + (v - p.from) / (p.speed ?? 1)
+  }
   const next = pieces.find(p => p.from != null && p.from > v)
   return next ? next.at : (pieces.length ? pieces[pieces.length - 1].at + pieces[pieces.length - 1].ms : v)
 }
