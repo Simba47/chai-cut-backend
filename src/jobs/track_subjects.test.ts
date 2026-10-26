@@ -149,12 +149,26 @@ test('a short wide shot between close-ups is not the close-up, even with a frame
   assert.deepEqual(spans, [[0, 5000], [6500, 10000]])
 })
 
-test('who is in an angle: someone seen in under half its frames (PRESENCE_MIN) does not count', () => {
-  // One camera shot of P; Q sits in for 3 s, then R for 3 s (each 30% of the shot): two faces in most
-  // frames, but P is the only one there for half of it
+test('who is in an angle: everyone seen in it counts, even someone there only part of the time (never ignore anyone)', () => {
+  // One camera shot of P; Q sits in for 3 s, then R for 3 s (each 30% of the shot)
   const fw = made(10000, (t, n) => [person(0, 0.5, 0.05, n, 0.12),
     ...(t < 3000 ? [person(1, 0.15, 0.6, n, 0.12)] : []), ...(t >= 4000 && t < 7000 ? [person(2, 0.85, 0.9, n, 0.12)] : [])])
   const [angle] = findAngles(fw, [], 10000)
+  assert.equal(angle.people, 3)
+  assert.deepEqual(angle.faces.map(f => Math.round((f.x + f.w / 2) * 100) / 100), [0.15, 0.5, 0.85])
+})
+
+test('who is in an angle: a misread seen in only 1–2 frames is nobody (PRESENCE_MIN_FRAMES)', () => {
+  // A close-up of P; for two frames the detector also "sees" a big face over the background
+  const fw = made(10000, (t, n) => [person(0, 0.4, 0.05, n, 0.13), ...(n === 10 || n === 11 ? [{ ...face(0.8, 0.9, 0.3), score: 0.8 }] : [])])
+  const [angle] = findAngles(fw, [], 10000)
   assert.equal(angle.people, 1)
-  assert.ok(Math.abs(angle.faces[0].x + angle.faces[0].w / 2 - 0.5) < 0.02, JSON.stringify(angle.faces))
+})
+
+test('who is in an angle: one person in two places, never seen together, counts once', () => {
+  // A close-up of B in the middle; for 4 s the video's own edit shows him on the right (faces too small
+  // for who-is-who: by place and timing only)
+  const fw = made(12000, (t) => [face(t >= 4000 && t < 8000 ? 0.72 : 0.5, 0.05, 0.1)])
+  const [angle] = findAngles(fw, [], 12000)
+  assert.equal(angle.people, 1)
 })

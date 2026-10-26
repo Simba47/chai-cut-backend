@@ -636,11 +636,20 @@ const ANGLE_MOTION_SIZE = 2.2
 /** A frame this close to a camera cut may already show the next shot: a short stretch is judged without it when it has others */
 const SHORT_EDGE_MS = 150
 /**
- * Who is in an angle (the Auto format Rulebook, 2026-10-25, PRESENCE_MIN — as the editor's AUTO_FORMAT):
- * a person counts when a face is seen in their place in at least this share of the angle's frames, so
- * someone walking through doesn't change its format
+ * Who is in an angle: everyone whose face is seen in it, in at least this many frames (¾ s) — never
+ * ignore anyone (the user, 2026-10-26), over the Rulebook's PRESENCE_MIN of half the angle's frames,
+ * which left out someone who sat down partway through. Measured on four clips: misreads (a 0.44-wide
+ * "face", a hand) are seen in 1–2 frames, real people the detector catches only part of the time in 10+
  */
-const PRESENCE_MIN = 0.5
+const PRESENCE_MIN_FRAMES = 3
+/**
+ * …and, for a face seen only outside the angle's own frame, sure enough to be one: the detector this sure
+ * of it (the middle of its sightings), or a small face of a wide shot (people at the back read lower: a
+ * woman at the end of a row read 76–81%). A blurred orange lamp behind a close-up read 70–76% in 10 frames
+ * of a long scene and became a second person (2026-10-26)
+ */
+const SEEN_SURE = 0.8
+const SEEN_SMALL = 0.05
 
 export interface Angle {
   /** How many people it shows; 0: the other shots (no faces, or too short to be an angle) */
@@ -676,6 +685,11 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
   const overlap = (s: { a: number; b: number }, spans: Turn[]) => spans.reduce((n, [a, b]) => n + Math.max(0, Math.min(b, s.b) - Math.max(a, s.a)), 0)
   // Who each face is (identities; faces too small to read have no one)
   const personAt = whoIs(fr, cuts)
+  // Each face's track (the same face frame to frame, until a camera cut): one person moving in their
+  // seat is one sighting, never two people
+  const trackIds = trackFaces(fr, cuts.map(c => c - FRAME_SHOWS_MS))
+  const trackAt = new Map<CropBox, number>()
+  fr.forEach((f, fi) => trackIds[fi].forEach((tid, k) => trackAt.set(f.faces[k], tid)))
   /** Two faces surely the same person (true), surely not (false), or not known (null) */
   const samePerson = (f: CropBox, g: CropBox) => {
     const p = personAt.get(f), q = personAt.get(g)
@@ -811,20 +825,54 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
   const talking = (p: number | undefined, [a, b]: Turn) => p === undefined || !turns ? 0
     : Math.round((turns.get(String(p)) ?? []).reduce((n, [x, y]) => n + Math.max(0, Math.min(b, y) - Math.max(a, x)), 0))
   /** The angle's faces seen in their place in at least PRESENCE_MIN of its frames (the most present one at least) */
-  const present = (faces: CropBox[], id: number) => {
-    const inAngle = fr.filter((_, fi) => { const t = timeOf(fi); return stretches.some(s => s.angle === id && t >= s.a && t < s.b) })
-    if (!inAngle.length) return faces
-    const share = faces.map(r => inAngle.filter(f => f.faces.some(g => {
+  /**
+   * Everyone seen in the angle, not only in its own frame: the angle's faces, plus each other place a
+   * face is seen in any of its frames (PRESENCE_MIN_FRAMES) — its box the middle of its sightings —
+   * left to right. Two faces are one person in one place: about the same place and size, and not two
+   * different people by who they are
+   */
+  const seenIn = (faces: CropBox[], id: number) => {
+    // (frames right on a camera cut may already show the next shot's people: they aren't in this one)
+    const inAngle = fr.filter((_, fi) => {
+      const t = timeOf(fi)
+      return stretches.some(s => s.angle === id && t >= s.a && t < s.b
+        && (s.a <= 0 || t - s.a >= SHORT_EDGE_MS) && (s.b >= durationMs || s.b - t >= SHORT_EDGE_MS))
+    })
+    const near = (g: CropBox, r: CropBox) => {
       const reach = Math.max(SHOT_REACH_X, SHOT_REACH_FACE * r.w)
       return Math.abs(g.x + g.w / 2 - (r.x + r.w / 2)) <= reach && Math.abs(g.y + g.h / 2 - (r.y + r.h / 2)) <= Math.max(SHOT_REACH_Y, reach)
-        && Math.max(g.w / r.w, r.w / g.w) <= SHOT_SIZE_RATIO
-    })).length / inAngle.length)
-    const most = Math.max(...share)
-    return faces.filter((_, k) => share[k] >= PRESENCE_MIN || share[k] === most)
+        && Math.max(g.w / r.w, r.w / g.w) <= SHOT_SIZE_RATIO && samePerson(g, r) !== false
+    }
+    const places = faces.map(f => ({ rep: f, seen: [f], own: true, tracks: new Set([trackAt.get(f)]), frames: new Set<number>() }))
+    inAngle.forEach((f, k) => f.faces.forEach(g => {
+      const tid = trackAt.get(g)
+      // Their own track first (they moved), then the same place
+      const at = places.find(pl => tid !== undefined && pl.tracks.has(tid)) ?? places.find(pl => near(g, pl.rep))
+      if (at) { at.seen.push(g); at.tracks.add(tid); at.frames.add(k) }
+      else places.push({ rep: g, seen: [g], own: false, tracks: new Set([tid]), frames: new Set([k]) })
+    }))
+    const median = (v: number[]) => [...v].sort((p, q) => p - q)[Math.floor(v.length / 2)]
+    // One person in two places (moved, or the video's own edit put them elsewhere for a while): a place
+    // never seen in the same frame as another, with a face about the same size, is that one — unless who
+    // they are says otherwise
+    for (const pl of [...places].filter(x => !x.own).sort((p, q) => p.seen.length - q.seen.length)) {
+      const w = median(pl.seen.map(g => g.w))
+      const same = places.find(o => o !== pl && !o.frames.has(-1) && ![...pl.frames].some(k => o.frames.has(k))
+        && Math.max(w / median(o.seen.map(g => g.w)), median(o.seen.map(g => g.w)) / w) <= SHOT_SIZE_RATIO && samePerson(pl.rep, o.rep) !== false)
+      if (!same) continue
+      same.seen.push(...pl.seen); pl.tracks.forEach(t => same.tracks.add(t)); pl.frames.forEach(k => same.frames.add(k))
+      pl.frames.add(-1)   // (merged: gone)
+      pl.seen = []
+    }
+    return places
+      .filter(pl => pl.own || (pl.seen.length >= PRESENCE_MIN_FRAMES && !pl.frames.has(-1)
+        && (median(pl.seen.map(g => g.score ?? 0)) >= SEEN_SURE || median(pl.seen.map(g => g.w)) < SEEN_SMALL)))
+      .map(pl => (pl.own ? pl.rep : { x: median(pl.seen.map(g => g.x)), y: median(pl.seen.map(g => g.y)), w: median(pl.seen.map(g => g.w)), h: median(pl.seen.map(g => g.h)), score: pl.rep.score }))
+      .sort((p, q) => p.x + p.w / 2 - (q.x + q.w / 2))
   }
   const angles: Angle[] = found.flatMap((a, id) => {
     if (!kept.has(id)) return []
-    const faces = present(a.faces, id)
+    const faces = seenIn(a.faces, id)
     const persons = personsOf(faces, id)
     const spans = spansOf(s => s.angle === id)
     return [{
