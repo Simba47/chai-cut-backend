@@ -1887,13 +1887,30 @@ def main(
                 }]}
 
         # ── ASS captions ───────────────────────────────────────────────────────
-        ass_path = None
-        ass_info = {"difference": None, "behind": False}
+        # One file per caption part (render.ts caption_parts: a different style from one moment of
+        # the clip to the next): each part's words, in its own look over the clip's style. A line
+        # never runs from one part into the next. No parts: one file, as always.
+        ass_files: list[tuple[str, dict]] = []
         # enabled False = the user turned captions off (styles saved before that field count as on)
         if clip_words and caption_style and caption_style.get("enabled") is not False:
-            ass_path = os.path.join(tmp, "captions.ass")
-            ass_info = _write_ass(clip_words, caption_style, clip_start_ms, out_w, out_h, ass_path,
-                                  band_zones=caption_band_zones(segments, out_h))
+            zones = caption_band_zones(segments, out_h)
+            parts = [p for p in (spec.get("caption_parts") or []) if int(p.get("start_ms") or 0) > 0]
+            parts.sort(key=lambda p: int(p["start_ms"]))
+            if not parts:
+                path = os.path.join(tmp, "captions.ass")
+                ass_files.append((path, _write_ass(clip_words, caption_style, clip_start_ms, out_w, out_h, path, band_zones=zones)))
+            else:
+                bounds = [None] + [int(p["start_ms"]) for p in parts] + [None]
+                looks = [caption_style] + [{**caption_style, **(p.get("style") or {})} for p in parts]
+                for k, look in enumerate(looks):
+                    a, b = bounds[k], bounds[k + 1]
+                    own = [w for w in clip_words
+                           if (a is None or w["start_ms"] - clip_start_ms >= a) and (b is None or w["start_ms"] - clip_start_ms < b)]
+                    if not own:
+                        continue
+                    path = os.path.join(tmp, f"captions-{k}.ass")
+                    ass_files.append((path, _write_ass(own, look, clip_start_ms, out_w, out_h, path, band_zones=zones)))
+                print(f"[render] captions in {len(looks)} parts: {[(bounds[k] or 0, l.get('template') or l.get('animation')) for k, l in enumerate(looks)]}", flush=True)
 
         # ── Count how many times each source video is needed ───────────────────
         # FFmpeg requires explicit split() when a stream is consumed more than once.
@@ -2546,29 +2563,32 @@ def main(
 
         # ── Subtitles (ASS captions) ───────────────────────────────────────────
         behind_subs = None
-        if ass_path:
-            # Escape path for FFmpeg filter option: quoted, forward slashes, and inside the quotes
-            # ':' (Windows drive letters) still needs escaping
-            def _esc_path(p: str) -> str:
-                return "'" + p.replace("\\", "/").replace(":", "\\:").replace("'", "") + "'"
+        behind_parts: list[str] = []
+        # Escape path for FFmpeg filter option: quoted, forward slashes, and inside the quotes
+        # ':' (Windows drive letters) still needs escaping
+        def _esc_path(p: str) -> str:
+            return "'" + p.replace("\\", "/").replace(":", "\\:").replace("'", "") + "'"
+        for k, (ass_path, ass_info) in enumerate(ass_files):
             esc_ass   = _esc_path(ass_path)
             esc_fonts = _esc_path(_subtitle_fonts_dir(tmp))
             if ass_info["difference"]:
                 # Difference blend (a Creator style): those words drawn white on black, and the
                 # picture inverted where they are (in RGB, as the editor's canvas blends)
                 esc_diff = _esc_path(ass_info["difference"])
-                fp.append(f"{cur}split[vdf0][vdf1]")
-                fp.append(f"[vdf1]drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill,"
-                          f"subtitles=filename={esc_diff}:fontsdir={esc_fonts},format=gbrp[vdfw]")
-                fp.append(f"[vdf0]format=gbrp[vdfv]")
-                fp.append(f"[vdfv][vdfw]blend=all_mode=difference,format=yuv420p[vdiff]")
-                cur = "[vdiff]"
+                fp.append(f"{cur}split[vdf0_{k}][vdf1_{k}]")
+                fp.append(f"[vdf1_{k}]drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill,"
+                          f"subtitles=filename={esc_diff}:fontsdir={esc_fonts},format=gbrp[vdfw_{k}]")
+                fp.append(f"[vdf0_{k}]format=gbrp[vdfv_{k}]")
+                fp.append(f"[vdfv_{k}][vdfw_{k}]blend=all_mode=difference,format=yuv420p[vdiff_{k}]")
+                cur = f"[vdiff_{k}]"
             if ass_info["behind"]:
                 # Behind the person (a Creator style): burnt in after the render, under them (person_mask.py)
-                behind_subs = f"subtitles=filename={esc_ass}:fontsdir={esc_fonts}"
+                behind_parts.append(f"subtitles=filename={esc_ass}:fontsdir={esc_fonts}")
             else:
-                fp.append(f"{cur}subtitles=filename={esc_ass}:fontsdir={esc_fonts}[vcap]")
-                cur = "[vcap]"
+                fp.append(f"{cur}subtitles=filename={esc_ass}:fontsdir={esc_fonts}[vcap_{k}]")
+                cur = f"[vcap_{k}]"
+        if behind_parts:
+            behind_subs = ",".join(behind_parts)
 
         # ── Text overlays (drawtext) ───────────────────────────────────────────
         for oi, ov in enumerate(text_overlays):

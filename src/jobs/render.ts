@@ -311,6 +311,10 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
     // Where the main video is hidden: black (captions, text and photos still go on top)
     blank_ranges: blankRanges(placedSegments, clip.video_id),
     caption_styles: captionStyles,
+    // A different caption style from one moment to the next (the editor's captions/parts.ts): each
+    // part after the first, from its start (clip ms, the clip as it plays) in its own look over
+    // caption_styles[0]
+    caption_parts: captionPartsOf((clip as Row).layers),
     text_overlays: (textOverlays as Row[]).filter(t => !t.hidden),
     // Music (uploaded from the editor) and detached original-sound bars, each placed where its bar
     // is (audio.py). Music saved before uploads existed has only a file name: it can't be mixed in
@@ -510,6 +514,22 @@ async function loudPauses(cuts: Range[], words: Array<{ start_ms: number; end_ms
 /** The empty space a part left in the main row (the editor's visibility.ts isGapPart): hidden and muted, its picture box hidden too */
 function isGapRow(s: Row, mainVideoId: string): boolean {
   return !!s.hidden && !!s.muted && !!(s.crop_boxes ?? [])[0]?.hidden && !String(s.layout).startsWith('frame_') && !addedVideo(s, mainVideoId)
+}
+
+/** What a caption part's look may hold (the editor's captions/parts.ts LOOK_KEYS) */
+const CAPTION_LOOK_KEYS = ['template', 'animation', 'color', 'highlight_color', 'font', 'size', 'uppercase', 'stroke_width', 'words_per_line']
+
+/** The caption parts saved beside the rows (clips.layers.captionParts), made safe: in order, each with only its look */
+export function captionPartsOf(layers: unknown): { start_ms: number; style: Row }[] {
+  const raw = (layers as { captionParts?: unknown } | null)?.captionParts
+  if (!Array.isArray(raw)) return []
+  return raw
+    .map(p => ({
+      start_ms: Math.round(Number(p?.start_ms)),
+      style: Object.fromEntries(Object.entries(p?.style && typeof p.style === 'object' ? p.style : {}).filter(([k, v]) => CAPTION_LOOK_KEYS.includes(k) && v !== undefined)),
+    }))
+    .filter(p => Number.isFinite(p.start_ms) && p.start_ms > 0)
+    .sort((a, b) => a.start_ms - b.start_ms)
 }
 
 /** The video added over the main video in a section (B-roll), if any: its crop box */
