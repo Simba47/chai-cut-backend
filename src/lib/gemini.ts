@@ -51,6 +51,26 @@ export class GeminiError extends Error {
   constructor(message: string, readonly status: number) { super(message) }
 }
 
+/** Connection errors that mean the request never got an answer (the network, not Google, failed) */
+const DROPS = new Set(['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH',
+  'EHOSTUNREACH', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_CLOSED'])
+/** The code of a connection error (fetch hides it in `cause`), '' when there is none */
+export function dropCode(e: unknown): string {
+  const err = e as { code?: unknown; cause?: { code?: unknown } } | null
+  return String(err?.cause?.code ?? err?.code ?? '')
+}
+/**
+ * A request that never got an answer because the connection dropped or a name lookup missed a beat:
+ * worth sending again, like a 5xx (one stopped a whole video's reading on 2026-10-22). A timeout or a
+ * stop (AbortError, TimeoutError) is not: the caller chose how long to wait.
+ */
+export function isNetworkDrop(e: unknown): boolean {
+  const name = (e as { name?: unknown } | null)?.name
+  if (name === 'AbortError' || name === 'TimeoutError') return false
+  return DROPS.has(dropCode(e))
+}
+const pause = (ms: number) => new Promise(r => setTimeout(r, ms))
+
 /** Sends one request and returns the answer's text (thinking parts left out) */
 export async function askGemini(input: string | GeminiPart[], opts: AskOptions = {}): Promise<string> {
   const provider = aiProvider()
@@ -84,7 +104,15 @@ export async function askGemini(input: string | GeminiPart[], opts: AskOptions =
 
   // Vertex answers 429 when shared capacity is briefly busy: wait and try again
   for (let attempt = 1; ; attempt++) {
-    const res = await inTurn(() => fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(opts.timeoutMs ?? 120_000) }))
+    let res: Response
+    try {
+      res = await inTurn(() => fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(opts.timeoutMs ?? 120_000) }))
+    } catch (e) {
+      // The connection dropped before an answer came: send it again, like a 5xx
+      if (!isNetworkDrop(e) || attempt >= TRIES) throw e
+      await pause(retryDelayMs(attempt))
+      continue
+    }
     if (res.ok) {
       const data = await res.json() as { candidates?: { content?: { parts?: { text?: string; thought?: boolean }[] } }[] }
       return (data.candidates?.[0]?.content?.parts ?? []).filter(p => !p.thought).map(p => p.text ?? '').join('')
@@ -183,7 +211,17 @@ async function vertexToken(): Promise<string> {
   } else {
     throw new Error(`Unsupported Google credentials type: ${(creds as { type?: string }).type}`)
   }
-  const res = await fetch(tokenUrl, { method: 'POST', body: form, signal: AbortSignal.timeout(30_000) })
+  // (a dropped connection is tried again: the token is asked for about once an hour)
+  let res: Response
+  for (let attempt = 1; ; attempt++) {
+    try {
+      res = await fetch(tokenUrl, { method: 'POST', body: form, signal: AbortSignal.timeout(30_000) })
+      break
+    } catch (e) {
+      if (!isNetworkDrop(e) || attempt >= 3) throw e
+      await pause(retryDelayMs(attempt))
+    }
+  }
   const data = await res.json().catch(() => ({})) as { access_token?: string; expires_in?: number; error_description?: string; error?: string }
   if (!res.ok || !data.access_token) throw new Error(`Google Cloud login failed (${res.status}): ${data.error_description ?? data.error ?? 'no token'}`)
   cached = { token: data.access_token, expires: Date.now() + ((data.expires_in ?? 3600) - 300) * 1000 }
