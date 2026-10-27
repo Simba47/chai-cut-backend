@@ -113,12 +113,13 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
       } catch (e) { console.warn(`[render] Failed to download frame photo:`, e) }
     }
 
-    // A brand kit's own fonts (BrandFont-<id>) on the clip's text and captions: fetched from the
-    // owner's brand/<user>/fonts/<id> (the editor uploads them there) for the renderer (--fonts)
+    // A brand kit's own fonts (BrandFont-<id>) on the clip's text, captions and frame text: fetched
+    // from the owner's brand/<user>/fonts/<id> (the editor uploads them there) for the renderer (--fonts)
     const brandFonts: Record<string, string> = {}
     const fontNames = new Set<string>([
       ...((renderSpec.caption_styles ?? []) as Row[]).map(c => String(c.font ?? '')),
       ...((renderSpec.text_overlays ?? []) as Row[]).map(t => String(t.font ?? '')),
+      ...((renderSpec.segments ?? []) as Row[]).flatMap(s => ((s.frame?.items ?? []) as Row[]).map(it => String(it.font ?? ''))),
     ])
     for (const fam of fontNames) {
       const m = /^BrandFont-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(fam)
