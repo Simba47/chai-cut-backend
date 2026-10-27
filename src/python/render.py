@@ -63,14 +63,36 @@ _FONT_NAMES = {
 # Fonts the editor offers by their family name that are bundled here (the editor loads them from
 # Google Fonts at the weight it draws: these are the nearest bundled files). Without this a text or
 # caption in, say, Bebas Neue came out in Roboto.
+# The editor's fonts (its VIDEO_FONTS, lib/shared/videoFonts.ts), each at the weight the editor
+# draws it — bold where the font has one — so text exports in the font it shows in. (Until
+# 2026-10-27 only seven were here: text in any other exported in Roboto, and Roboto and Poppins
+# came out thinner / heavier than the editor shows them.) Static files from Google Fonts (OFL /
+# Apache): variable ones cut at weight 700. Fredoka One is Google's web copy (Latin only).
 _FAMILY_FILES = {
-    "Roboto":     "Roboto-Regular.ttf",
-    "Montserrat": "Montserrat-Bold.ttf",
-    "Poppins":    "Poppins-ExtraBold.ttf",
-    "Oswald":     "Oswald-Bold.ttf",
-    "Bebas Neue": "BebasNeue-Regular.ttf",
-    "Anton":      "Anton-Regular.ttf",
-    "Pacifico":   "Pacifico-Regular.ttf",
+    "Roboto":           "Roboto-Bold.ttf",
+    "Montserrat":       "Montserrat-Bold.ttf",
+    "Poppins":          "Poppins-Bold.ttf",
+    "Lato":             "Lato-Bold.ttf",
+    "Inter":            "Inter-Bold.ttf",
+    "Nunito":           "Nunito-Bold.ttf",
+    "Rubik":            "Rubik-Bold.ttf",
+    "DM Sans":          "DMSans-Bold.ttf",
+    "Ubuntu":           "Ubuntu-Bold.ttf",
+    "Space Grotesk":    "SpaceGrotesk-Bold.ttf",
+    "Outfit":           "Outfit-Bold.ttf",
+    "Sora":             "Sora-Bold.ttf",
+    "Raleway":          "Raleway-Bold.ttf",
+    "Oswald":           "Oswald-Bold.ttf",
+    "Bebas Neue":       "BebasNeue-Regular.ttf",
+    "Anton":            "Anton-Regular.ttf",
+    "Barlow Condensed": "BarlowCondensed-Bold.ttf",
+    "Fjalla One":       "FjallaOne-Regular.ttf",
+    "Archivo Black":    "ArchivoBlack-Regular.ttf",
+    "Exo 2":            "Exo2-Bold.ttf",
+    "Righteous":        "Righteous-Regular.ttf",
+    "Fredoka One":      "FredokaOne-Regular.ttf",
+    "Playfair Display": "PlayfairDisplay-Bold.ttf",
+    "Pacifico":         "Pacifico-Regular.ttf",
 }
 # A brand kit's own fonts (uploaded TTF / OTF): "BrandFont-<id>" → the file the render job fetched
 # for this export (--fonts). Set by main().
@@ -1224,13 +1246,18 @@ def _subtitle_fonts_dir(tmp: str) -> str:
     return d
 
 
-def _frame_text_font(text: str) -> str:
-    """Montserrat Bold for Latin text; the Noto font of the Indian script Montserrat can't draw."""
+def _frame_text_font(text: str, family: str | None = None) -> str:
+    """The text's own font (`family`: an editor font, or a brand kit's own — a brand kit puts its
+    title font on frame text) for Latin text, else Montserrat Bold; text in an Indian script, the
+    Noto font of that script (neither can draw it). The editor's preview picks the same way."""
     scripts = (("\u0c00", "\u0c7f", "noto-sans-telugu"), ("\u0900", "\u097f", "noto-sans-devanagari"),
                ("\u0b80", "\u0bff", "noto-sans-tamil"), ("\u0c80", "\u0cff", "noto-sans-kannada"),
                ("\u0d00", "\u0d7f", "noto-sans-malayalam"), ("\u0980", "\u09ff", "noto-sans-bengali"))
-    font_id = next((fid for a, b, fid in scripts if any(a <= c <= b for c in text)), "montserrat-bold")
-    path = _find_font_path(font_id)
+    script_font = next((fid for a, b, fid in scripts if any(a <= c <= b for c in text)), None)
+    path = ""
+    if family and not script_font and (family in _CUSTOM_FONTS or family in _FAMILY_FILES):
+        path = _find_font_path(family)
+    path = path or _find_font_path(script_font or "montserrat-bold")
     path = path or _find_font_path("roboto")
     # Quoted in the filter; inside the quotes ':' (Windows drive letters) still needs escaping
     return path.replace("\\", "/").replace(":", "\\:") if path else ""
@@ -1390,7 +1417,7 @@ def _frame_text_chain(fp: list[str], inputs: list[str], next_input: int, key: st
                       text: str, bg: str, color: str, size_1080: int, w: int, h: int, dur_s: float,
                       cx: float = 0.5, cy: float = 0.5, box_w: float | None = None,
                       rotation: float = 0.0, frame_w: int | None = None, default_w: float | None = None,
-                      ticker: bool = False) -> tuple[str, int]:
+                      ticker: bool = False, font_family: str | None = None) -> tuple[str, int]:
     """A solid w×h card with wrapped text centred on (cx, cy) — shares of the card, set by dragging
     it in the editor; the text wraps inside its box's width (`box_w`, a share of the frame's) and
     is turned by `rotation` degrees. Appends its filter statements onto `fp` (and any emoji PNG
@@ -1405,7 +1432,7 @@ def _frame_text_chain(fp: list[str], inputs: list[str], next_input: int, key: st
         fp.append(f"color=c=0x{bg}:s={w}x{h}:d={dur_s:.3f}:r=30,format=yuv420p{base_lbl}")
     cur = base_lbl
     text = (text or "").strip()
-    font = _frame_text_font(text) if text else ""
+    font = _frame_text_font(text, font_family) if text else ""
     ridx = 0
     if text and font and ticker:
         # One line, scrolling in from the right and out to the left, over and over
@@ -2299,7 +2326,8 @@ def main(
                                 float(it["y"]) if it.get("y") is not None else 0.5,
                                 float(it["w"]) if it.get("w") else None,
                                 float(it.get("rotation") or 0),
-                                frame_w=out_w, default_w=0.88 * aw / out_w, ticker=bool(area.get("ticker")))
+                                frame_w=out_w, default_w=0.88 * aw / out_w, ticker=bool(area.get("ticker")),
+                                font_family=it.get("font") or None)
                             chain = f"{text_lbl}null"  # passthrough: the shared epilogue below appends setpts
                         elif ik == "photo" and (si, it["id"]) in frame_item_in:
                             src = frame_item_in[(si, it["id"])]
