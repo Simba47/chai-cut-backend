@@ -7,7 +7,9 @@ import db from '../db.js'
  * one. What it puts on each clip mirrors what the frontend puts on a clip made by hand
  * (services/brandKits.ts brandNewClips): its logo where and when the kit says, its caption style
  * when its captions are on, and here also its title style on the hook. Keep the two in step.
- * (A kit's progress bar and brand voice aren't used any more — user, 2026-10-20: taken out of kits.)
+ * The rest of a kit (its progress bar, end card, intro and outro: brand kit Phase 4) the clip gets from the frontend's brand
+ * engine the first time it catches up with its kit — when it's opened in the editor or exported —
+ * because the version saved with the clip (`applied`) has it off (appliedHere).
  */
 
 export interface ClipBrand {
@@ -38,6 +40,8 @@ const color = (v: unknown, fallback: string) => (typeof v === 'string' && HEX.te
 const r4 = (v: number) => Math.round(v * 10000) / 10000
 /** The logo's margin from the frame's edges in its corner (share of the frame's width): the frontend's LOGO_MARGIN */
 const LOGO_MARGIN = 0.04
+/** What Reels and Shorts draw over a video, for a logo kept clear of it (kit logo.safe): the frontend's LOGO_SAFE */
+const LOGO_SAFE = { top: 0.08, bottom: 0.13, right: 0.14, edge: 0.035 }
 
 /** A kit's saved settings (as the brand_kits row keeps them) as what goes on a clip; anything missing or wrong takes the default */
 export function clipBrand(raw: unknown, userId: string): ClipBrand {
@@ -52,10 +56,13 @@ export function clipBrand(raw: unknown, userId: string): ClipBrand {
     const w = num(l.size, 0.06, 0.5, 0.18)
     const h = Math.min(0.9, (w * 1080 * num(l.ratio, 0.05, 20, 1)) / 1920)
     const corner = ['tl', 'tr', 'bl', 'br'].includes(l.corner as string) ? (l.corner as string) : 'tr'
-    const mx = LOGO_MARGIN, my = (LOGO_MARGIN * 1080) / 1920
+    const safe = l.safe !== false
+    const mx = safe ? Math.max(LOGO_MARGIN, LOGO_SAFE.edge) : LOGO_MARGIN
+    const top = safe ? LOGO_SAFE.top : (LOGO_MARGIN * 1080) / 1920, bottom = safe ? LOGO_SAFE.bottom : (LOGO_MARGIN * 1080) / 1920
+    const right = safe && corner === 'br' ? LOGO_SAFE.right : mx
     const placed = typeof l.x === 'number' && typeof l.y === 'number' && isFinite(l.x) && isFinite(l.y)
-    const x = placed ? Math.min(1 - w, Math.max(0, l.x as number)) : corner.endsWith('l') ? mx : 1 - mx - w
-    const y = placed ? Math.min(1 - h, Math.max(0, l.y as number)) : corner.startsWith('t') ? my : 1 - my - h
+    const x = placed ? Math.min(1 - w, Math.max(0, l.x as number)) : corner.endsWith('l') ? mx : 1 - right - w
+    const y = placed ? Math.min(1 - h, Math.max(0, l.y as number)) : corner.startsWith('t') ? top : 1 - bottom - h
     logo = {
       path, x: r4(x), y: r4(y), w: r4(w), h: r4(h), opacity: num(l.opacity, 0.1, 1, 0.9),
       show: (['all', 'start', 'end'] as const).find(s => s === l.show) ?? 'all', seconds: Math.round(num(l.seconds, 1, 15, 3)),
@@ -96,12 +103,25 @@ export async function loadClipBrand(userId: string, choice: string | undefined):
           SELECT bk.id, bk.data, bk.user_id FROM brand_kits bk WHERE bk.id = ${choice}
             AND (bk.user_id = ${userId} OR EXISTS (SELECT 1 FROM brand_kit_shares s WHERE s.kit_id = bk.id AND s.user_id = ${userId}))`
       : await db<{ id: string; data: unknown; user_id: string }[]>`SELECT id, data, user_id FROM brand_kits WHERE user_id = ${userId} AND (data->>'is_default')::boolean LIMIT 1`
-    return row ? { ...clipBrand(row.data, row.user_id), kit_id: row.id, applied: row.data } : null
+    return row ? { ...clipBrand(row.data, row.user_id), kit_id: row.id, applied: appliedHere(row.data) } : null
   } catch (e) {
     // (no brand_kits table yet, or the database hiccuped: the clips are made without a kit)
     console.warn('[brand] the brand kit could not be read:', e instanceof Error ? e.message : e)
     return null
   }
+}
+
+/**
+ * A kit's settings as this job puts them on: what it doesn't put on (the kit's progress bar, end card, intro and outro) off.
+ * Saved with the clip as the version it got, so the frontend's brand engine adds the rest later as it
+ * would a kit's newly switched-on progress bar.
+ */
+export function appliedHere(data: unknown): unknown {
+  if (!data || typeof data !== 'object') return data
+  const d = data as Record<string, unknown>
+  const bar = d.progress_bar && typeof d.progress_bar === 'object' ? d.progress_bar as Record<string, unknown> : null
+  const ends = d.ends && typeof d.ends === 'object' ? d.ends as Record<string, unknown> : null
+  return { ...d, ...(bar ? { progress_bar: { ...bar, on: false } } : {}), ...(ends ? { ends: { ...ends, card: false, intro: null, outro: null } } : {}) }
 }
 
 /** When the logo shows on a clip `lengthMs` long: [start, end] ms (the frontend's logoSpan) */
