@@ -13,6 +13,11 @@ import db from '../db.js'
 export interface ClipBrand {
   /** The kit (its brand_kits id): the clip is saved with it switched on (clips.brand) */
   kit_id?: string
+  /**
+   * The kit's settings as saved, kept with the clip (clips.brand.applied) as the version it got: when
+   * the kit changes, the clip follows it (the frontend's brand engine, modules/brand/engine.ts)
+   */
+  applied?: unknown
   title: { font: string | null; color: string; size: number }
   /** The caption style fields (null: the kit's captions are off — the job's own style is kept) */
   captions: {
@@ -91,7 +96,7 @@ export async function loadClipBrand(userId: string, choice: string | undefined):
           SELECT bk.id, bk.data, bk.user_id FROM brand_kits bk WHERE bk.id = ${choice}
             AND (bk.user_id = ${userId} OR EXISTS (SELECT 1 FROM brand_kit_shares s WHERE s.kit_id = bk.id AND s.user_id = ${userId}))`
       : await db<{ id: string; data: unknown; user_id: string }[]>`SELECT id, data, user_id FROM brand_kits WHERE user_id = ${userId} AND (data->>'is_default')::boolean LIMIT 1`
-    return row ? { ...clipBrand(row.data, row.user_id), kit_id: row.id } : null
+    return row ? { ...clipBrand(row.data, row.user_id), kit_id: row.id, applied: row.data } : null
   } catch (e) {
     // (no brand_kits table yet, or the database hiccuped: the clips are made without a kit)
     console.warn('[brand] the brand kit could not be read:', e instanceof Error ? e.message : e)

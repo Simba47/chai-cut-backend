@@ -1896,7 +1896,8 @@ async function saveClip(
       `
     }
     // Saved with its brand kit switched on (the editor's Brand kit switch; nothing to put back when it's switched off)
-    if (brand?.kit_id) await tx`UPDATE clips SET brand = ${tx.json({ kit_id: brand.kit_id, before: null } as never)} WHERE id = ${clipId}`
+    // (with the kit's version, so the clip follows the kit when it changes — the frontend's brand engine)
+    if (brand?.kit_id) await tx`UPDATE clips SET brand = ${tx.json({ kit_id: brand.kit_id, before: null, applied: brand.applied ?? null } as never)} WHERE id = ${clipId}`
     // The brand kit's logo, where and when the kit says
     if (brand?.logo) {
       const [from, to] = logoSpan(brand.logo, highlight.end_ms - highlight.start_ms)
