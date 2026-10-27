@@ -284,6 +284,21 @@ async function runMigrations() {
   console.log('[startup] migrations ok')
 }
 
+// Workers starting together (a deploy of several copies) run the migrations one after another: two
+// at once collide (DROP then ADD CONSTRAINT: "already exists", and the second worker stopped; found
+// in a two-worker test, 2026-10-27). A lock held on one connection for the whole run.
+const MIGRATION_LOCK = 20261029
+async function migrateInTurn() {
+  const conn = await db.reserve()
+  try {
+    await conn`SELECT pg_advisory_lock(${MIGRATION_LOCK})`
+    await runMigrations()
+  } finally {
+    await conn`SELECT pg_advisory_unlock(${MIGRATION_LOCK})`.catch(() => {})
+    conn.release()
+  }
+}
+
 registerHandler('transcribe', handleTranscribeJob)
 registerHandler('render', handleRenderJob)
 registerHandler('ai_edit', handleAiEditJob)
@@ -310,7 +325,7 @@ if (!mayTakeJobs()) {
   console.log('[worker] Not taking jobs: this PC\'s database is somewhere else (QA\'s?), so Railway\'s worker does them. '
     + 'Set LOCAL_WORKER=on in .env to run this worker on it anyway.')
 } else {
-  runMigrations()
+  migrateInTurn()
     .then(() => startQueue())
     .catch(err => {
       console.error('[worker] Fatal error:', err)

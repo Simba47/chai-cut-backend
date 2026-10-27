@@ -35,9 +35,38 @@ function isLong(job: Job): boolean {
 // them. (User, 2026-10-24: a 2-hour upload's editing copy and its reading took both slots, and a
 // Subjects job waited 7+ minutes — editing copies weren't counted.) AI edit itself is not held
 // back: it waits for its video's reading, which must be able to start next to it. Editing copies
-// also wait for everything else queued and are made one at a time.
-const LONG_SLOTS = CONCURRENCY > 1 ? CONCURRENCY - 1 : 1
+// also wait for everything else queued.
+let LONG_SLOTS = CONCURRENCY > 1 ? CONCURRENCY - 1 : 1
 let longRunning = 0
+
+// Editing copies one worker makes at once (PROXY_PER_WORKER, default 1), within its long-job slots.
+// Per worker, not across all of them: more workers make more copies (it used to be one at a time
+// across every worker, so at ~200 uploads an hour copies queued for hours).
+const PROXY_PER_WORKER = Math.max(1, parseInt(process.env.PROXY_PER_WORKER ?? '1', 10) || 1)
+let proxyRunning = 0
+
+// ── Worker pools ─────────────────────────────────────────────────────────────
+// WORKER_JOBS: the jobs this worker takes, so each kind can have its own machines, e.g.
+// "render,track_subjects,detect_silence" (exports and Subjects on big machines) or "proxy" (editing
+// copies on their own). "transcribe" is a clip's captions and link imports; "reading" is a whole-video
+// reading (AI edit). Not set: every job, as before.
+const READING = 'reading'
+interface Pool { types: string[]; clipCaptions: boolean; readings: boolean; label: string }
+let pool: Pool | null = null
+function workerPool(known: string[]): Pool {
+  const raw = process.env.WORKER_JOBS?.trim()
+  if (!raw) return { types: known, clipCaptions: true, readings: true, label: 'every job' }
+  const asked = raw.split(',').map(s => s.trim()).filter(Boolean)
+  const unknown = asked.filter(a => a !== READING && !known.includes(a))
+  if (unknown.length) console.warn(`[queue] WORKER_JOBS: no such job ${unknown.join(', ')} (known: ${[...known, READING].join(', ')})`)
+  const clipCaptions = asked.includes('transcribe'), readings = asked.includes(READING)
+  const types = known.filter(t => t !== 'transcribe' && asked.includes(t))
+  if (clipCaptions || readings) types.push('transcribe')
+  if (!types.length) console.error('[queue] WORKER_JOBS names no job this worker can run: it will take nothing')
+  return { types, clipCaptions, readings, label: asked.filter(a => !unknown.includes(a)).join(', ') || 'nothing' }
+}
+/** Whether this worker's jobs include any quick one (else no slot needs keeping free for them) */
+const takesQuickJobs = (p: Pool) => p.clipCaptions || p.types.some(t => t !== 'proxy' && t !== 'transcribe')
 
 export function registerHandler(type: JobType, handler: JobHandler) {
   handlers.set(type, handler)
@@ -97,7 +126,13 @@ export async function startQueue() {
   setInterval(() => { requeueStuck().catch(err => console.error('[queue] Stuck-job sweep failed:', err)) }, STUCK_SWEEP_MS)
   setInterval(() => { reportQueue().catch(() => { /* only a log line */ }) }, STUCK_SWEEP_MS)
 
-  console.log(`[queue] Worker started (concurrency=${CONCURRENCY}, long jobs (whole-video readings, editing copies) at most ${LONG_SLOTS} at a time), polling for jobs…`)
+  pool = workerPool([...handlers.keys()])
+  // A worker of long jobs only (editing copies, readings) has no quick job to keep a slot for
+  if (!takesQuickJobs(pool)) LONG_SLOTS = CONCURRENCY
+  const copies = Math.min(PROXY_PER_WORKER, LONG_SLOTS)
+  if (copies < PROXY_PER_WORKER && pool.types.includes('proxy')) console.warn(`[queue] PROXY_PER_WORKER=${PROXY_PER_WORKER} but only ${LONG_SLOTS} slot(s) for long jobs: ${copies} editing copies at a time (raise QUEUE_CONCURRENCY)`)
+  await listenForJobs(pool)
+  console.log(`[queue] Worker started (concurrency=${CONCURRENCY}, takes: ${pool.label}; long jobs (whole-video readings, editing copies) at most ${LONG_SLOTS} at a time, editing copies at most ${copies}; per person at once: ${EXPORTS_PER_PERSON} exports, ${SUBJECTS_PER_PERSON} Subjects), ${listening ? 'new jobs signalled' : 'polling for jobs'}…`)
   await Promise.all(Array.from({ length: CONCURRENCY }, (_, i) => runLoop(i)))
 }
 
@@ -106,7 +141,52 @@ async function runLoop(id: number) {
     // Straight on to the next job after one is done; wait only when there was nothing to take
     let ran = false
     try { ran = await tick() } catch (err) { console.error(`[queue] Unexpected error in loop ${id}:`, err) }
-    if (!ran) await sleep(JOB_POLL_INTERVAL_MS)
+    if (!ran) await waitForJob(listening ? FALLBACK_POLL_MS : JOB_POLL_INTERVAL_MS)
+  }
+}
+
+// ── New-job signal ───────────────────────────────────────────────────────────
+// A trigger on jobs signals (NOTIFY jobs_new, with the job's type) when a job is queued: added, or
+// put back by requeueStuck. Each worker listens and wakes one idle slot per job of its kinds, so a
+// job starts at once instead of at the next poll (up to 2 s later, and every idle slot of every
+// worker polling every 2 s). Signals can be missed (the listening connection dropped for a moment),
+// so idle slots still look every FALLBACK_POLL_MS; without the signal at all, every 2 s as before.
+// The signal needs a direct connection to Postgres: PgBouncer in transaction mode doesn't pass it on.
+const FALLBACK_POLL_MS = 10_000
+const SIGNAL = 'jobs_new'
+// Creating the trigger takes its turn (workers starting together would both make it)
+const SIGNAL_LOCK = 20261028
+let listening = false
+const idle: Array<() => void> = []
+
+/** Waits until a job of this worker's kinds is signalled, or `ms` passes */
+function waitForJob(ms: number): Promise<void> {
+  return new Promise(resolve => {
+    const done = () => { clearTimeout(timer); const i = idle.indexOf(done); if (i >= 0) idle.splice(i, 1); resolve() }
+    const timer = setTimeout(done, ms)
+    idle.push(done)
+  })
+}
+
+async function listenForJobs(p: Pool) {
+  try {
+    await db.begin(async tx => {
+      await tx`SELECT pg_advisory_xact_lock(${SIGNAL_LOCK})`
+      await tx`
+        CREATE OR REPLACE FUNCTION jobs_notify_new() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN PERFORM pg_notify('jobs_new', NEW.type); RETURN NULL; END $$`
+      // Made only when missing: replacing a trigger locks the jobs table
+      const [made] = await tx`SELECT 1 FROM pg_trigger WHERE tgname = 'jobs_new_job' AND tgrelid = 'jobs'::regclass`
+      if (!made) await tx`
+        CREATE TRIGGER jobs_new_job AFTER INSERT OR UPDATE OF status ON jobs
+        FOR EACH ROW WHEN (NEW.status = 'queued') EXECUTE FUNCTION jobs_notify_new()`
+    })
+    // (postgres.js keeps one connection for this and listens again after it reconnects; on each
+    // (re)start one idle slot looks, for any signal missed meanwhile)
+    await db.listen(SIGNAL, type => { if (p.types.includes(type)) idle.shift()?.() }, () => { listening = true; idle.shift()?.() })
+  } catch (err) {
+    listening = false
+    console.warn(`[queue] No new-job signal (${err instanceof Error ? err.message : err}): looking for jobs every ${JOB_POLL_INTERVAL_MS / 1000} s instead`)
   }
 }
 
@@ -115,65 +195,106 @@ async function runLoop(id: number) {
 // 'ai_edit' runs anywhere: it reads the video from storage and never uses yt-dlp.
 const isRailway = !!process.env.RAILWAY_ENVIRONMENT
 
-/** Takes and runs the next job; false when there was none */
+/** Takes and runs the next job; false when there was none (true: look again now) */
 async function tick(): Promise<boolean> {
   // Only jobs this worker can run (a worker from before a new kind of job leaves those to others).
-  // Editing copies (proxy) wait for everything else, and only one is made at a time: renders and
+  // Editing copies (proxy) wait for everything else, at most PROXY_PER_WORKER at a time: renders and
   // captions always have a slot.
   // Picked and claimed in one statement. SKIP LOCKED: with many workers (replicas × CONCURRENCY
   // loops) each takes the next job nobody else is taking, instead of all reading the same oldest
   // job, one winning and the rest sleeping a poll interval for nothing. The heartbeat starts in
   // the same statement, as before.
-  const types = [...handlers.keys()]
+  const p = pool ?? workerPool([...handlers.keys()])
   // A long job may be taken only while a slot is left for quick jobs (counted before the claim, so
   // two loops never both take the last one)
   const mayLong = longRunning < LONG_SLOTS
   if (mayLong) longRunning++
+  const mayProxy = mayLong && proxyRunning < PROXY_PER_WORKER
+  if (mayProxy) proxyRunning++
   let job: Job | undefined
   try {
-    job = await claim(types, mayLong)
+    job = await claim(p, mayLong, mayProxy)
   } finally {
     if (mayLong && !(job && isLong(job))) longRunning--
+    if (mayProxy && job?.type !== 'proxy') proxyRunning--
   }
-  if (!job) return false
+  // Nothing, but only because another slot was holding a long-job place while it picked (and has
+  // let go of it): look again now, not at the next poll
+  if (!job) return (!mayLong && longRunning < LONG_SLOTS) || (mayLong && !mayProxy && proxyRunning < PROXY_PER_WORKER)
+  // One more idle slot looks too: signals for jobs added together arrive as one
+  idle.shift()?.()
   try {
     await run(job)
   } finally {
     if (mayLong && isLong(job)) longRunning--
+    if (mayProxy && job.type === 'proxy') proxyRunning--
   }
   return true
 }
 
-async function claim(types: string[], mayLong: boolean): Promise<Job | undefined> {
-  const [job] = await db<Job[]>`
-    WITH next AS (
-      SELECT id FROM jobs
-      WHERE status = 'queued' AND type = ANY(${types})
-      ${isRailway ? db`AND NOT (type = 'transcribe' AND payload @> '{"requires_ytdlp":true}'::jsonb)` : db``}
-      AND NOT (type = 'proxy' AND EXISTS (SELECT 1 FROM jobs p WHERE p.type = 'proxy' AND p.status = 'processing'))
-      ${mayLong ? db`` : db`AND NOT (type = 'proxy' OR (type = 'transcribe' AND COALESCE(payload->>'transcribe_full', '') = 'true'))`}
-      -- One whole-video reading per person at a time (across all workers): one person's videos
-      -- never take every slot while someone else waits
-      AND NOT (type = 'transcribe' AND COALESCE(payload->>'transcribe_full', '') = 'true' AND EXISTS (
-        SELECT 1 FROM jobs p
-        JOIN videos pv ON pv.id::text = p.payload->>'video_id'
-        JOIN videos v ON v.id::text = jobs.payload->>'video_id'
-        WHERE p.type = 'transcribe' AND p.status = 'processing' AND COALESCE(p.payload->>'transcribe_full', '') = 'true'
-          AND pv.user_id = v.user_id))
-      -- A whole-video reading (AI edit: many minutes for a long video) waits for the quick jobs that
-      -- came after it — a clip's own captions (manual edit), renders, uploads — so they never queue
-      -- behind it (COALESCE: a job without the field must sort as false, not as NULL, which goes last)
-      ORDER BY (type = 'proxy') ASC, (type = 'transcribe' AND COALESCE(payload->>'transcribe_full', '') = 'true') ASC, created_at ASC LIMIT 1
-      FOR UPDATE SKIP LOCKED
-    ), claimed AS (
-      UPDATE jobs j SET status = 'processing' FROM next WHERE j.id = next.id AND j.status = 'queued' RETURNING j.*
-    ), beat AS (
-      INSERT INTO job_heartbeats (job_id) SELECT id FROM claimed
-      ON CONFLICT (job_id) DO UPDATE SET at = now()
-    )
-    SELECT * FROM claimed
-  `
-  return job
+// ── Fair limits per person ───────────────────────────────────────────────────
+// Running at once for one person, across all workers (the person is the job's payload.user_id, set
+// by the website): their next ones wait their turn, nothing is refused. Exports: Make my clips gives
+// up to 10 clips, so all 10 can export together (EXPORTS_PER_PERSON). Subjects / Sub-edit: one at a
+// time (SUBJECTS_PER_PERSON). Among the waiting, the person with fewest of that kind running goes
+// first, so one person's 10 exports never hold up someone else's one. (A job from before user_id was
+// sent has no limit.) The top plan's exports (payload.priority) go before all of these, each person
+// still within their limit.
+const EXPORTS_PER_PERSON = Math.max(1, parseInt(process.env.EXPORTS_PER_PERSON ?? '10', 10) || 10)
+const SUBJECTS_PER_PERSON = Math.max(1, parseInt(process.env.SUBJECTS_PER_PERSON ?? '1', 10) || 1)
+// Claims take turns (a transaction lock, held for the few ms a claim takes): two workers claiming at
+// the same moment would otherwise both see "none running" and both take one, past a limit
+const CLAIM_LOCK = 20261027
+
+async function claim(p: Pool, mayLong: boolean, mayProxy: boolean): Promise<Job | undefined> {
+  // Nothing waiting (most polls of an idle worker): no turn on the lock
+  const [waiting] = await db`SELECT 1 FROM jobs WHERE status = 'queued' AND type = ANY(${p.types}) LIMIT 1`
+  if (!waiting) return undefined
+  return db.begin(async tx => {
+    await tx`SELECT pg_advisory_xact_lock(${CLAIM_LOCK})`
+    const reading = tx`(type = 'transcribe' AND COALESCE(payload->>'transcribe_full', '') = 'true')`
+    // How many of this job's kind its person has running (counted once, from the few running jobs)
+    const theirs = tx`COALESCE(running.n, 0)`
+    const [job] = await tx<Job[]>`
+      WITH running AS (
+        SELECT type AS kind, payload->>'user_id' AS person, count(*) AS n FROM jobs
+        WHERE status = 'processing' AND payload->>'user_id' IS NOT NULL GROUP BY 1, 2
+      ), next AS (
+        SELECT jobs.id FROM jobs LEFT JOIN running ON running.kind = jobs.type AND running.person = jobs.payload->>'user_id'
+        WHERE status = 'queued' AND type = ANY(${p.types})
+        ${p.clipCaptions && !p.readings ? tx`AND NOT ${reading}` : tx``}
+        ${p.readings && !p.clipCaptions ? tx`AND (type <> 'transcribe' OR ${reading})` : tx``}
+        ${isRailway ? tx`AND NOT (type = 'transcribe' AND payload @> '{"requires_ytdlp":true}'::jsonb)` : tx``}
+        ${mayProxy ? tx`` : tx`AND type <> 'proxy'`}
+        ${mayLong ? tx`` : tx`AND NOT (type = 'proxy' OR ${reading})`}
+        AND NOT (type = 'render' AND ${theirs} >= ${EXPORTS_PER_PERSON})
+        AND NOT (type = 'track_subjects' AND ${theirs} >= ${SUBJECTS_PER_PERSON})
+        -- One whole-video reading per person at a time (across all workers): one person's videos
+        -- never take every slot while someone else waits
+        AND NOT (${reading} AND EXISTS (
+          SELECT 1 FROM jobs p
+          JOIN videos pv ON pv.id::text = p.payload->>'video_id'
+          JOIN videos v ON v.id::text = jobs.payload->>'video_id'
+          WHERE p.type = 'transcribe' AND p.status = 'processing' AND COALESCE(p.payload->>'transcribe_full', '') = 'true'
+            AND pv.user_id = v.user_id))
+        -- A whole-video reading (AI edit: many minutes for a long video) waits for the quick jobs that
+        -- came after it — a clip's own captions (manual edit), renders, uploads — so they never queue
+        -- behind it (COALESCE: a job without the field must sort as false, not as NULL, which goes last).
+        -- Then the top plan's exports (payload.priority: "priority rendering"), then the person with
+        -- fewest of that kind running, then the oldest.
+        ORDER BY (type = 'proxy') ASC, ${reading} ASC, (type = 'render' AND payload @> '{"priority":true}'::jsonb) DESC,
+          ${theirs} ASC, created_at ASC LIMIT 1
+        FOR UPDATE OF jobs SKIP LOCKED
+      ), claimed AS (
+        UPDATE jobs j SET status = 'processing' FROM next WHERE j.id = next.id AND j.status = 'queued' RETURNING j.*
+      ), beat AS (
+        INSERT INTO job_heartbeats (job_id) SELECT id FROM claimed
+        ON CONFLICT (job_id) DO UPDATE SET at = now()
+      )
+      SELECT * FROM claimed
+    `
+    return job
+  })
 }
 
 async function run(job: Job) {
@@ -222,4 +343,3 @@ async function fail(jobId: string, error: string) {
   await db`UPDATE jobs SET status = 'failed', error = ${error} WHERE id = ${jobId}`
 }
 
-function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)) }

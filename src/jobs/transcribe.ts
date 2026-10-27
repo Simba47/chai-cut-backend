@@ -11,7 +11,7 @@ import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from '@aws-sd
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { GoogleAuth } from 'google-auth-library'
 import { r2, R2_BUCKET, r2DownloadToFile, r2SignedUrl, r2UploadFile } from '../r2.js'
-import { aiProvider, askGemini, retryAfterMs, retryDelayMs } from '../lib/gemini.js'
+import { aiProvider, askGemini, dropCode, isNetworkDrop, retryAfterMs, retryDelayMs } from '../lib/gemini.js'
 import { runawayReason, trimRunaway } from '../lib/transcriptGuard.js'
 import { convertWordForWord } from '../lib/wordConvert.js'
 import db from '../db.js'
@@ -758,12 +758,22 @@ async function vertexTranscribeChunk(buf: Buffer, languageCode?: string): Promis
   })
 
   for (let attempt = 1; ; attempt++) {
-    const token = await auth.getAccessToken()
-    const res = await sttTurn(() => fetchWithTimeout(url, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'x-goog-user-project': VERTEX_PROJECT!, 'Content-Type': 'application/json' },
-      body,
-    }, 300_000))
+    let res: Response
+    try {
+      const token = await auth.getAccessToken()
+      res = await sttTurn(() => fetchWithTimeout(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'x-goog-user-project': VERTEX_PROJECT!, 'Content-Type': 'application/json' },
+        body,
+      }, 300_000))
+    } catch (e) {
+      // The connection dropped before an answer came (not a timeout or a stop): try again, like a 5xx
+      if (!isNetworkDrop(e) || attempt >= GEMINI_MAX_TRIES) throw e
+      const delayMs = retryDelayMs(attempt)
+      console.warn(`[vertex] connection dropped (${dropCode(e)}) on attempt ${attempt}, retrying in ${(delayMs / 1000).toFixed(1)}s`)
+      await new Promise(r => setTimeout(r, delayMs))
+      continue
+    }
     if (res.status === 429) sttBusy()
     else if (res.ok) sttFine()
     if (res.ok) {
@@ -803,22 +813,33 @@ function retryHintSec(body: string): number {
 
 async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promise<SarvamWord[]> {
   if (VERTEX_PROJECT) return vertexTranscribeChunk(buf, languageCode)
+  // A dropped connection (upload or request, not a timeout) is tried again, like a 5xx
+  const dropped = async (e: unknown, attempt: number) => {
+    if (!isNetworkDrop(e) || attempt >= GEMINI_MAX_TRIES) throw e
+    const delayMs = retryDelayMs(attempt)
+    console.warn(`[gemini] connection dropped (${dropCode(e)}) on attempt ${attempt}, retrying in ${(delayMs / 1000).toFixed(1)}s`)
+    await new Promise(r => setTimeout(r, delayMs))
+  }
   for (let attempt = 1; ; attempt++) {
-    const file = await geminiUploadAudio(buf)
+    let file: { name: string; uri: string }
+    try { file = await geminiUploadAudio(buf) } catch (e) { await dropped(e, attempt); continue }
     try {
       // diarization: each word gets a speaker label, so caption lines never mix two speakers
       const transcription_config: Record<string, unknown> = { mode: { type: 'verbatim', timestamp_granularities: ['word'], diarization_mode: 'speaker' } }
       if (languageCode) transcription_config.language_codes = [toGeminiLang(languageCode)]
 
-      const res = await fetchWithTimeout(`${GEMINI_BASE}/v1beta/interactions`, {
-        method: 'POST',
-        headers: { 'x-goog-api-key': GEMINI_API_KEY!, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: GEMINI_STT_MODEL,
-          input: [{ type: 'audio', uri: file.uri, mime_type: 'audio/wav' }],
-          generation_config: { transcription_config },
-        }),
-      }, 300_000)
+      let res: Response
+      try {
+        res = await fetchWithTimeout(`${GEMINI_BASE}/v1beta/interactions`, {
+          method: 'POST',
+          headers: { 'x-goog-api-key': GEMINI_API_KEY!, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: GEMINI_STT_MODEL,
+            input: [{ type: 'audio', uri: file.uri, mime_type: 'audio/wav' }],
+            generation_config: { transcription_config },
+          }),
+        }, 300_000)
+      } catch (e) { await dropped(e, attempt); continue }
 
       if (res.ok) {
         const raw = await res.json() as {
