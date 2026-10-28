@@ -1,4 +1,5 @@
 import db from '../db.js'
+import { cleanBrandWords, type BrandWords } from './brandWords.js'
 
 /**
  * Brand kits on the clips Make my clips makes (user, 2026-10-17). A kit is a user's saved look
@@ -28,6 +29,8 @@ export interface ClipBrand {
   } | null
   /** Its logo on the frame (shares of it) and when it shows; null: no logo */
   logo: { path: string; x: number; y: number; w: number; h: number; opacity: number; show: 'all' | 'start' | 'end'; seconds: number } | null
+  /** Its words (brand kit Phase 5, lib/brandWords.ts): its spellings and tone in the post text the job writes */
+  words: BrandWords
 }
 
 /** A clip's progress bar (clips.progress_bar): its colour, thickness in px on a 1080 × 1920 frame, and edge */
@@ -69,6 +72,7 @@ export function clipBrand(raw: unknown, userId: string): ClipBrand {
     }
   }
   return {
+    words: cleanBrandWords(d.words),
     title: { font: typeof t.font === 'string' && t.font.length <= 60 ? t.font : null, color: color(t.color, '#ffffff'), size: Math.round(num(t.size, 24, 160, 64)) },
     captions: c.on === true ? {
       template: typeof c.template === 'string' && c.template.length <= 60 ? c.template : null,
@@ -107,6 +111,27 @@ export async function loadClipBrand(userId: string, choice: string | undefined):
   } catch (e) {
     // (no brand_kits table yet, or the database hiccuped: the clips are made without a kit)
     console.warn('[brand] the brand kit could not be read:', e instanceof Error ? e.message : e)
+    return null
+  }
+}
+
+/**
+ * The brand words a clip's captions are exported with (brand kit Phase 5): those of the kit switched on
+ * for it (one its owner can still use), else of the owner's default kit — as the frontend's
+ * services/brandKits.ts brandWordsFor. Null: none, or the kits couldn't be read (the words then go as they are).
+ */
+export async function clipBrandWords(clipId: string): Promise<BrandWords | null> {
+  try {
+    const [row] = await db<{ words: unknown }[]>`
+      SELECT bk.data->'words' AS words FROM clips c JOIN videos v ON v.id = c.video_id
+      JOIN brand_kits bk ON (bk.id::text = to_jsonb(c)->'brand'->>'kit_id'
+          AND (bk.user_id = v.user_id OR EXISTS (SELECT 1 FROM brand_kit_shares s WHERE s.kit_id = bk.id AND s.user_id = v.user_id)))
+        OR (bk.user_id = v.user_id AND (bk.data->>'is_default')::boolean)
+      WHERE c.id = ${clipId}
+      ORDER BY (bk.id::text = to_jsonb(c)->'brand'->>'kit_id') DESC LIMIT 1`
+    return row ? cleanBrandWords(row.words) : null
+  } catch (e) {
+    console.warn('[brand] the brand words could not be read:', e instanceof Error ? e.message : e)
     return null
   }
 }
