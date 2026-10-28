@@ -37,6 +37,8 @@ export interface ClipBrand {
 export interface ProgressBar { color: string; height: number; position: 'top' | 'bottom' }
 
 const HEX = /^#[0-9a-f]{6}$/i
+/** The plans whose kits can be shared with a team (the frontend's lib/shared/brandTeam.ts TEAM_SEATS): a kit shared by someone on another plan waits */
+const TEAM_PLANS = ['agency']
 const ANIMATIONS = ['karaoke', 'fade', 'none', 'pop', 'highlight', 'bounce', 'word', 'hormozi', 'box', 'glow']
 const num = (v: unknown, lo: number, hi: number, fallback: number) => (typeof v === 'number' && isFinite(v) ? Math.min(hi, Math.max(lo, v)) : fallback)
 const color = (v: unknown, fallback: string) => (typeof v === 'string' && HEX.test(v) ? v.toLowerCase() : fallback)
@@ -105,7 +107,8 @@ export async function loadClipBrand(userId: string, choice: string | undefined):
     const [row] = choice && /^[0-9a-f-]{36}$/i.test(choice)
       ? await db<{ id: string; data: unknown; user_id: string }[]>`
           SELECT bk.id, bk.data, bk.user_id FROM brand_kits bk WHERE bk.id = ${choice}
-            AND (bk.user_id = ${userId} OR EXISTS (SELECT 1 FROM brand_kit_shares s WHERE s.kit_id = bk.id AND s.user_id = ${userId}))`
+            AND (bk.user_id = ${userId} OR (EXISTS (SELECT 1 FROM brand_kit_shares s WHERE s.kit_id = bk.id AND s.user_id = ${userId})
+              AND EXISTS (SELECT 1 FROM users o WHERE o.id = bk.user_id AND o.plan = ANY(${TEAM_PLANS}))))`
       : await db<{ id: string; data: unknown; user_id: string }[]>`SELECT id, data, user_id FROM brand_kits WHERE user_id = ${userId} AND (data->>'is_default')::boolean LIMIT 1`
     return row ? { ...clipBrand(row.data, row.user_id), kit_id: row.id, applied: appliedHere(row.data) } : null
   } catch (e) {
@@ -125,7 +128,8 @@ export async function clipBrandWords(clipId: string): Promise<BrandWords | null>
     const [row] = await db<{ words: unknown }[]>`
       SELECT bk.data->'words' AS words FROM clips c JOIN videos v ON v.id = c.video_id
       JOIN brand_kits bk ON (bk.id::text = to_jsonb(c)->'brand'->>'kit_id'
-          AND (bk.user_id = v.user_id OR EXISTS (SELECT 1 FROM brand_kit_shares s WHERE s.kit_id = bk.id AND s.user_id = v.user_id)))
+          AND (bk.user_id = v.user_id OR (EXISTS (SELECT 1 FROM brand_kit_shares s WHERE s.kit_id = bk.id AND s.user_id = v.user_id)
+            AND EXISTS (SELECT 1 FROM users o WHERE o.id = bk.user_id AND o.plan = ANY(${TEAM_PLANS})))))
         OR (bk.user_id = v.user_id AND (bk.data->>'is_default')::boolean)
       WHERE c.id = ${clipId}
       ORDER BY (bk.id::text = to_jsonb(c)->'brand'->>'kit_id') DESC LIMIT 1`

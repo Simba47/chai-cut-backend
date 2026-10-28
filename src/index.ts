@@ -281,6 +281,23 @@ async function runMigrations() {
     )
   `
   await db`CREATE INDEX IF NOT EXISTS brand_kit_shares_user ON brand_kit_shares (user_id)`
+  // Brand kit teams (Phase 6): what each person a kit is shared with can do — 'use' it on their clips,
+  // or also 'edit' it (frontend lib/shared/brandTeam.ts)
+  await db`ALTER TABLE brand_kit_shares ADD COLUMN IF NOT EXISTS role text NOT NULL DEFAULT 'use'`
+  // People invited to a kit by email (an account, or not yet), until they accept or decline in the app
+  // (no email is sent: the owner can copy a link to it). email: lower case
+  await db`
+    CREATE TABLE IF NOT EXISTS brand_kit_invites (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      kit_id uuid NOT NULL REFERENCES brand_kits(id) ON DELETE CASCADE,
+      email text NOT NULL,
+      role text NOT NULL DEFAULT 'use',
+      invited_by uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      UNIQUE (kit_id, email)
+    )
+  `
+  await db`CREATE INDEX IF NOT EXISTS brand_kit_invites_email ON brand_kit_invites (email)`
   console.log('[startup] migrations ok')
 }
 
