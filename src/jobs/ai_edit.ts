@@ -15,6 +15,7 @@ import { fitInRoom, minWidthFor, sideBySideRooms, steadyRoom } from '../lib/fram
 import { loadClipBrand, logoSpan, brandCaptionRow, type ClipBrand } from '../lib/brandKit.js'
 import { brollEnabled, pickBrollMoments, searchStock, downloadStock, withBroll } from '../lib/broll.js'
 import { findVisuals, describeVisuals, pickVisualMoments, detectPanels, refinePanels, type Visual, type VisualMoment, type Panel } from '../lib/visuals.js'
+import { formatClip } from './clip_formats.js'
 import { r2UploadFile } from '../r2.js'
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
@@ -36,7 +37,9 @@ export interface FrameDetection { frame_index: number; person_count: number; fac
 export interface FaceInfo { face_count: number; face_boxes: CropBox[]; frames: FrameDetection[] }
 interface SlotKf { t_ms: number; x: number; y: number; w: number; h: number }
 interface ClipSegment {
-  start_ms: number; end_ms: number; layout: 'vertical' | 'split' | 'trio'; slotKfs: SlotKf[][]; broll?: string
+  start_ms: number; end_ms: number; layout: 'vertical' | 'split' | 'trio' | 'frame_blur_fill'; slotKfs: SlotKf[][]; broll?: string
+  /** How many people it shows (the Rulebook's formats, clip_formats.ts): a panel or related visual goes only over one */
+  people?: number
   /** Per slot: null = the clip's own picture at this moment; a number = the same video from that
    *  clip-relative ms instead ("borrowed" reaction footage from another moment, muted) */
   slotSources?: Array<number | null>
@@ -60,6 +63,11 @@ export interface SpokenWord { start_ms: number; end_ms: number; speaker_id?: str
 // Follow whoever is talking when 2+ people are in the picture. SPEAKER_TRACKING=off goes back
 // to framing by face count and size only.
 const SPEAKER_TRACKING = process.env.SPEAKER_TRACKING !== 'off'
+
+// How a clip's formats are chosen (user, 2026-10-29): by the Rulebook, as the editor's Auto format (Cuts)
+// lays them (clip_formats.ts), the faces read in people mode. CLIP_FORMATS=classic goes back to the
+// frame-by-frame framing (buildSegments). Cuts off (always Vertical) and vertical videos use buildSegments.
+const RULEBOOK_FORMATS = process.env.CLIP_FORMATS !== 'classic'
 
 // Frames analysed per second, and the time between them. 4 fps catches quick head turns and
 // lets the crop follow within a quarter second.
@@ -230,6 +238,8 @@ export async function detectFaces(tmp: string, videoPath: string, startMs: numbe
 export async function analyseClip(
   tmp: string, videoPath: string, startMs: number, endMs: number,
   size: { width: number; height: number } | null, words: Array<SpokenWord & { word?: string }>, signal?: AbortSignal,
+  /** Faces read as the Subjects tool reads them (people side by side, small faces, who is who): the Rulebook's formats */
+  people = false,
 ): Promise<ClipAnalysis> {
   const speech = words
     .filter(w => w.end_ms > startMs && w.start_ms < endMs)
@@ -239,7 +249,7 @@ export async function analyseClip(
   const reelW = size ? Math.min(1, (9 / 16) * (size.height / size.width)) : 81 / 256
   if (portrait) return { info: EMPTY, cuts: [], reelW, portrait, speech }
   const [info, cuts] = await Promise.all([
-    detectFaces(tmp, videoPath, startMs, endMs, signal, SPEAKER_TRACKING),
+    detectFaces(tmp, videoPath, startMs, endMs, signal, SPEAKER_TRACKING || people, false, people),
     detectCuts(videoPath, startMs, endMs, signal),
   ])
   return { info, cuts, reelW, portrait, speech }
@@ -357,7 +367,7 @@ export function asCuts(kfs: SlotKf[]): SlotKf[] {
 
 // Smooth raw detected center positions before converting to keyframes, starting afresh at
 // each index in `resets` (the first frame after a camera cut).
-function stabilise(rawCx: number[], resets: number[] = []): number[] {
+export function stabilise(rawCx: number[], resets: number[] = []): number[] {
   const out: number[] = []
   const bounds = [0, ...resets.filter(r => r > 0 && r < rawCx.length), rawCx.length]
   for (let i = 0; i < bounds.length - 1; i++) {
@@ -890,7 +900,7 @@ function personCrop(layout: 'split' | 'trio', cx: number, cy: number, reelW: num
 export function withShotReactions(segments: ClipSegment[], windows: ReactionWindow[], reelW: number): ClipSegment[] {
   let out = segments
   for (const w of windows) {
-    if (out.some(s => s.layout !== 'vertical' && s.start_ms < w.end_ms && s.end_ms > w.start_ms)) continue
+    if (out.some(s => (s.layout !== 'vertical' || (s.people ?? 0) > 1) && s.start_ms < w.end_ms && s.end_ms > w.start_ms)) continue
     const next: ClipSegment[] = []
     for (const seg of out) {
       if (seg.end_ms <= w.start_ms || seg.start_ms >= w.end_ms) { next.push(seg); continue }
@@ -1753,15 +1763,26 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
 
         // Faces 4× a second and camera cuts across the entire clip
         const tDetect = Date.now()
-        const analysis = await analyseClip(tmp, videoPath, highlight.start_ms, highlight.end_ms, size, words, signal)
+        const rulebook = RULEBOOK_FORMATS && framing.layouts !== false && !!size && size.height < size.width
+        const analysis = await analyseClip(tmp, videoPath, highlight.start_ms, highlight.end_ms, size, words, signal, rulebook)
         // Graphics the video's editor put next to the speaker (shown under them, not cut off)
         analysis.panels = await detectPanels(videoPath, highlight.start_ms, highlight.end_ms, tmp, signal)
           .then(found => refinePanels(found, analysis.cuts, clipDurationMs, videoPath, highlight.start_ms))
           .catch(e => { console.warn('[ai_edit] panel detection skipped:', e instanceof Error ? e.message : e); return [] })
         const detectS = ((Date.now() - tDetect) / 1000).toFixed(1)
 
-        // Brain: dynamically switch layout within the clip
-        let segments: ClipSegment[] = buildSegments(analysis, clipDurationMs, framing)
+        // Brain: dynamically switch layout within the clip — by the Rulebook (each scene's format from its
+        // people, the views following them), its graphic panels over one-person parts; else frame by frame
+        let segments: ClipSegment[]
+        if (rulebook && analysis.info.frames.length) {
+          const parts = formatClip(analysis.info.frames, analysis.cuts, clipDurationMs, analysis.speech, size!, { motion: framing.motion })
+          const counts = parts.reduce<Record<string, number>>((n, p) => ({ ...n, [p.why]: (n[p.why] ?? 0) + 1 }), {})
+          console.log(`[ai_edit] Rulebook formats: ${parts.length} part(s) — ${Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(', ')}`)
+          segments = parts.map(({ why: _why, ...p }) => p)
+          if (REACTIONS) segments = withShotReactions(segments, panelWindows(analysis), analysis.reelW)
+        } else {
+          segments = buildSegments(analysis, clipDurationMs, framing)
+        }
         // Related visuals: the speaker on top, what they're talking about below (a split: not with cuts off)
         if (visuals.length && framing.layouts) {
           const moments = await pickVisualMoments(words, highlight.start_ms, highlight.end_ms, visuals)
