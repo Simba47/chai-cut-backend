@@ -8,7 +8,7 @@ process.env.R2_ENDPOINT ??= 'http://127.0.0.1:1'
 process.env.R2_ACCESS_KEY_ID ??= 'test'
 process.env.R2_SECRET_ACCESS_KEY ??= 'test'
 process.env.R2_BUCKET ??= 'test'
-const { shotSpans, settleGroups, whoIs, followSubjects, findAngles, findPeople } = await import('./track_subjects.js')
+const { shotSpans, settleGroups, whoIs, followSubjects, findAngles, findPeople, withoutPictures } = await import('./track_subjects.js')
 
 // ── A made-up clip, 4 frames a second ──
 // A colour signature (24 numbers summing to 1) `d` away (L1) from person A's
@@ -171,4 +171,44 @@ test('who is in an angle: one person in two places, never seen together, counts 
   const fw = made(12000, (t) => [face(t >= 4000 && t < 8000 ? 0.72 : 0.5, 0.05, 0.1)])
   const [angle] = findAngles(fw, [], 12000)
   assert.equal(angle.people, 1)
+})
+
+// ── Pictures on the wall vs people sitting still (face_detect.py people mode marks a still face; the
+// scan drops it only when who it is is never seen moving: withoutPictures) ──
+const still = (f: CropBox): CropBox => ({ ...f, still: true })
+
+test('a listener sitting still in a two-shot stays when they are seen moving elsewhere in the clip (2026-10-29)', () => {
+  // L's close-up, talking (0–5 s); then the two-shot: L still, listening, beside C who talks (5–10 s)
+  const fw = made(10000, (t, n) => (t < 5000
+    ? [person(0, 0.5, 0.05, n, 0.14)]
+    : [still(person(0, 0.29, 0.3, n, 0.09)), person(1, 0.77, 0.6, n, 0.11)]))
+  const kept = withoutPictures(fw, [5000])
+  assert.equal(kept[30].faces.length, 2, 'L is kept in the two-shot')
+  const angles = findAngles(kept, [5000], 10000)
+  assert.equal(angles.find(a => a.faces.some(f => Math.abs(f.x + f.w / 2 - 0.77) < 0.02))!.people, 2)
+})
+
+test('a picture on the wall (a face that never moves anywhere) is still dropped', () => {
+  // P talks all through; a poster's face on the wall behind, still the whole clip
+  const fw = made(10000, (t, n) => [person(0, 0.6, 0.05, n, 0.12), still(person(5, 0.15, 0.7, n, 0.08))])
+  const kept = withoutPictures(fw, [])
+  assert.ok(kept.every(f => f.faces.length === 1 && Math.abs(f.faces[0].x + f.faces[0].w / 2 - 0.6) < 0.01))
+  assert.equal(findAngles(kept, [], 10000)[0].people, 1)
+})
+
+test('a still face whose identity can’t be read is judged on its stillness, as before', () => {
+  const fw = made(8000, (t, n) => [person(0, 0.6, 0.05, n, 0.12), still(face(0.15, 0.7, 0.08))])
+  assert.ok(withoutPictures(fw, []).every(f => f.faces.length === 1))
+})
+
+test('nothing still: the scan is unchanged', () => {
+  assert.equal(withoutPictures(pq, pqCuts), pq)
+})
+
+test('a blurred thing read as a face (unsure), "moving" only in stretches too short to judge, is still dropped', () => {
+  // P talks all through; behind her a blur the detector half-reads as a face (0.72): still for 4 s, with
+  // 1-s stretches between that were never judged
+  const fw = made(12000, (t, n) => [person(0, 0.4, 0.05, n, 0.12),
+    { ...(t % 5000 < 4000 ? still(person(5, 0.62, 0.7, n, 0.08)) : person(5, 0.62, 0.7, n, 0.08)), score: 0.72 }])
+  assert.ok(withoutPictures(fw, []).filter((_, i) => (i * 250 + 100) % 5000 < 4000).every(f => f.faces.length === 1))
 })
