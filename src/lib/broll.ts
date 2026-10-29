@@ -134,7 +134,7 @@ export async function downloadStock(url: string, dir: string, ref: string): Prom
 }
 
 /** A kept part of a framing segment, or a stock shot over it */
-export interface FramedPart<K> { start_ms: number; end_ms: number; layout: 'vertical' | 'split' | 'trio'; slotKfs: K[][]; broll?: string; slotSources?: Array<number | null> }
+export interface FramedPart<K> { start_ms: number; end_ms: number; layout: 'vertical' | 'split' | 'trio' | 'frame_blur_fill'; slotKfs: K[][]; broll?: string; slotSources?: Array<number | null> }
 
 /**
  * Cuts the clip's framing segments around the B-roll shots: each shot becomes its own vertical
