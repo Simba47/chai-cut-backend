@@ -587,7 +587,10 @@ def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False
     lip_frames = 0
     unreadable = 0
     for fi, (faces, ids) in enumerate(zip(raw, track_ids)):
-        subjects = [dict(f) for f, tid in zip(faces, ids) if tid not in static]
+        # People mode: a still face stays, marked — the scan (track_subjects.ts withoutPictures) drops it
+        # only when who it is is never seen moving in the clip: a listener sitting still beside a talker
+        # read 0.84 here, posters 0.81–0.86, so stillness alone took a person out (2026-10-29)
+        subjects = [dict(f, **({"still": True} if tid in static else {})) for f, tid in zip(faces, ids) if people or tid not in static]
 
         # Mouth opening, expression and a colour signature on every real face (who talks and who
         # reacts, also across one-person camera shots; who is who). Read before the filters below,
@@ -665,7 +668,8 @@ def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False
                        **({"lip": s["lip"]} if s.get("lip") is not None else {}),
                        **({"ex": s["ex"]} if s.get("ex") is not None else {}),
                        **({"sig": s["sig"]} if s.get("sig") is not None else {}),
-                       **({"emb": s["emb"]} if s.get("emb") is not None else {})}
+                       **({"emb": s["emb"]} if s.get("emb") is not None else {}),
+                       **({"still": True} if s.get("still") else {})}
                       for s in subjects[:MAX_FACES]],
         })
 
@@ -676,7 +680,7 @@ def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False
     print(
         f"[detect] {len(per_frame)} frames, faces/frame min={min(counts)} "
         f"avg={sum(counts) / len(counts):.2f} max={max(counts)}, by method {counts_by_method}, "
-        f"static faces dropped: {len(static)}, unreadable unsure faces dropped: {unreadable}, lips read on {lip_frames} frames"
+        f"static faces {'marked still' if people else 'dropped'}: {len(static)}, unreadable unsure faces dropped: {unreadable}, lips read on {lip_frames} frames"
         + (f", identities read on {id_faces} faces" if identity is not None else ""),
         file=sys.stderr,
     )

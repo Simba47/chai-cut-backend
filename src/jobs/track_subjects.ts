@@ -205,6 +205,47 @@ export function whoIs(frames: FrameDetection[], cuts: number[]): Map<CropBox, nu
   return who
 }
 
+/** A still face is kept as a person only this sure of it (the middle of its readings): fakes behind people read 0.70–0.78, people sitting still 0.86–0.92 */
+const STILL_SURE = 0.85
+/** Seen moving counts on a stretch of at least this many frames (face_detect.py STATIC_MIN_FRAMES: shorter ones are never judged still) */
+const STILL_JUDGED_FRAMES = 8
+
+/**
+ * The scan's faces without the pictures (posters, photos, a TV on the wall): a face the detector read
+ * as still (face_detect.py, people mode) is dropped only when who it is is never seen moving anywhere in
+ * the clip. Stillness alone can't tell: a listener sitting still beside the one talking read 0.84 of
+ * their surroundings' change, posters 0.81–0.86 — he was dropped and a two-shot listed as one person
+ * (the user, 2026-10-29). A track is still when most of its faces are; one whose identity can't be read
+ * (too small, too few faces) is judged on its stillness, as before. Both sides must be sure faces
+ * (STILL_SURE): a blurred thing behind a woman, read 0.70–0.78, was seen "moving" in stretches too short
+ * to be judged still and so kept itself — seen moving counts only on a stretch long enough to be judged.
+ */
+export function withoutPictures(frames: FrameDetection[], cuts: number[]): FrameDetection[] {
+  if (!frames.some(f => f.faces.some(face => face.still))) return frames
+  const fr = [...frames].sort((a, b) => a.frame_index - b.frame_index).map(f => ({ ...f, faces: f.faces.filter(face => (face.score ?? 0) > 0) }))
+  const ids = trackFaces(fr, cuts.map(c => c - FRAME_SHOWS_MS))
+  const { personOf } = identities(fr, ids)
+  const faces = new Map<number, CropBox[]>()
+  fr.forEach((f, fi) => ids[fi].forEach((id, k) => faces.set(id, [...(faces.get(id) ?? []), f.faces[k]])))
+  const isStill = (id: number) => { const list = faces.get(id)!; return list.filter(x => x.still).length * 2 > list.length }
+  const sure = (id: number) => { const s = faces.get(id)!.map(x => x.score ?? 0).sort((a, b) => a - b); return s[Math.floor(s.length / 2)] >= STILL_SURE }
+  // The people seen moving somewhere: a sure face, on a stretch long enough to have been judged
+  const moving = new Set<number>()
+  for (const [id, list] of faces) {
+    const p = personOf.get(id)
+    if (p !== undefined && !isStill(id) && list.length >= STILL_JUDGED_FRAMES && sure(id)) moving.add(p)
+  }
+  const drop = new Set<CropBox>()
+  for (const [id, list] of faces) {
+    const p = personOf.get(id)
+    if (isStill(id) && (p === undefined || !moving.has(p) || !sure(id))) list.forEach(x => drop.add(x))
+  }
+  return frames.map(f => {
+    const kept = f.faces.filter(x => !drop.has(x))
+    return kept.length === f.faces.length ? f : { ...f, faces: kept, person_count: kept.length }
+  })
+}
+
 /**
  * How well a click points at a face: the face itself, or the person under it (their body is below
  * their head, a little wider). Lower is better; null when the click is not on that person.
@@ -1028,6 +1069,7 @@ async function followMarked(clip_id: string, start_ms: number, end_ms: number, s
     ])
     signal?.throwIfAborted()
     await setSubjects(ids, { progress: 90 })
+    info.frames = withoutPictures(info.frames, cuts)
 
     // People are followed; a group subject (a marked shot) is found wherever the clip shows that shot
     const people = subjects.filter(s => !s.shot), shots = subjects.filter(s => s.shot)
@@ -1096,6 +1138,7 @@ async function scanAngles(clipId: string, from: number, to: number, signal?: Abo
       spokenWords(clip.video_id, from, to),
     ])
     signal?.throwIfAborted()
+    info.frames = withoutPictures(info.frames, cuts)
     const angles = findAngles(info.frames, cuts, to - from, speech).map(a => ({
       ...a, at: a.at + from, spans: a.spans.map(([s, e]) => [s + from, e + from]),
     }))
@@ -1219,6 +1262,7 @@ async function subEditSteps(clipId: string, signal: AbortSignal, onCreated: (ids
       probeSize(videoPath),
     ])
     signal?.throwIfAborted()
+    info.frames = withoutPictures(info.frames, cuts)
     const found = findPeople(info.frames, cuts)
     if (!found.length) throw new Error('No people could be found in this clip')
 
