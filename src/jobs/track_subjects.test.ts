@@ -212,3 +212,21 @@ test('a blurred thing read as a face (unsure), "moving" only in stretches too sh
     { ...(t % 5000 < 4000 ? still(person(5, 0.62, 0.7, n, 0.08)) : person(5, 0.62, 0.7, n, 0.08)), score: 0.72 }])
   assert.ok(withoutPictures(fw, []).filter((_, i) => (i * 250 + 100) % 5000 < 4000).every(f => f.faces.length === 1))
 })
+
+test('a listener seen only in one shot, side-on (matching no one), is a person: their head moves a little', () => {
+  // C talks; L sits still beside him, read as still, his face's box moving a few thousandths (breathing, nods)
+  const wobble = (n: number) => 0.004 * Math.sin(n * 1.7)
+  const fw = made(6000, (t, n) => [still({ ...person(6, 0.3, 0.3, n, 0.09), x: 0.3 - 0.045 + wobble(n), y: 0.3 + wobble(n + 3) }), person(1, 0.77, 0.6, n, 0.11)])
+  assert.ok(withoutPictures(fw, []).every(f => f.faces.length === 2))
+  assert.equal(findAngles(withoutPictures(fw, []), [], 6000)[0].people, 2)
+})
+
+test('a still face the user marked is a person, whatever it reads (+ Add)', () => {
+  // The poster case — a face that never moves anywhere — but the user clicked it at 2.1 s
+  const fw = made(8000, (t, n) => [person(0, 0.6, 0.05, n, 0.12), still(person(5, 0.15, 0.7, n, 0.08))])
+  assert.ok(withoutPictures(fw, []).every(f => f.faces.length === 1), 'dropped unmarked')
+  const kept = withoutPictures(fw, [], [{ t: 2100, x: 0.15, y: 0.36 }])
+  assert.ok(kept.every(f => f.faces.length === 2), 'kept once marked')
+  const [r] = followSubjects(kept, [], [{ id: 'l', t: 2100, x: 0.15, y: 0.36 }])
+  assert.equal(r.error, undefined)
+})
