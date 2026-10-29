@@ -209,6 +209,12 @@ export function whoIs(frames: FrameDetection[], cuts: number[]): Map<CropBox, nu
 const STILL_SURE = 0.85
 /** Seen moving counts on a stretch of at least this many frames (face_detect.py STATIC_MIN_FRAMES: shorter ones are never judged still) */
 const STILL_JUDGED_FRAMES = 8
+/**
+ * A still face whose box moves this much frame to frame (the spread of its middle, a share of the picture —
+ * about a pixel of the 640-wide frames) is a living head: breathing, a small nod. A printed face doesn't
+ * move: 0.0001–0.0002 (a photo on the wall of a still shot); a listener sitting still 0.004–0.005 (2026-10-29)
+ */
+const STILL_JITTER = 0.0015
 
 /**
  * The scan's faces without the pictures (posters, photos, a TV on the wall): a face the detector read
@@ -219,8 +225,11 @@ const STILL_JUDGED_FRAMES = 8
  * (too small, too few faces) is judged on its stillness, as before. Both sides must be sure faces
  * (STILL_SURE): a blurred thing behind a woman, read 0.70–0.78, was seen "moving" in stretches too short
  * to be judged still and so kept itself — seen moving counts only on a stretch long enough to be judged.
+ * A listener seen only in one shot, side-on, matched no one (2026-10-29): a still face whose box moves
+ * at all (STILL_JITTER) is a person too. `marks` (Follow: the people the user marked, ms from the scan's
+ * start): a still face they clicked is a person whatever it reads — their mark says so.
  */
-export function withoutPictures(frames: FrameDetection[], cuts: number[]): FrameDetection[] {
+export function withoutPictures(frames: FrameDetection[], cuts: number[], marks: ReadonlyArray<{ t: number; x: number; y: number }> = []): FrameDetection[] {
   if (!frames.some(f => f.faces.some(face => face.still))) return frames
   const fr = [...frames].sort((a, b) => a.frame_index - b.frame_index).map(f => ({ ...f, faces: f.faces.filter(face => (face.score ?? 0) > 0) }))
   const ids = trackFaces(fr, cuts.map(c => c - FRAME_SHOWS_MS))
@@ -229,6 +238,18 @@ export function withoutPictures(frames: FrameDetection[], cuts: number[]): Frame
   fr.forEach((f, fi) => ids[fi].forEach((id, k) => faces.set(id, [...(faces.get(id) ?? []), f.faces[k]])))
   const isStill = (id: number) => { const list = faces.get(id)!; return list.filter(x => x.still).length * 2 > list.length }
   const sure = (id: number) => { const s = faces.get(id)!.map(x => x.score ?? 0).sort((a, b) => a - b); return s[Math.floor(s.length / 2)] >= STILL_SURE }
+  const spread = (v: number[]) => { const m = v.reduce((a, b) => a + b, 0) / v.length; return Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / v.length) }
+  /** The box's middle moves (a living head) */
+  const alive = (id: number) => {
+    const list = faces.get(id)!
+    return list.length >= 3 && Math.max(spread(list.map(f => f.x + f.w / 2)), spread(list.map(f => f.y + f.h / 2))) >= STILL_JITTER
+  }
+  // The faces the user clicked (at the mark's moment, or a frame or two around it)
+  const clicked = new Set<number>()
+  for (const mk of marks) fr.forEach((f, fi) => {
+    if (Math.abs(f.frame_index * FRAME_INTERVAL_MS + FRAME_SHOWS_MS - mk.t) > (MARK_SEARCH_FRAMES + 0.5) * FRAME_INTERVAL_MS) return
+    f.faces.forEach((face, k) => { if (face.still && clickScore(face, mk.x, mk.y) !== null) clicked.add(ids[fi][k]) })
+  })
   // The people seen moving somewhere: a sure face, on a stretch long enough to have been judged
   const moving = new Set<number>()
   for (const [id, list] of faces) {
@@ -238,7 +259,8 @@ export function withoutPictures(frames: FrameDetection[], cuts: number[]): Frame
   const drop = new Set<CropBox>()
   for (const [id, list] of faces) {
     const p = personOf.get(id)
-    if (isStill(id) && (p === undefined || !moving.has(p) || !sure(id))) list.forEach(x => drop.add(x))
+    const person = clicked.has(id) || (sure(id) && (alive(id) || (p !== undefined && moving.has(p))))
+    if (isStill(id) && !person) list.forEach(x => drop.add(x))
   }
   return frames.map(f => {
     const kept = f.faces.filter(x => !drop.has(x))
@@ -1069,7 +1091,7 @@ async function followMarked(clip_id: string, start_ms: number, end_ms: number, s
     ])
     signal?.throwIfAborted()
     await setSubjects(ids, { progress: 90 })
-    info.frames = withoutPictures(info.frames, cuts)
+    info.frames = withoutPictures(info.frames, cuts, subjects.filter(s => !s.shot).map(s => ({ t: s.mark_ms - from, x: s.mark_x, y: s.mark_y })))
 
     // People are followed; a group subject (a marked shot) is found wherever the clip shows that shot
     const people = subjects.filter(s => !s.shot), shots = subjects.filter(s => s.shot)
