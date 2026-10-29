@@ -332,3 +332,19 @@ function defaultCropForSlot(_layout: 'vertical', _slot: number, videoAR = DEFAUL
   if (w > 1) { w = 1; h = 1 / a }
   return { x: clamp((centerX ?? 0.5) - w / 2, 0, 1 - w), y: clamp(0.5 - h / 2, 0, 1 - h), w, h }
 }
+
+// ── Worker only (not in the editor's file) ──
+
+/**
+ * A view on one person in a Split-shaped slot (9:8; Make my clips' B-roll puts the speaker in one under
+ * the footage): the Rulebook's one-person view in that slot — SPLIT_FACE_H face heights, head room,
+ * within MAX_ZOOM — over the whole width of the picture
+ */
+export function personView(face: Face, videoAR?: number, sourcePxH = SOURCE_PX_H): BoxPosition {
+  const a = normalizedSlotAspect('split', videoAR) ?? 1
+  const v = viewIn('split', a, [face], [0, 1], sourcePxH)
+  if (v) return v
+  // (too big a face for the limits: as tall as the picture lets it, centred on them)
+  const h = Math.min(1, 1 / a), w = a * h
+  return { x: clamp(midX(face) - w / 2, 0, 1 - w), y: clamp(midY(face) - h / 2, 0, 1 - h), w, h }
+}

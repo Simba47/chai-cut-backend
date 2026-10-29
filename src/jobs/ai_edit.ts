@@ -13,9 +13,10 @@ import { findLoops } from '../lib/transcriptGuard.js'
 import { generateClipText, fontForText, type ClipText, type ClipTextLanguage } from '../lib/clipText.js'
 import { fitInRoom, minWidthFor, sideBySideRooms, steadyRoom } from '../lib/framingRoom.js'
 import { loadClipBrand, logoSpan, brandCaptionRow, type ClipBrand } from '../lib/brandKit.js'
-import { brollEnabled, pickBrollMoments, searchStock, downloadStock, withBroll } from '../lib/broll.js'
+import { brollEnabled, pickBrollMoments, searchCandidates, chooseBroll, brollWindow, downloadStock, withBroll, type BrollShot } from '../lib/broll.js'
 import { findVisuals, describeVisuals, pickVisualMoments, detectPanels, refinePanels, type Visual, type VisualMoment, type Panel } from '../lib/visuals.js'
 import { formatClip } from './clip_formats.js'
+import { personView } from './auto_format.js'
 import { r2UploadFile } from '../r2.js'
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
@@ -37,9 +38,11 @@ export interface FrameDetection { frame_index: number; person_count: number; fac
 export interface FaceInfo { face_count: number; face_boxes: CropBox[]; frames: FrameDetection[] }
 interface SlotKf { t_ms: number; x: number; y: number; w: number; h: number }
 interface ClipSegment {
-  start_ms: number; end_ms: number; layout: 'vertical' | 'split' | 'trio' | 'frame_blur_fill'; slotKfs: SlotKf[][]; broll?: string
+  start_ms: number; end_ms: number; layout: 'vertical' | 'split' | 'trio' | 'frame_blur_fill' | 'frame_gameplay'; slotKfs: SlotKf[][]
   /** How many people it shows (the Rulebook's formats, clip_formats.ts): a panel or related visual goes only over one */
   people?: number
+  /** A frame's settings (segments.frame): B-roll on top of the speaker (lib/broll.ts withBroll) */
+  frame?: Record<string, unknown>
   /** Per slot: null = the clip's own picture at this moment; a number = the same video from that
    *  clip-relative ms instead ("borrowed" reaction footage from another moment, muted) */
   slotSources?: Array<number | null>
@@ -1793,7 +1796,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
             console.log(`[ai_edit] related visuals: ${moments.map(m => `${(m.start_ms / 1000).toFixed(1)}s "${m.visual.about}"`).join(', ')}`)
           }
         }
-        if (addBroll) segments = await addStockBroll(segments, words, highlight, video.user_id, tmp)
+        if (addBroll) segments = await addStockBroll(segments, words, highlight, video.user_id, tmp, analysis, size)
         const clipWords = words.filter(w => w.start_ms >= highlight.start_ms && w.start_ms < highlight.end_ms)
         const caption = captionFontFor(clipWords, payload.caption_language)
 
@@ -1837,22 +1840,44 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
 }
 
 /**
- * Stock shots over the clip where a picture helps (src/lib/broll.ts). Any failure (no result,
- * Pexels down, a bad file) just means fewer or no shots; the clip is still made.
+ * B-roll ("B-rolls" on Make my clips): Gemini picks the moments and their searches, each moment gets a
+ * few stock videos, and Gemini looks at them all and picks the one that shows what is said, or none
+ * (lib/broll.ts). A shot goes only over one person in a Vertical, on one camera shot: the stock video on
+ * top, the speaker below in the Rulebook's one-person view. The other candidates stay on the shot for
+ * the editor's swap.
  */
-async function addStockBroll(segments: ClipSegment[], words: Word[], highlight: FoundClip, userId: string, tmp: string): Promise<ClipSegment[]> {
+async function addStockBroll(
+  segments: ClipSegment[], words: Word[], highlight: FoundClip, userId: string, tmp: string,
+  analysis: ClipAnalysis, size: { width: number; height: number } | null,
+): Promise<ClipSegment[]> {
   try {
     const moments = await pickBrollMoments(words, highlight.start_ms, highlight.end_ms)
-    const shots: Array<{ start_ms: number; end_ms: number; videoId: string }> = []
-    for (const m of moments) {
+    const placed = moments.flatMap(m => {
+      const w = brollWindow(segments, analysis.cuts, m)
+      if (!w) console.log(`[ai_edit] B-roll "${m.queries[0]}" at ${(m.start_ms / 1000).toFixed(1)}s: not over one person in a Vertical, skipped`)
+      return w ? [{ ...m, ...w }] : []
+    })
+    const searched = (await Promise.all(placed.map(async m => ({ ...m, candidates: await searchCandidates(m.queries) }))))
+      .filter(m => m.candidates.length || (console.log(`[ai_edit] B-roll: no stock video for "${m.queries.join('" / "')}"`), false))
+    if (!searched.length) return segments
+    const picks = await chooseBroll(searched)
+    const shots: BrollShot[] = []
+    for (const [i, m] of searched.entries()) {
+      const pick = picks[i]
+      const face = speakerFace(analysis.info.frames, m.start_ms, m.end_ms)
+      if (pick === null || !face) {
+        console.log(`[ai_edit] B-roll "${m.queries[0]}" at ${(m.start_ms / 1000).toFixed(1)}s: ${face ? `none of ${m.candidates.length} fits` : 'no speaker to show below'}, skipped`)
+        continue
+      }
+      const c = m.candidates[pick]
       try {
-        const stock = await searchStock(m.query)
-        if (!stock) { console.log(`[ai_edit] B-roll: no stock video for "${m.query}"`); continue }
-        const videoId = await stockAsset(userId, stock.ref, stock.url, m.query, tmp)
-        if (videoId) shots.push({ start_ms: m.start_ms, end_ms: m.end_ms, videoId })
-        console.log(`[ai_edit] B-roll "${m.query}" at ${(m.start_ms / 1000).toFixed(1)}s: ${stock.ref} (${stock.width}x${stock.height})`)
+        const videoId = await stockAsset(userId, c.ref, c.url, m.queries[0], tmp)
+        if (!videoId) continue
+        const view = personView(face, size ? size.width / size.height : undefined, size?.height)
+        shots.push({ start_ms: m.start_ms, end_ms: m.end_ms, videoId, view, query: m.queries[0], alts: m.candidates, at: pick })
+        console.log(`[ai_edit] B-roll "${m.queries[0]}" at ${(m.start_ms / 1000).toFixed(1)}s: ${c.ref} (${c.width}x${c.height}), ${pick + 1} of ${m.candidates.length}`)
       } catch (e) {
-        console.warn(`[ai_edit] B-roll "${m.query}" skipped:`, e instanceof Error ? e.message : e)
+        console.warn(`[ai_edit] B-roll "${m.queries[0]}" skipped:`, e instanceof Error ? e.message : e)
       }
     }
     return withBroll(segments, shots)
@@ -1860,6 +1885,16 @@ async function addStockBroll(segments: ClipSegment[], words: Word[], highlight: 
     console.warn('[ai_edit] B-roll skipped:', e instanceof Error ? e.message : e)
     return segments
   }
+}
+
+/** The speaker in [a, b) of the clip: the middle of the biggest real face of each frame there (null: none) */
+function speakerFace(frames: FrameDetection[], a: number, b: number): CropBox | null {
+  const faces = frames
+    .filter(f => f.frame_index * FRAME_INTERVAL_MS >= a && f.frame_index * FRAME_INTERVAL_MS < b)
+    .map(f => f.faces.filter(x => (x.score ?? 0) > 0).sort((p, q) => q.w * q.h - p.w * p.h)[0])
+    .filter((x): x is CropBox => !!x)
+  if (faces.length < 2) return null
+  return { x: median(faces.map(f => f.x)), y: median(faces.map(f => f.y)), w: median(faces.map(f => f.w)), h: median(faces.map(f => f.h)) }
 }
 
 /** The user's copy of a stock video (an 'asset' video, so the render job may use it), made once */
@@ -1936,6 +1971,7 @@ async function saveClip(
     const segRows = await tx`
       INSERT INTO segments ${tx(segments.map((seg, si) => ({
         clip_id: clipId, start_ms: seg.start_ms, end_ms: seg.end_ms, layout: seg.layout, sort_order: si, video_offset_ms: null,
+        frame: seg.frame ? tx.json(seg.frame as never) : null,
       })))}
       RETURNING id, sort_order
     `
@@ -1943,12 +1979,9 @@ async function saveClip(
 
     // source_offset_ms is where in the clip this segment's video starts: render.py trims
     // the main video from it, so 0 made every later segment replay the clip's start
-    // A stock shot plays its video from the start, muted (the speaker keeps talking under it)
     const boxInputs = segments.flatMap((seg, si) => seg.slotKfs.map((kfs, slotIdx) => ({
       // A borrowed reaction slot shows this same video from another moment (absolute ms), muted
-      row: seg.broll
-        ? { segment_id: segIdByOrder.get(si)!, slot_index: slotIdx, source_video_id: seg.broll, source_offset_ms: 0, muted: true }
-        : seg.slotSources?.[slotIdx] != null
+      row: seg.slotSources?.[slotIdx] != null
           ? { segment_id: segIdByOrder.get(si)!, slot_index: slotIdx, source_video_id: videoId, source_offset_ms: highlight.start_ms + seg.slotSources[slotIdx]!, muted: true }
           : { segment_id: segIdByOrder.get(si)!, slot_index: slotIdx, source_video_id: null, source_offset_ms: seg.start_ms, muted: false },
       kfs,
