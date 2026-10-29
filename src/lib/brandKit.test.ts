@@ -17,7 +17,9 @@ const kit = (over: Record<string, unknown> = {}) => ({
 test('the logo sits in its corner, a margin in, keeping its shape (as the editor puts it)', () => {
   const b = clipBrand(kit(), U)
   // 20% wide, half as tall as wide on a 1080 × 1920 frame; top right, 4% of the width in
-  assert.deepEqual(b.logo && { x: b.logo.x, y: b.logo.y, w: b.logo.w, h: b.logo.h }, { x: 0.76, y: 0.0225, w: 0.2, h: 0.0563 })
+  assert.deepEqual(b.logo && { x: b.logo.x, y: b.logo.y, w: b.logo.w, h: b.logo.h }, { x: 0.76, y: 0.08, w: 0.2, h: 0.0563 })
+  // (kept clear of the apps' header unless switched off — the frontend's logoBox, Phase 4)
+  assert.equal(clipBrand(kit({ logo: { ...kit().logo, safe: false } }), U).logo?.y, 0.0225)
   assert.equal(b.logo?.opacity, 0.8)
 })
 
@@ -61,7 +63,7 @@ test('a kit saved before these settings existed still works (defaults fill the r
   assert.equal(b.captions, null)
   assert.equal(b.title.color, '#123456')
   assert.equal(b.logo?.show, 'all')
-  assert.ok(b.logo && b.logo.x < 0.1 && b.logo.y > 0.8, 'bottom left')
+  assert.ok(b.logo && b.logo.x < 0.1 && b.logo.y > 0.7 && b.logo.y + b.logo.h <= 0.87 + 1e-3, 'bottom left, above the apps caption')
 })
 
 test("a clip's progress bar made safe; a kit's progress bar and voice aren't used", () => {
@@ -69,4 +71,13 @@ test("a clip's progress bar made safe; a kit's progress bar and voice aren't use
   assert.equal(b.progress, undefined); assert.equal(b.voice, undefined)
   assert.deepEqual(cleanProgressBar({ color: 'red', height: 999, position: 'left' }), { color: '#ffffff', height: 40, position: 'bottom' })
   assert.equal(cleanProgressBar(null), null)
+})
+
+test("the kit's progress bar and end card are saved as not put on yet (the frontend's engine adds it)", async () => {
+  const { appliedHere } = await import('./brandKit.js')
+  const kit = { colors: { main: '#111111' }, progress_bar: { on: true, color: 'accent', height: 12, position: 'bottom' } }
+  assert.deepEqual(appliedHere(kit), { ...kit, progress_bar: { ...kit.progress_bar, on: false } })
+  assert.deepEqual(appliedHere({ colors: {} }), { colors: {} })
+  // (and its end card)
+  assert.deepEqual(appliedHere({ ends: { card: true, seconds: 4, intro: { id: 'x', ms: 3000 } } }), { ends: { card: false, seconds: 4, intro: null, outro: null } })
 })
