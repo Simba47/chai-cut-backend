@@ -13,6 +13,7 @@ import { findLoops } from '../lib/transcriptGuard.js'
 import { generateClipText, fontForText, type ClipText, type ClipTextLanguage } from '../lib/clipText.js'
 import { fitInRoom, minWidthFor, sideBySideRooms, steadyRoom } from '../lib/framingRoom.js'
 import { loadClipBrand, logoSpan, brandCaptionRow, type ClipBrand } from '../lib/brandKit.js'
+import { brandCaptionWords, brandClipText, brandVoice } from '../lib/brandWords.js'
 import { brollEnabled, pickBrollMoments, searchCandidates, chooseBroll, brollWindow, downloadStock, withBroll, type BrollShot } from '../lib/broll.js'
 import { findVisuals, describeVisuals, pickVisualMoments, detectPanels, refinePanels, type Visual, type VisualMoment, type Panel } from '../lib/visuals.js'
 import { formatClip } from './clip_formats.js'
@@ -1729,8 +1730,9 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
     const texts: Array<ClipText | null> = await Promise.all(highlights.map(async (h, i) => {
       await new Promise(r => setTimeout(r, (i % 4) * 250)) // spread the calls a little
       try {
-        const said = words.filter(w => w.start_ms >= h.start_ms && w.start_ms < h.end_ms)
-        return await generateClipText(said, video.title ?? null, prompt => askGemini(prompt), titleLanguageFor(payload.title_language, said), null)
+        // (the kit's words: names spelled its way, its tone, hashtags and closing line — lib/brandWords.ts)
+        const said = brandCaptionWords(words.filter(w => w.start_ms >= h.start_ms && w.start_ms < h.end_ms), brand?.words)
+        return brandClipText(await generateClipText(said, video.title ?? null, prompt => askGemini(prompt), titleLanguageFor(payload.title_language, said), brandVoice(brand?.words)), brand?.words)
       } catch (e) {
         console.warn(`[ai_edit] clip text failed for ${h.start_ms}-${h.end_ms}:`, e instanceof Error ? e.message : e)
         return null

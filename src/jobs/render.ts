@@ -12,7 +12,8 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { computeCutRanges, keptRanges, makeTimeMap, reactionRanges, removedMs, type Range } from '../lib/cuts.js'
 import { cleanTrims } from '../lib/trims.js'
-import { cleanProgressBar } from '../lib/brandKit.js'
+import { cleanProgressBar, clipBrandWords } from '../lib/brandKit.js'
+import { brandCaptionWords } from '../lib/brandWords.js'
 import { aiProvider, askGemini } from '../lib/gemini.js'
 
 const execFileAsync = promisify(execFile)
@@ -245,8 +246,9 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
   const [transcriptRow] = await db`
     SELECT id FROM transcripts WHERE video_id = ${clip.video_id} ORDER BY created_at DESC LIMIT 1
   `
+  // As the brand writes them (brand kit Phase 5: its spellings, its hidden words), as the editor shows them
   const words = transcriptRow
-    ? await db`SELECT word, word_roman, start_ms, end_ms, speaker_id FROM transcript_words WHERE transcript_id = ${transcriptRow.id} ORDER BY start_ms`
+    ? brandCaptionWords([...await db`SELECT word, word_roman, start_ms, end_ms, speaker_id FROM transcript_words WHERE transcript_id = ${transcriptRow.id} ORDER BY start_ms`] as Array<{ word: string; word_roman: string | null; start_ms: number; end_ms: number; speaker_id: string | null }>, await clipBrandWords(clipId))
     : []
 
   // Animated presets emphasise the words that matter; asked once per clip and kept
