@@ -68,6 +68,10 @@ export interface SpokenWord { start_ms: number; end_ms: number; speaker_id?: str
 // to framing by face count and size only.
 const SPEAKER_TRACKING = process.env.SPEAKER_TRACKING !== 'off'
 
+// Clips one Make my clips run frames at the same time (AI_CLIPS_AT_ONCE, default 3): each runs its own
+// FFmpeg and face detection, so more at once needs more CPU and memory on the worker
+const CLIPS_AT_ONCE = Math.max(1, Number(process.env.AI_CLIPS_AT_ONCE) || 3)
+
 // How a clip's formats are chosen (user, 2026-10-29): by the Rulebook, as the editor's Auto format (Cuts)
 // lays them (clip_formats.ts), the faces read in people mode. CLIP_FORMATS=classic goes back to the
 // frame-by-frame framing (buildSegments). Cuts off (always Vertical) and vertical videos use buildSegments.
@@ -1760,8 +1764,14 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       await setProgress(ai_edit_job_id, 45)
 
       // 5. Frame each clip and save it as a draft. Nothing is exported: the user previews the
-      //    clips in the app and exports the ones they want.
-      for (let hi = 0; hi < highlights.length; hi++) {
+      //    clips in the app and exports the ones they want. AI_CLIPS_AT_ONCE (default 3) are made
+      //    side by side: each clip's own face and cut detection (FFmpeg + Python) is the slow part,
+      //    and clips don't depend on each other (their temporary files are named by their start).
+      //    The clip board orders them by score, not by when they were made. A clip that fails stops
+      //    the others from starting new ones, and the job fails as before.
+      let next = 0, made = 0
+      let firstError: unknown = null
+      const makeClip = async (hi: number) => {
         signal?.throwIfAborted()
         const highlight = highlights[hi]
         const clipDurationMs = highlight.end_ms - highlight.start_ms
@@ -1814,8 +1824,17 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
           : `[ai_edit] Detection summary: ${counts.length} frames in ${detectS}s, faces/frame min=${counts.length ? Math.min(...counts) : 0} `
             + `avg=${counts.length ? (counts.reduce((a, b) => a + b, 0) / counts.length).toFixed(2) : 0} max=${analysis.info.face_count}, `
             + `${analysis.cuts.length} camera cut(s)`)
-        await setProgress(ai_edit_job_id, 45 + (55 * (hi + 1)) / highlights.length - 1)
+        made++
+        await setProgress(ai_edit_job_id, 45 + (55 * made) / highlights.length - 1)
       }
+      const lane = async () => {
+        while (next < highlights.length && !firstError) {
+          const hi = next++
+          try { await makeClip(hi) } catch (e) { firstError ??= e }
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(CLIPS_AT_ONCE, highlights.length) }, lane))
+      if (firstError) throw firstError
     } finally {
       await rm(tmp, { recursive: true, force: true })
     }
@@ -1899,8 +1918,18 @@ function speakerFace(frames: FrameDetection[], a: number, b: number): CropBox | 
   return { x: median(faces.map(f => f.x)), y: median(faces.map(f => f.y)), w: median(faces.map(f => f.w)), h: median(faces.map(f => f.h)) }
 }
 
-/** The user's copy of a stock video (an 'asset' video, so the render job may use it), made once */
-async function stockAsset(userId: string, ref: string, url: string, query: string, tmp: string): Promise<string | null> {
+/** The user's copy of a stock video (an 'asset' video, so the render job may use it), made once —
+ *  also when two clips made side by side pick the same one (they share the download) */
+const stockInFlight = new Map<string, Promise<string | null>>()
+function stockAsset(userId: string, ref: string, url: string, query: string, tmp: string): Promise<string | null> {
+  const key = `${userId}:${ref}`
+  const running = stockInFlight.get(key)
+  if (running) return running
+  const once = stockAssetOnce(userId, ref, url, query, tmp).finally(() => stockInFlight.delete(key))
+  stockInFlight.set(key, once)
+  return once
+}
+async function stockAssetOnce(userId: string, ref: string, url: string, query: string, tmp: string): Promise<string | null> {
   const [existing] = await db`SELECT id FROM videos WHERE user_id = ${userId} AND stock_ref = ${ref} AND storage_path IS NOT NULL LIMIT 1`
   if (existing) return existing.id as string
   const path = await downloadStock(url, tmp, ref)
