@@ -30,6 +30,8 @@ export interface TranscribeJobPayload {
   link_source?: 'gdrive' | 'dropbox'
   // Largest file the user's plan allows (link imports stop past this)
   max_bytes?: number
+  // "Captions on" for a clip: only parts without words need reading (none, if the video was read in full)
+  fill_gaps?: boolean
 }
 
 /** Follow the people marked in a clip (jobs/track_subjects.ts): its clip_subjects rows that are 'queued' */
