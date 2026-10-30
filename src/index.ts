@@ -245,6 +245,19 @@ async function runMigrations() {
       updated_at timestamptz NOT NULL DEFAULT now()
     )
   `
+  // A clip's B-roll ideas (editor Media ▸ B-roll / Photos: the AI's searches for what is said in it,
+  // frontend services/stock.ts), kept so opening the panels again — after a redeploy too — doesn't
+  // ask Gemini again. Good while the clip's span and its video's transcript are the ones they came from.
+  await db`
+    CREATE TABLE IF NOT EXISTS clip_broll_ideas (
+      clip_id uuid PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+      transcript_id uuid NOT NULL,
+      start_ms integer NOT NULL,
+      end_ms integer NOT NULL,
+      ideas jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )
+  `
   // Brand kits (editor Brand kit tool): a user's saved looks — colours, logo, @handle, title style —
   // put on a clip with Apply. data: the kit's settings (frontend lib/shared/brandKit.ts). How many a
   // user can have depends on their plan (frontend server/services/brandKits.ts)
@@ -298,6 +311,22 @@ async function runMigrations() {
     )
   `
   await db`CREATE INDEX IF NOT EXISTS brand_kit_invites_email ON brand_kit_invites (email)`
+  // The lookups the website makes on every editor open, autosave and dashboard visit (Postgres doesn't
+  // index a link column by itself: without these each one read the whole table). Each on its own, so
+  // one that can't be made is logged and the worker still starts
+  const indexes: Array<[string, ReturnType<typeof db>]> = [
+    ['caption_styles_clip', db`CREATE INDEX IF NOT EXISTS caption_styles_clip ON caption_styles (clip_id)`],
+    ['text_overlays_clip', db`CREATE INDEX IF NOT EXISTS text_overlays_clip ON text_overlays (clip_id)`],
+    ['overlays_clip', db`CREATE INDEX IF NOT EXISTS overlays_clip ON overlays (clip_id)`],
+    ['audio_tracks_clip', db`CREATE INDEX IF NOT EXISTS audio_tracks_clip ON audio_tracks (clip_id)`],
+    ['transitions_clip', db`CREATE INDEX IF NOT EXISTS transitions_clip ON transitions (clip_id)`],
+    ['transcripts_video_created', db`CREATE INDEX IF NOT EXISTS transcripts_video_created ON transcripts (video_id, created_at)`],
+    ['videos_user_created', db`CREATE INDEX IF NOT EXISTS videos_user_created ON videos (user_id, created_at)`],
+    ['ai_edit_jobs_video', db`CREATE INDEX IF NOT EXISTS ai_edit_jobs_video ON ai_edit_jobs (video_id)`],
+  ]
+  for (const [name, q] of indexes) {
+    try { await q } catch (e) { console.warn(`[startup] index ${name} not made:`, e instanceof Error ? e.message : e) }
+  }
   console.log('[startup] migrations ok')
 }
 

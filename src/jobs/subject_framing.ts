@@ -297,13 +297,6 @@ export function viewOnFace(face: BoxPosition, view: { w: number; h: number }): B
   }
 }
 
-/** How much of [from, to) of the timeline the subject is seen in (0–1) */
-export function seenShare(path: readonly SubjectPoint[], from: number, to: number, toSource: (t: number) => number): number {
-  let n = 0, seen = 0
-  for (let t = from; t < to; t += SUBJECT_STEP_MS) { n++; if (subjectBoxAt(path, toSource(t))) seen++ }
-  return n ? seen / n : 0
-}
-
 /**
  * The view changes that follow a subject over [from, to) of the timeline (`toSource`: timeline ms
  * → source ms), keeping the view's size. Before they are first seen it waits where they appear;
