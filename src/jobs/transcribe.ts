@@ -133,6 +133,19 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
   // Full-video captions right after upload/download, so clips open with captions ready.
   // The video is marked ready first — clipping never waits on this background transcription.
   const isFullJob = !!payload.transcribe_full && !isClipJob && !isRetranscribe
+  // "Captions on" for a clip on a video already read in full: its words are all there (a part with
+  // none is a pause or music), so it isn't read, and paid for, again. The transcript's time moves on,
+  // so the editor (waiting for new words) shows them at once. A language picked, or an export with
+  // fresh captions, still reads.
+  if (isClipJob && payload.fill_gaps && !payload.render_after) {
+    const [latest] = await db<{ id: string; whole_video: boolean | null }[]>`
+      SELECT id, whole_video FROM transcripts WHERE video_id = ${payload.video_id} ORDER BY created_at DESC LIMIT 1`
+    if (latest?.whole_video) {
+      await db`UPDATE transcripts SET created_at = now() WHERE id = ${latest.id}`
+      console.log(`[transcribe] clip ${payload.clip_id}: the video was read in full, nothing to read`)
+      return
+    }
+  }
   let videoReady = false
   // A whole-video reading (AI edit) says how far it has got, in its job (read_pct): the clip board
   // shows it while Best moments and Ask AI wait for the words
