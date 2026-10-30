@@ -221,16 +221,31 @@ async function tick(): Promise<boolean> {
   // Nothing, but only because another slot was holding a long-job place while it picked (and has
   // let go of it): look again now, not at the next poll
   if (!job) return (!mayLong && longRunning < LONG_SLOTS) || (mayLong && !mayProxy && proxyRunning < PROXY_PER_WORKER)
+  busyHere++
   // One more idle slot looks too: signals for jobs added together arrive as one
   idle.shift()?.()
   try {
     await run(job)
   } finally {
+    busyHere--
     if (mayLong && isLong(job)) longRunning--
     if (mayProxy && job.type === 'proxy') proxyRunning--
   }
   return true
 }
+
+// ── Spreading jobs across machines ───────────────────────────────────────────
+// Every worker hears every new job, and the first to claim it wins, so a machine already running
+// jobs took new ones as readily as an idle one. Exports on one machine slow each other (one ~21 s
+// alone, ~35 s with 4 at once; on 2026-10-28 a busy machine took several bursts while others sat
+// idle). So a worker waits SPREAD_MS for each job it is running or claiming (at most SPREAD_MAX_MS)
+// before it claims: an idle machine claims at once and gets the job first. Nobody else took it
+// meanwhile: this worker still does. 100 ms is far more than one machine's head start in hearing a
+// job, and adds ~0.2 s to a start (tested: 3 machines × 4, uneven starts 12–16% → 0–1%; 250 ms
+// spread no better and added ~0.5 s). SPREAD_MS=0: no waiting.
+const SPREAD_MS = Math.max(0, parseInt(process.env.SPREAD_MS ?? '100', 10) || 0)
+const SPREAD_MAX_MS = 400
+let busyHere = 0   // jobs this worker is running or claiming
 
 // ── Fair limits per person ───────────────────────────────────────────────────
 // Running at once for one person, across all workers (the person is the job's payload.user_id, set
@@ -248,8 +263,23 @@ const CLAIM_LOCK = 20261027
 
 async function claim(p: Pool, mayLong: boolean, mayProxy: boolean): Promise<Job | undefined> {
   // Nothing waiting (most polls of an idle worker): no turn on the lock
-  const [waiting] = await db`SELECT 1 FROM jobs WHERE status = 'queued' AND type = ANY(${p.types}) LIMIT 1`
+  const [{ waiting }] = await db<{ waiting: number }[]>`
+    SELECT count(*)::int AS waiting FROM (SELECT 1 FROM jobs WHERE status = 'queued' AND type = ANY(${p.types}) LIMIT 2) w`
   if (!waiting) return undefined
+  // A busy worker lets idle ones go first (see SPREAD_MS)
+  const ahead = busyHere++
+  // Several waiting (a burst): the next idle slot starts its own, longer wait now, side by side,
+  // rather than after this claim (6 exports at one machine: the last started 1.2 s late, not 0.4 s)
+  if (waiting > 1 && SPREAD_MS) idle.shift()?.()
+  try {
+    if (ahead && SPREAD_MS) await new Promise(r => setTimeout(r, Math.min(ahead * SPREAD_MS, SPREAD_MAX_MS)))
+    return await claimNow(p, mayLong, mayProxy)
+  } finally {
+    busyHere--
+  }
+}
+
+async function claimNow(p: Pool, mayLong: boolean, mayProxy: boolean): Promise<Job | undefined> {
   return db.begin(async tx => {
     await tx`SELECT pg_advisory_xact_lock(${CLAIM_LOCK})`
     const reading = tx`(type = 'transcribe' AND COALESCE(payload->>'transcribe_full', '') = 'true')`
