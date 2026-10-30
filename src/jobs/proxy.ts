@@ -70,6 +70,8 @@ export function proxyArgs(input: string, output: string): string[] {
     '-movflags', '+faststart',
     // Two cores at most: renders run on the same worker
     '-threads', '2',
+    // (a YouTube video's chapters aren't copied into the editing copy)
+    '-map_chapters', '-1',
     output,
   ]
 }

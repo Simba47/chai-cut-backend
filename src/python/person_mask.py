@@ -101,7 +101,7 @@ def captions_behind(video_path: str, subtitles: str, out_path: str, tmp: str, ve
              f"[b][m]alphamerge[p];"
              f"[cap][p]overlay=format=auto:shortest=1,format=yuv420p[v]")
     cmd = ["ffmpeg", "-v", "error", "-y", "-i", video_path, "-i", mask_path, "-filter_complex", graph,
-           "-map", "[v]", "-map", "0:a?", *venc, "-c:a", "copy", out_path]
+           "-map", "[v]", "-map", "0:a?", *venc, "-c:a", "copy", "-map_chapters", "-1", out_path]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"[render] captions behind the person failed:\n{result.stderr[-3000:]}", flush=True)

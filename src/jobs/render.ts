@@ -476,7 +476,9 @@ async function condenseClip(clipId: string, spec: Spec, videoUrl: string, tmp: s
     '-filter_complex', fc.join(';'),
     '-map', '[v]', ...(hasAudio ? ['-map', '[a]'] : []),
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuv420p',
-    ...(hasAudio ? ['-c:a', 'aac', '-b:a', '192k'] : []), '-movflags', '+faststart', out,
+    ...(hasAudio ? ['-c:a', 'aac', '-b:a', '192k'] : []), '-movflags', '+faststart',
+    // (a YouTube video's chapters aren't copied in: they'd reach the export and make it look 30+ minutes long)
+    '-map_chapters', '-1', out,
   ], { signal, maxBuffer: 32 * 1024 * 1024 })
   console.log(`[render] Removed ${trims.length} part(s) cut in the editor and ${pauses.length} pause/filler cut(s): ${(removedMs(cuts) / 1000).toFixed(1)}s in all, in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
   return { path: out, spec: remapSpec(spec, kept) }
@@ -659,24 +661,6 @@ export function timelineAtPieces(pieces: Piece[], v: number): number {
   }
   const next = pieces.find(p => p.from != null && p.from > v)
   return next ? next.at : (pieces.length ? pieces[pieces.length - 1].at + pieces[pieces.length - 1].ms : v)
-}
-
-/** Where the main video is at timeline `t` (clip ms); inside a video put in between: where it waits */
-export function videoAtTimeline(inserts: InsertSpan[], t: number): number {
-  let before = 0
-  for (const i of inserts) {
-    if (t < i.at) break
-    if (t < i.at + i.ms) return i.hold
-    before += i.ms
-  }
-  return t - before
-}
-
-/** The timeline time where the main video shows its moment `v` (clip ms): after any video put in at or before it */
-export function timelineAtVideo(inserts: InsertSpan[], v: number): number {
-  let t = v
-  for (const i of inserts) if (i.hold <= v) t += i.ms
-  return t
 }
 
 /** A music-lane bar that is the main video's own sound, detached ("main-video:<id>") */
