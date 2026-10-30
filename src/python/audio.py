@@ -43,6 +43,8 @@ def build_ffmpeg_audio_args(
             "-i", source_video,
             "-vn",
             "-acodec", "aac", "-b:a", "192k",
+            # (-map_chapters -1: a YouTube video's chapters aren't copied in — they made a 2-minute export a 31-minute file to players, user 2026-10-27)
+            "-map_chapters", "-1",
             output_audio,
         ]
 
@@ -96,6 +98,7 @@ def build_ffmpeg_audio_args(
         "-map", "[aout]",
         "-acodec", "aac",
         "-b:a", "192k",
+        "-map_chapters", "-1",
         output_audio,
     ]
 
@@ -472,6 +475,7 @@ def build_segment_audio_args(
         "-filter_complex", ";".join(fp),
         "-map", "[aout]",
         "-acodec", "aac", "-b:a", "192k",
+        "-map_chapters", "-1",
         output_audio,
     ]
 

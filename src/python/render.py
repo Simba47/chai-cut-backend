@@ -2965,6 +2965,8 @@ def main(
             "-c:a", "aac",
             "-b:a", qs["audio_br"],
             "-shortest",
+            # (-map_chapters -1: a YouTube video's chapters aren't copied in — they made a 2-minute export a 31-minute file to players, user 2026-10-27)
+            "-map_chapters", "-1",
             rendered_path,
         ]
 
