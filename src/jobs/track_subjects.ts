@@ -713,6 +713,13 @@ const PRESENCE_MIN_FRAMES = 3
  */
 const SEEN_SURE = 0.8
 const SEEN_SMALL = 0.05
+/**
+ * A shot shorter than SHOT_MIN_MS whose people are in no other scene is a scene of its own from at least
+ * this long (a flash between two shots isn't): a 0.76 s wide shot of two men had 3 frames, 2 of them on a
+ * cut — nobody could be counted, it went with the other shots, and Make my clips put a centred view on
+ * the wall between them (the user, 2026-10-31)
+ */
+const SHORT_SHOT_MIN_MS = 300
 
 export interface Angle {
   /** How many people it shows; 0: the other shots (no faces, or too short to be an angle) */
@@ -838,6 +845,24 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
     const best = [...votes].sort((p, q) => q[1] - p[1])[0]
     if (best && best[1] * 2 >= use.length) st.angle = best[0]
   }
+  // A short shot whose people are in no scene: its own scene, from what its frames show — the sure faces
+  // (SEEN_SURE: no presence count, a short shot hasn't the frames for one), at the middle frame showing the
+  // most common count of them, away from the cuts when it can be (SHORT_SHOT_MIN_MS)
+  for (const st of stretches) {
+    if (st.angle >= 0 || st.b - st.a < SHORT_SHOT_MIN_MS) continue
+    const inside = fr.map((f, fi) => ({ faces: f.faces.filter(face => (face.score ?? 0) >= SEEN_SURE), t: timeOf(fi) })).filter(x => x.t >= st.a && x.t < st.b)
+    const away = inside.filter(x => (st.a <= 0 || x.t - st.a >= SHORT_EDGE_MS) && (st.b >= durationMs || st.b - x.t >= SHORT_EDGE_MS))
+    const pool = (away.some(x => x.faces.length) ? away : inside).filter(x => x.faces.length)
+    if (!pool.length) continue
+    const counts = new Map<number, number>()
+    for (const x of pool) counts.set(x.faces.length, (counts.get(x.faces.length) ?? 0) + 1)
+    const want = [...counts].sort((p, q) => q[1] - p[1] || q[0] - p[0])[0][0]
+    const withAll = pool.filter(x => x.faces.length === want)
+    const ref = withAll[Math.floor(withAll.length / 2)]
+    const id = found.push({ at: ref.t, faces: [...ref.faces].sort((p, q) => p.x - q.x) }) - 1
+    into.push(id)
+    st.angle = id
+  }
 
   // Past the most there can be, the least shown go with the other shots
   const total = (id: number) => stretches.filter(s => s.angle === id).reduce((n, s) => n + s.b - s.a, 0)
@@ -945,6 +970,8 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
       ...(turns ? { talk: spans.map(span => persons.map(p => talking(p, span))) } : {}),
     }]
   })
+  // (in the order they first come up: a short shot's scene was made after the others)
+  angles.sort((p, q) => p.spans[0][0] - q.spans[0][0])
   const rest = spansOf(s => !kept.has(s.angle))
   if (rest.length) angles.push({ people: 0, at: Math.round((rest[0][0] + rest[0][1]) / 2), faces: [], spans: rest })
   return angles

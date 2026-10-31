@@ -8,7 +8,8 @@
 //   2. Every place gets its format (auto_format.ts decideFormat, the editor's rules); a place under
 //      SHORT_PLACE takes the one before it when that still keeps everyone (EditorShell autoFormat).
 //   3. Each place is its own section, cut on the camera cuts; stretches no scene covers (no faces) get
-//      a still centred Vertical, as the old framing's cutaways.
+//      a still centred Vertical, as the old framing's cutaways — one under SHORT_PLACE goes on in the
+//      section before it (a centred view there showed the wall between two people: 2026-10-31).
 //   4. Follow (the editor's Cuts mode): a view on one person keeps on them as they move, inside its strip
 //      of the picture (never over a neighbour's view); a view on two or more holds. Motion off: all hold.
 
@@ -75,10 +76,15 @@ export function formatClip(
     slotKfs: [[{ t_ms: a, x: (1 - reelW) / 2, y: 0, w: reelW, h: 1 }]],
   })
   const out: FormattedPart[] = []
+  /** No faces through [a, b): a cutaway — or, under SHORT_PLACE, the section before it goes on (its views hold) */
+  const between = (a: number, b: number) => {
+    if (b - a < AUTO_FORMAT.SHORT_PLACE * 1000 && out.length) out[out.length - 1].end_ms = b
+    else out.push(cutaway(a, b))
+  }
   let at = 0
   for (const p of places) {
     const a = Math.max(p.a, at)
-    if (a - at >= 50) out.push(cutaway(at, a))
+    if (a - at >= 50) between(at, a)
     if (p.b - a < 50) continue
     const views = p.plan.layout === 'frame_blur_fill' ? [{ x: 0, y: 0, w: 1, h: 1 }] : p.plan.framing
     const people = p.faces.length
@@ -92,7 +98,7 @@ export function formatClip(
     })
     at = p.b
   }
-  if (durationMs - at >= 50) out.push(cutaway(at, durationMs))
+  if (durationMs - at >= 50) between(at, durationMs)
   else if (out.length) out[out.length - 1].end_ms = durationMs
   if (!out.length) out.push(cutaway(0, durationMs))
   return out
