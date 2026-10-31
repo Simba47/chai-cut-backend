@@ -102,3 +102,40 @@ test('a following view in a Split never crosses into its neighbour’s view', ()
     assert.ok(l.x + l.w <= r.x + 1e-6, `${t}: views overlap ${JSON.stringify([a, b])}`)
   }
 })
+
+// ── A short shot between two others (the user's clip, 2026-10-31): 0–9.72 s two people; 9.72–10.48 s a
+// wide shot of two others (3 frames, 2 of them right on the cuts); 10.48–15 s one man ──
+function shortShot(other: (t: number) => CropBox[]) {
+  const out: FrameDetection[] = []
+  for (let n = 0; n * 250 + 100 < 15000; n++) {
+    const t = n * 250 + 100
+    const faces = t < 9723 ? [face(0.31, 0.05), face(0.74, 0.9)] : t < 10483 ? other(t) : [face(0.5, 0.3, 0.12)]
+    out.push({ frame_index: n, person_count: faces.length, faces })
+  }
+  return out
+}
+const shortCuts = [9723, 10483]
+
+test('a short shot of two people seen nowhere else gets its own format on them — not a centred view on the wall', () => {
+  const two = [face(0.17, 0.6, 0.096), face(0.71, 0.7, 0.076)]
+  const parts = formatClip(shortShot(() => two), shortCuts, 15000, [], SIZE)
+  const mid = parts.find(p => p.start_ms <= 10000 && p.end_ms > 10000)!
+  assert.deepEqual([mid.start_ms, mid.end_ms, mid.layout, mid.people], [9723, 10483, 'split', 2])
+  for (const f of two) assert.ok(mid.slotKfs.some(k => within(f, at(k, 10000))), 'each man whole in a view')
+})
+
+test('a short shot with no sure faces (a flash, a blur) gets no centred view — the shot beside it covers it', () => {
+  for (const other of [() => [], () => [{ ...face(0.5, 0.6, 0.1), score: 0.7 }]]) {
+    // (the shot before it goes on, or the one after takes it in — a shot can take in an empty moment
+    // beside it — never a centred cutaway)
+    const parts = formatClip(shortShot(other), shortCuts, 15000, [], SIZE)
+    assert.ok(!parts.some(p => p.why === 'cutaway'), JSON.stringify(parts.map(p => [p.start_ms, p.end_ms, p.layout, p.why])))
+    assert.equal(parts[0].start_ms, 0)
+    assert.equal(parts[parts.length - 1].end_ms, 15000)
+  }
+})
+
+test('a long stretch with nobody is still a centred cutaway', () => {
+  const parts = formatClip(frames, cuts, DUR, [], SIZE)
+  assert.equal(parts.find(p => p.start_ms === 12000)!.why, 'cutaway')
+})
