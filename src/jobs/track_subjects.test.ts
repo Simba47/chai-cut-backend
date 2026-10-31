@@ -230,3 +230,14 @@ test('a still face the user marked is a person, whatever it reads (+ Add)', () =
   const [r] = followSubjects(kept, [], [{ id: 'l', t: 2100, x: 0.15, y: 0.36 }])
   assert.equal(r.error, undefined)
 })
+
+test('scenes: a 0.76 s shot of people seen nowhere else is a scene of its own (not the other shots); a flash is not', () => {
+  const fw = made(15000, (t, n) => t < 9723 ? [person(0, 0.31, 0.05, n, 0.1), person(1, 0.74, 0.9, n, 0.1)]
+    : t < 10483 ? [person(2, 0.17, 0.6, n, 0.096), person(3, 0.71, 0.7, n, 0.076)]
+    : t < 10700 ? [person(4, 0.4, 0.2, n, 0.1)] : [person(5, 0.5, 0.3, n, 0.12)])
+  const angles = findAngles(fw, [9723, 10483, 10700], 15000)
+  const short = angles.find(a => a.spans.some(([s, e]) => s === 9723 && e === 10483))!
+  assert.equal(short.people, 2)
+  assert.ok(angles.find(a => a.spans.some(([s, e]) => s === 10483 && e === 10700))!.people === 0, 'a 0.2 s flash goes with the other shots')
+  assert.deepEqual(angles.filter(a => a.people).map(a => a.spans[0][0]), [0, 9723, 10700], 'scenes in the order they come up')
+})
