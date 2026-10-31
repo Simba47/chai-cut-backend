@@ -13,24 +13,35 @@
  * then first come, first served. The budget refills at GOOGLE_STT_TPM tokens a minute (a minute's
  * worth at most). Not set: no line, no budget (each worker on its own, as before). The website reads
  * the line to tell people where they are in it (google_waiting).
+ *
+ * Vertex and the Gemini API key have limits of their own, so each has its own line and budget:
+ * Vertex GOOGLE_STT_TPM (lane 'stt'), the key GEMINI_STT_TPM (lane 'stt-key'). transcribe.ts picks
+ * the side for each request (sttSides).
  */
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import db from '../db.js'
 
-/** Audio tokens a minute the whole project may send (0: no shared budget) */
-const TPM = Math.max(0, Number(process.env.GOOGLE_STT_TPM) || 0)
+/** Where speech-to-text requests go: Vertex AI, or the Gemini API with our key */
+export type SttSide = 'vertex' | 'key'
+/** Audio tokens a minute the whole project may send to each side (0: no shared budget there) */
+const TPM: Record<SttSide, number> = {
+  vertex: Math.max(0, Number(process.env.GOOGLE_STT_TPM) || 0),
+  key: Math.max(0, Number(process.env.GEMINI_STT_TPM) || 0),
+}
+const LANES: Record<SttSide, string> = { vertex: 'stt', key: 'stt-key' }
 /** Gemini counts 32 tokens per second of audio */
 const TOKENS_PER_SEC = 32
 /** A waiter not seen for this long has gone (its worker stopped): the line skips it */
 const GONE_AFTER_S = 30
-const LANE = 'stt'
 
 export interface SttTurn {
   /** Place in line (see above) */
   rank: number
   /** The job this request is for (the website looks up its place in line by it) */
   jobId?: string
+  /** Seconds of audio the job reads in all (transcribeAudio sets it): short ones go to Vertex first */
+  audioSec?: number
 }
 /** Who the speech-to-text requests made inside it are for (handleTranscribeJob sets it) */
 export const sttTurn = new AsyncLocalStorage<SttTurn>()
@@ -60,25 +71,28 @@ export function wavSeconds(buf: Buffer): number {
 }
 
 /**
- * Waits for this request's turn and its share of the budget (`seconds` of audio), then returns.
- * At once when no budget is set (GOOGLE_STT_TPM).
+ * Waits for this request's turn and its share of `side`'s budget (`seconds` of audio), then returns
+ * true. At once when that side has no budget (GOOGLE_STT_TPM / GEMINI_STT_TPM). With `maxWaitMs`,
+ * gives up after that long and returns false (the request then goes to the other side).
  */
-export async function waitForStt(seconds: number, signal?: AbortSignal): Promise<void> {
-  if (!TPM) return
+export async function waitForStt(seconds: number, side: SttSide, maxWaitMs?: number, signal?: AbortSignal): Promise<boolean> {
+  const tpm = TPM[side], LANE = LANES[side]
+  if (!tpm) return true
   await tables()
   const turn = sttTurn.getStore() ?? { rank: 1 }
   // A minute's worth at most: a bigger request (a 5-minute chunk at 9,600 tokens on a 10K budget)
   // waits for a full budget rather than forever
-  const need = Math.min(TPM, Math.ceil(seconds * TOKENS_PER_SEC))
-  const perSec = TPM / 60
+  const need = Math.min(tpm, Math.ceil(seconds * TOKENS_PER_SEC))
+  const perSec = tpm / 60
   const me = randomUUID()
+  const giveUpAt = maxWaitMs == null ? Infinity : Date.now() + maxWaitMs
   const [{ since }] = await db<{ since: Date }[]>`
     INSERT INTO google_waiting (id, lane, rank, job_id) VALUES (${me}, ${LANE}, ${turn.rank}, ${turn.jobId ?? null}) RETURNING since`
   try {
     for (;;) {
       signal?.throwIfAborted()
-      const waitMs = await db.begin(async tx => {
-        await tx`INSERT INTO google_budget (lane, tokens) VALUES (${LANE}, ${TPM}) ON CONFLICT (lane) DO NOTHING`
+      const wait = await db.begin(async tx => {
+        await tx`INSERT INTO google_budget (lane, tokens) VALUES (${LANE}, ${tpm}) ON CONFLICT (lane) DO NOTHING`
         const [b] = await tx<{ tokens: number; secs: number }[]>`
           SELECT tokens, extract(epoch FROM clock_timestamp() - at)::float8 AS secs FROM google_budget WHERE lane = ${LANE} FOR UPDATE`
         // Someone ahead in line (a better rank, or the same rank sooner) goes first
@@ -87,18 +101,21 @@ export async function waitForStt(seconds: number, signal?: AbortSignal): Promise
           WHERE lane = ${LANE} AND id <> ${me} AND seen > clock_timestamp() - make_interval(secs => ${GONE_AFTER_S})
             AND (rank < ${turn.rank} OR (rank = ${turn.rank} AND (since, id) < (${since}, ${me})))
           LIMIT 1`
-        const have = Math.min(TPM, b.tokens + b.secs * perSec)
+        const have = Math.min(tpm, b.tokens + b.secs * perSec)
         if (!ahead && have >= need) {
           await tx`UPDATE google_budget SET tokens = ${have - need}, at = clock_timestamp() WHERE lane = ${LANE}`
-          return 0
+          return null
         }
         await tx`UPDATE google_waiting SET seen = clock_timestamp() WHERE id = ${me}`
         // First in line: until the budget has refilled enough (looking again at least every 5 s);
         // behind someone: soon, to follow them
-        return ahead ? 500 : Math.min(5000, Math.max(200, ((need - have) / perSec) * 1000))
+        const refillMs = ((need - have) / perSec) * 1000
+        return { ms: ahead ? 500 : Math.min(5000, Math.max(200, refillMs)), atLeastMs: ahead ? 0 : refillMs }
       })
-      if (!waitMs) return
-      await new Promise(r => setTimeout(r, waitMs + Math.random() * 100))
+      if (!wait) return true
+      // (the budget won't have room in time: give up now)
+      if (Date.now() + Math.max(wait.ms, wait.atLeastMs) > giveUpAt) return false
+      await new Promise(r => setTimeout(r, wait.ms + Math.random() * 100))
     }
   } finally {
     await db`DELETE FROM google_waiting WHERE id = ${me}`.catch(() => {})

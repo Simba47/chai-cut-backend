@@ -12,7 +12,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { GoogleAuth } from 'google-auth-library'
 import { r2, R2_BUCKET, r2DownloadToFile, r2SignedUrl, r2UploadFile } from '../r2.js'
 import { aiProvider, askGemini, dropCode, isNetworkDrop, retryAfterMs, retryDelayMs } from '../lib/gemini.js'
-import { sttRank, sttTurn, waitForStt, wavSeconds } from '../lib/googleBudget.js'
+import { sttRank, sttTurn, waitForStt, wavSeconds, type SttSide } from '../lib/googleBudget.js'
 import { runawayReason, trimRunaway } from '../lib/transcriptGuard.js'
 import { skippedGaps, rereadWindows, wordsInGaps, REREAD_MIN_SOUND_SEC } from '../lib/skippedSpeech.js'
 import { convertWordForWord } from '../lib/wordConvert.js'
@@ -711,6 +711,8 @@ async function geminiUploadAudio(buf: Buffer): Promise<{ name: string; uri: stri
 // (`gcloud auth application-default login` locally, or a GOOGLE_APPLICATION_CREDENTIALS file).
 // The model is only served from the 'global' location; audio goes inline (5-minute chunks, well
 // under the 15-minute limit).
+// With the key set too and STT_SHORT_SEC set, both are used (sttSides): Vertex and the key each
+// have their own limit, so together they read more at once.
 const VERTEX_PROJECT   = process.env.GOOGLE_CLOUD_PROJECT
 const VERTEX_LOCATION  = process.env.GOOGLE_CLOUD_LOCATION || 'global'
 const VERTEX_STT_MODEL = 'gemini-3.5-transcribe-preview'
@@ -766,7 +768,7 @@ function sttFine() {
   sttLimit = Math.min(STT_MAX_IN_FLIGHT, sttLimit + 0.5)
 }
 
-async function vertexTranscribeChunk(buf: Buffer, languageCode?: string): Promise<SarvamWord[]> {
+async function vertexTranscribeChunk(buf: Buffer, languageCode?: string, handOver?: HandOver): Promise<SarvamWord[]> {
   const auth = vertexAuthClient()
   const host = VERTEX_LOCATION === 'global' ? 'aiplatform.googleapis.com' : `${VERTEX_LOCATION}-aiplatform.googleapis.com`
   const url = `https://${host}/v1/projects/${VERTEX_PROJECT}/locations/${VERTEX_LOCATION}/publishers/google/models/${VERTEX_STT_MODEL}:generateContent`
@@ -783,7 +785,7 @@ async function vertexTranscribeChunk(buf: Buffer, languageCode?: string): Promis
     let res: Response
     try {
       // Its turn in the shared Google line, and its share of the budget (each try is sent anew)
-      await waitForStt(wavSeconds(buf))
+      if (!await waitForStt(wavSeconds(buf), 'vertex', handOver?.lineMs)) throw new SttHandOver('the Vertex line is long')
       const token = await auth.getAccessToken()
       res = await sttGate(() => fetchWithTimeout(url, {
         method: 'POST',
@@ -800,6 +802,7 @@ async function vertexTranscribeChunk(buf: Buffer, languageCode?: string): Promis
     }
     if (res.status === 429) sttBusy()
     else if (res.ok) sttFine()
+    if (res.status === 429 && handOver) throw new SttHandOver('Vertex is busy')
     if (res.ok) {
       const raw = await res.json() as {
         candidates?: { content?: { parts?: { audioTranscription?: { speakerLabel?: string; words?: { word?: string; startOffset?: string; endOffset?: string }[] } }[] } }[]
@@ -835,8 +838,54 @@ function retryHintSec(body: string): number {
   return sec
 }
 
+// ── Vertex and the key together ──────────────────────────────────────────────
+// With both set and STT_SHORT_SEC (seconds) set: a job with that much audio or less (a clip's
+// captions) goes to Vertex first — one request, no upload — and to the key if Vertex's line is
+// longer than STT_SPILL_SEC or Vertex refuses it as busy (Vertex lets through only ~2–3 two-minute
+// clips a minute). Longer ones (a whole video) go to the key first (Tier 2: ~10× Vertex's limit) and
+// to Vertex if the key refuses them as busy or its daily limit is used up. Not set: Vertex when
+// GOOGLE_CLOUD_PROJECT is set, else the key, as before.
+const STT_SHORT_SEC = Math.max(0, Number(process.env.STT_SHORT_SEC) || 0)
+const STT_SPILL_SEC = Math.max(1, Number(process.env.STT_SPILL_SEC) || 15)
+/** Until when the key's daily limit is used up: everything goes to Vertex till then */
+let keyRestUntil = 0
+
+/** A request may go to the other side: if its line is longer than lineMs, or if this side refuses it as busy */
+interface HandOver { lineMs?: number }
+/** This side can't take the request now: the other side reads it */
+class SttHandOver extends Error {}
+
+/** The sides a request goes to, in order (the second only when the first hands it over) */
+function sttSides(): SttSide[] {
+  if (!VERTEX_PROJECT) return ['key']
+  if (!GEMINI_API_KEY || !STT_SHORT_SEC || Date.now() < keyRestUntil) return ['vertex']
+  // (no job around it, e.g. filling a transcript's gaps: a whole video)
+  const audioSec = sttTurn.getStore()?.audioSec
+  return audioSec != null && audioSec <= STT_SHORT_SEC ? ['vertex', 'key'] : ['key', 'vertex']
+}
+
 async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promise<SarvamWord[]> {
-  if (VERTEX_PROJECT) return vertexTranscribeChunk(buf, languageCode)
+  const [first, then] = sttSides()
+  const read = (side: SttSide, handOver?: HandOver) =>
+    side === 'vertex' ? vertexTranscribeChunk(buf, languageCode, handOver) : keyTranscribeChunk(buf, languageCode, handOver)
+  if (!then) return read(first)
+  try {
+    return await read(first, first === 'vertex' ? { lineMs: STT_SPILL_SEC * 1000 } : {})
+  } catch (e) {
+    if (!(e instanceof SttHandOver)) throw e
+    console.warn(`[stt] ${e.message}: this ${Math.round(wavSeconds(buf))} s goes to ${then === 'vertex' ? 'Vertex' : 'the Gemini key'}`)
+    try {
+      return await read(then)
+    } catch (e2) {
+      // Sent on to the key and its daily limit was used up: back to Vertex, to wait there
+      if (!(e2 instanceof SttHandOver)) throw e2
+      console.warn(`[stt] ${e2.message}: this ${Math.round(wavSeconds(buf))} s goes back to Vertex`)
+      return read('vertex')
+    }
+  }
+}
+
+async function keyTranscribeChunk(buf: Buffer, languageCode?: string, handOver?: HandOver): Promise<SarvamWord[]> {
   // A dropped connection (upload or request, not a timeout) is tried again, like a 5xx
   const dropped = async (e: unknown, attempt: number) => {
     if (!isNetworkDrop(e) || attempt >= GEMINI_MAX_TRIES) throw e
@@ -846,7 +895,7 @@ async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promis
   }
   for (let attempt = 1; ; attempt++) {
     // Its turn in the shared Google line, and its share of the budget (each try is sent anew)
-    await waitForStt(wavSeconds(buf))
+    if (!await waitForStt(wavSeconds(buf), 'key', handOver?.lineMs)) throw new SttHandOver('the Gemini key line is long')
     let file: { name: string; uri: string }
     try { file = await geminiUploadAudio(buf) } catch (e) { await dropped(e, attempt); continue }
     try {
@@ -898,9 +947,13 @@ async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promis
       // ("retry in 22h28m") will not reset while the job waits: stop now and say so.
       const hinted = retryHintSec(body)
       if (hinted > 120) {
+        // Vertex (when set) reads everything until then
+        keyRestUntil = Date.now() + hinted * 1000
+        if (VERTEX_PROJECT) throw new SttHandOver(`the Gemini key's limit for today is used up (for ${Math.round(hinted / 60)} min)`)
         const hours = Math.max(1, Math.round(hinted / 3600))
         throw new Error(`Transcription limit for today is used up (Gemini API). It resets in about ${hours} hour${hours === 1 ? '' : 's'}.`)
       }
+      if (res.status === 429 && handOver) throw new SttHandOver('the Gemini key is busy')
       const delaySec = Math.max(hinted, res.status === 429 ? 20 : 5 * attempt)
       console.warn(`[gemini] ${res.status} on attempt ${attempt}, retrying in ${delaySec}s`)
       await new Promise(r => setTimeout(r, delaySec * 1000))
@@ -929,13 +982,17 @@ export interface ReadingStore {
 
 export async function transcribeAudio(audioPath: string, videoId?: string, languageCode?: string, signal?: AbortSignal, kept?: ReadingStore, onRead?: ReadProgress): Promise<SarvamResponse> {
   if (!GEMINI_API_KEY && !VERTEX_PROJECT) throw new Error('Set GOOGLE_CLOUD_PROJECT (Vertex AI) or GEMINI_API_KEY for transcription')
-  console.log(`[transcribe] ${VERTEX_PROJECT ? `Vertex AI ${VERTEX_STT_MODEL}` : GEMINI_STT_MODEL} (verbatim, word timestamps)`)
 
   const { stdout } = await execFileAsync('ffprobe', [
     '-v', 'error', '-show_entries', 'format=duration',
     '-of', 'default=noprint_wrappers=1:nokey=1', audioPath,
   ])
   const totalSec = parseFloat(stdout.trim())
+  // (how long the job's audio is decides where its requests go: sttSides)
+  const turn = sttTurn.getStore()
+  if (turn) turn.audioSec ??= totalSec
+  const sides = sttSides().map(s => s === 'vertex' ? `Vertex AI ${VERTEX_STT_MODEL}` : `Gemini key ${GEMINI_STT_MODEL}`)
+  console.log(`[transcribe] ${sides.join(', then ')} (verbatim, word timestamps)`)
   const numChunks = Math.max(1, Math.ceil(totalSec / GEMINI_CHUNK_SEC))
   console.log(`[transcribe] audio ${totalSec.toFixed(1)}s → ${numChunks} chunk(s), ${Math.min(READ_PARALLEL, numChunks)} at a time`)
   const readStart = Date.now()
