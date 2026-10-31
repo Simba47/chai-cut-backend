@@ -14,7 +14,17 @@
 
 export type FinderWord = { word: string; start_ms: number; end_ms: number }
 
-export interface TranscriptLine { index: number; start_ms: number; end_ms: number; text: string }
+export interface TranscriptLine {
+  index: number; start_ms: number; end_ms: number; text: string
+  /** Its first and last word (indexes into the words it was built from) */
+  first_word?: number; last_word?: number
+}
+
+/**
+ * A short piece of a line, for exact clip edges (refineEdges): it ends at a sentence end, at a pause
+ * after a few words, or at its line's end. `line`: the line it is part of.
+ */
+export interface Phrase { index: number; line: number; start_ms: number; end_ms: number; text: string }
 
 export interface Subscores { hook: number; emotion: number; story: number; value: number; clarity: number }
 
@@ -35,8 +45,8 @@ export interface FoundClip {
 /** 'best' = the strongest moments in general; 'search' = only moments matching the user's request */
 export type FinderMode = { kind: 'best' } | { kind: 'search'; criteria: string }
 
-/** Sends one prompt to the model and returns its raw text answer */
-export type AskModel = (system: string, user: string) => Promise<string>
+/** Sends one prompt to the model and returns its raw text answer (`opts.temperature`: 0 for the same answer every time) */
+export type AskModel = (system: string, user: string, opts?: { temperature?: number }) => Promise<string>
 
 export const MIN_CLIP_MS = 15_000
 /** What the model is asked for; a clip may run on to HARD_MAX_CLIP_MS to finish its thought */
@@ -54,6 +64,10 @@ const LEAD_MS = 350
 const TAIL_MS = 600
 /** Silence left between the room and a neighbouring word, so none of it is heard */
 const EDGE_KEEP_MS = 60
+/** A phrase (refineEdges' pieces) ends at a pause this long once it has PHRASE_MIN_WORDS words, and at PHRASE_MAX_WORDS in any case */
+const PHRASE_PAUSE_MS = 350
+const PHRASE_MIN_WORDS = 3
+const PHRASE_MAX_WORDS = 25
 /** Lines shown around a clip when its edges are checked (lib: refineEdges) */
 const REFINE_BEFORE = 8
 const REFINE_AFTER = 12
@@ -79,25 +93,58 @@ const SENTENCE_END = /[.?!।॥|]["'”’)]*$/
 export function buildLines(words: FinderWord[]): TranscriptLine[] {
   const lines: TranscriptLine[] = []
   let cur: FinderWord[] = []
-  const flush = () => {
+  let first = 0
+  const flush = (last: number) => {
     if (cur.length === 0) return
     lines.push({
       index: lines.length,
       start_ms: cur[0].start_ms,
       end_ms: cur[cur.length - 1].end_ms,
       text: cur.map(w => w.word).join(' '),
+      first_word: first, last_word: last,
     })
     cur = []
+    first = last + 1
   }
   words.forEach((w, i) => {
-    if (cur.length > 0 && w.start_ms - cur[cur.length - 1].end_ms > LINE_PAUSE_MS) flush()
+    if (cur.length > 0 && w.start_ms - cur[cur.length - 1].end_ms > LINE_PAUSE_MS) flush(i - 1)
     cur.push(w)
     const next = words[i + 1]
     const breath = !next || next.start_ms - w.end_ms >= BREATH_MS
-    if (SENTENCE_END.test(w.word.trim()) || (cur.length >= LINE_SOFT_WORDS && breath) || cur.length >= LINE_HARD_WORDS) flush()
+    if (SENTENCE_END.test(w.word.trim()) || (cur.length >= LINE_SOFT_WORDS && breath) || cur.length >= LINE_HARD_WORDS) flush(i)
   })
-  flush()
+  flush(words.length - 1)
   return lines
+}
+
+/**
+ * The lines from..to as phrases (user, 2026-10-31: a clip ended mid-sentence because the end of
+ * the thought was in the middle of a line — Telugu lines run 25–45 words, to a breath, and a clip
+ * could only end on a line's end). A phrase ends at a sentence end, at a pause of PHRASE_PAUSE_MS
+ * once it has PHRASE_MIN_WORDS words, at PHRASE_MAX_WORDS (a run of words with no pause at all — a forced cut — as long as a line's own soft limit), and always at its line's end — so the
+ * edges a clip had before are phrase edges too. Numbered from 0 in the order given.
+ */
+export function buildPhrases(words: FinderWord[], lines: TranscriptLine[], from: number, to: number): Phrase[] {
+  const out: Phrase[] = []
+  for (let li = from; li <= to; li++) {
+    const l = lines[li]
+    if (l.first_word === undefined || l.last_word === undefined) {
+      out.push({ index: out.length, line: li, start_ms: l.start_ms, end_ms: l.end_ms, text: l.text })
+      continue
+    }
+    let cur: FinderWord[] = []
+    for (let k = l.first_word; k <= l.last_word; k++) {
+      const w = words[k]
+      cur.push(w)
+      const next = k < l.last_word ? words[k + 1] : null
+      const pause = next ? next.start_ms - w.end_ms : Infinity
+      if (!next || (SENTENCE_END.test(w.word.trim()) && cur.length >= 2) || (cur.length >= PHRASE_MIN_WORDS && pause >= PHRASE_PAUSE_MS) || cur.length >= PHRASE_MAX_WORDS) {
+        out.push({ index: out.length, line: li, start_ms: cur[0].start_ms, end_ms: cur[cur.length - 1].end_ms, text: cur.map(x => x.word).join(' ') })
+        cur = []
+      }
+    }
+  }
+  return out
 }
 
 function mmss(ms: number) {
@@ -260,38 +307,45 @@ export function fitLength(clip: FoundClip, lines: TranscriptLine[]): FoundClip |
 
 /**
  * A second look at a picked clip's edges (user, 2026-10-31: clips stopped before the answer or
- * the payoff, or started without the setup). The model sees the clip's lines marked, with
- * REFINE_BEFORE lines before and REFINE_AFTER after, and may move the start earlier for the setup
- * it needs (or later, off the last topic) and the end later for the whole answer / punchline /
- * reaction (or earlier, off a new topic). Its answer is used only when it's inside the lines shown
- * and the clip stays 15 s – 2 min; otherwise, or if the call fails, the clip is kept as it was.
+ * the payoff, or started without the setup). The model sees the clip marked, with REFINE_BEFORE
+ * lines before and REFINE_AFTER after, as short phrases (buildPhrases), and may move the start
+ * earlier for the setup it needs (or later, off the last topic) and the end later for the whole
+ * answer / punchline / reaction (or earlier, off a new topic) — to the phrase, so a clip can end
+ * where a sentence ends inside a long line. Asked at temperature 0 (the same clip got different
+ * edges from one run to the next). Its answer is used only when it's inside the phrases shown and
+ * the clip stays 15 s – 2 min; otherwise, or if the call fails, the clip is kept as it was.
  */
-export async function refineEdges(clip: FoundClip, lines: TranscriptLine[], ask: AskModel): Promise<{ clip: FoundClip; why: string | null }> {
+export async function refineEdges(clip: FoundClip, lines: TranscriptLine[], words: FinderWord[], ask: AskModel): Promise<{ clip: FoundClip; why: string | null }> {
   const first = Math.max(0, clip.start_line - REFINE_BEFORE)
   const last = Math.min(lines.length - 1, clip.end_line + REFINE_AFTER)
-  const shown = lines.slice(first, last + 1)
-    .map(l => `${l.index >= clip.start_line && l.index <= clip.end_line ? '>' : ' '} L${l.index} [${mmss(l.start_ms)}] ${l.text}`).join('\n')
-  const system = `You check where a short clip cut from a video transcript should start and end, so it works on its own as a Reel or Short. Lines are written as "L<number> [mm:ss] text"; the clip's current lines are marked with ">".
+  const phrases = buildPhrases(words, lines, first, last)
+  // The clip as it is: its first and last phrase (its edges are phrase edges: phrases never cross a line)
+  const inClip = (ph: Phrase) => ph.start_ms >= clip.start_ms && ph.end_ms <= clip.end_ms
+  const was = phrases.filter(inClip)
+  if (!was.length) return { clip, why: null }
+  const shown = phrases.map(ph => `${inClip(ph) ? '>' : ' '} P${ph.index} [${mmss(ph.start_ms)}] ${ph.text}`).join('\n')
+  const system = `You check where a short clip cut from a video transcript should start and end, so it works on its own as a Reel or Short. The transcript is written in short phrases, "P<number> [mm:ss] text"; the clip's current phrases are marked with ">". A clip starts at the beginning of a phrase and ends at the end of one, so choose the exact phrase where the thought begins and the one where it is complete — not merely a nearby one.
 - Start: on the line that opens this thought. Move it earlier only for what the clip needs to make sense — the question being answered, the setup of a story or joke, who or what "he", "she", "this" or "that" refers to — not for small talk or the end of the previous topic. Move it later if the first marked lines belong to the previous topic.
 - End: after the thought is complete — the whole answer, the punchline, the payoff of the story, the conclusion, or the reaction to it. Never end on "but…" or "because…", or in the middle of a sentence or a list. Move it earlier if the last marked lines start a new topic.
 - Questions: in interviews and panels someone often asks a question near the end. If the clip would end on a question (in any language, with or without a question mark — e.g. "enduku…?", "kya…?", "cheppandi", "tell me"), either go on to the end of its answer, or end before the question begins. Never end on the question itself.
 - Keep the clip between 15 and 120 seconds (use the mm:ss times).
 - If the edges are already right, return them unchanged.
 ${LANGUAGE_RULES.split('\n')[0]}
-Return ONLY a JSON object, no other text: {"start_line":number,"end_line":number,"why":"what changed and why, max 12 words, in English"}`
+Return ONLY a JSON object, no other text: {"start_phrase":number,"end_phrase":number,"why":"what changed and why, max 12 words, in English"}`
   const user = `Clip: "${clip.title}" — ${clip.summary}\n\nTranscript:\n${shown}`
   try {
-    const text = await ask(system, user)
+    const text = await ask(system, user, { temperature: 0 })
     const m = text.match(/\{[\s\S]*\}/)
     if (!m) return { clip, why: null }
     const r = JSON.parse(m[0]) as Record<string, unknown>
-    const s = Number(r.start_line), e = Number(r.end_line)
-    if (!Number.isInteger(s) || !Number.isInteger(e) || s < first || e > last || e < s) return { clip, why: null }
-    if (s === clip.start_line && e === clip.end_line) return { clip, why: null }
-    const length = lines[e].end_ms - lines[s].start_ms
+    const s = Number(r.start_phrase), e = Number(r.end_phrase)
+    if (!Number.isInteger(s) || !Number.isInteger(e) || s < 0 || e >= phrases.length || e < s) return { clip, why: null }
+    const a = phrases[s], b = phrases[e]
+    if (a === was[0] && b === was[was.length - 1]) return { clip, why: null }
+    const length = b.end_ms - a.start_ms
     if (length < MIN_CLIP_MS || length > HARD_MAX_CLIP_MS) return { clip, why: null }
     return {
-      clip: { ...clip, start_line: s, end_line: e, start_ms: lines[s].start_ms, end_ms: lines[e].end_ms },
+      clip: { ...clip, start_line: a.line, end_line: b.line, start_ms: a.start_ms, end_ms: b.end_ms },
       why: typeof r.why === 'string' ? r.why.slice(0, 120) : '',
     }
   } catch {
@@ -302,19 +356,23 @@ Return ONLY a JSON object, no other text: {"start_line":number,"end_line":number
 /**
  * Room around the speech (user, 2026-10-31: clips began on the first syllable and stopped on the
  * last one): up to LEAD_MS before the first word and TAIL_MS after the last, taken only from the
- * silence there — never reaching the neighbouring words — and within the video.
+ * silence there — never reaching the neighbouring words — and within the video. The neighbours are
+ * the words right before and after the clip's own edges (an edge can be inside a line).
  */
-export function withRoom(clip: FoundClip, lines: TranscriptLine[], durationMs: number): FoundClip {
-  const before = clip.start_line > 0 ? lines[clip.start_line].start_ms - lines[clip.start_line - 1].end_ms : lines[clip.start_line].start_ms
-  const after = clip.end_line + 1 < lines.length ? lines[clip.end_line + 1].start_ms - lines[clip.end_line].end_ms : durationMs - lines[clip.end_line].end_ms
+export function withRoom(clip: FoundClip, words: FinderWord[], durationMs: number): FoundClip {
+  const startMs = clip.start_ms, endMs = clip.end_ms
+  const prev = words.filter(w => w.end_ms <= startMs).reduce((m, w) => Math.max(m, w.end_ms), -Infinity)
+  const next = words.filter(w => w.start_ms >= endMs).reduce((m, w) => Math.min(m, w.start_ms), Infinity)
+  const before = Number.isFinite(prev) ? startMs - prev : startMs
+  const after = Number.isFinite(next) ? next - endMs : durationMs - endMs
   // (never past the 2-minute cap: what's left under it is shared, the lead first)
-  const spare = Math.max(0, HARD_MAX_CLIP_MS - (lines[clip.end_line].end_ms - lines[clip.start_line].start_ms))
+  const spare = Math.max(0, HARD_MAX_CLIP_MS - (endMs - startMs))
   const lead = Math.max(0, Math.min(LEAD_MS, before - EDGE_KEEP_MS, spare))
   const tail = Math.max(0, Math.min(TAIL_MS, after - EDGE_KEEP_MS, spare - lead))
   return {
     ...clip,
-    start_ms: Math.max(0, lines[clip.start_line].start_ms - lead),
-    end_ms: Math.min(Math.max(durationMs, lines[clip.end_line].end_ms), lines[clip.end_line].end_ms + tail),
+    start_ms: Math.max(0, startMs - lead),
+    end_ms: Math.min(Math.max(durationMs, endMs), endMs + tail),
   }
 }
 
@@ -419,12 +477,12 @@ export async function findClips(opts: {
   const picked = search ? primary : [...primary, ...merged.filter(c => !primary.includes(c)).slice(0, 2)]
   const toCheck = opts.refine === false ? [] : picked.slice(0, search ? REFINE_MAX : picked.length)
   const checked = await mapLimit(toCheck, MAX_PARALLEL, async c => {
-    const r = await refineEdges(c, lines, opts.ask)
+    const r = await refineEdges(c, lines, opts.words, opts.ask)
     if (r.why !== null) log(`edges ${mmss(c.start_ms)}–${mmss(c.end_ms)} → ${mmss(r.clip.start_ms)}–${mmss(r.clip.end_ms)}: ${r.why}`)
     return r.clip
   })
   const all = [...checked, ...picked.slice(toCheck.length)]
   const kept = new Set(dedupe(all.filter(c => !repeats(c))))
   const out = all.filter(c => kept.has(c)).slice(0, search ? undefined : limit)
-  return out.map(c => withRoom(c, lines, opts.durationMs)).sort((a, b) => b.score - a.score)
+  return out.map(c => withRoom(c, opts.words, opts.durationMs)).sort((a, b) => b.score - a.score)
 }
