@@ -310,9 +310,9 @@ async function claimNow(p: Pool, mayLong: boolean, mayProxy: boolean): Promise<J
         -- A whole-video reading (AI edit: many minutes for a long video) waits for the quick jobs that
         -- came after it — a clip's own captions (manual edit), renders, uploads — so they never queue
         -- behind it (COALESCE: a job without the field must sort as false, not as NULL, which goes last).
-        -- Then the top plan's exports (payload.priority: "priority rendering"), then the person with
-        -- fewest of that kind running, then the oldest.
-        ORDER BY (type = 'proxy') ASC, ${reading} ASC, (type = 'render' AND payload @> '{"priority":true}'::jsonb) DESC,
+        -- Then the top plan's exports and captions (payload.priority: "priority rendering"), then the
+        -- person with fewest of that kind running, then the oldest.
+        ORDER BY (type = 'proxy') ASC, ${reading} ASC, (type IN ('render', 'transcribe') AND payload @> '{"priority":true}'::jsonb) DESC,
           ${theirs} ASC, created_at ASC LIMIT 1
         FOR UPDATE OF jobs SKIP LOCKED
       ), claimed AS (

@@ -32,6 +32,8 @@ export interface TranscribeJobPayload {
   max_bytes?: number
   // "Captions on" for a clip: only parts without words need reading (none, if the video was read in full)
   fill_gaps?: boolean
+  // The top plan: first in the job queue and in the shared Google line (lib/googleBudget.ts)
+  priority?: boolean
 }
 
 /** Follow the people marked in a clip (jobs/track_subjects.ts): its clip_subjects rows that are 'queued' */
