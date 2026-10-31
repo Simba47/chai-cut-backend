@@ -14,7 +14,7 @@ import { r2, R2_BUCKET, r2DownloadToFile, r2SignedUrl, r2UploadFile } from '../r
 import { aiProvider, askGemini, dropCode, isNetworkDrop, retryAfterMs, retryDelayMs } from '../lib/gemini.js'
 import { sttRank, sttTurn, waitForStt, wavSeconds, type SttSide } from '../lib/googleBudget.js'
 import { runawayReason, trimRunaway } from '../lib/transcriptGuard.js'
-import { skippedGaps, rereadWindows, wordsInGaps, REREAD_MIN_SOUND_SEC } from '../lib/skippedSpeech.js'
+import { skippedGaps, rereadWindows, wordsInGaps, REREAD_MIN_SOUND_SEC, REREAD_ROUNDS, REREAD_ROUND_MIN_WORDS } from '../lib/skippedSpeech.js'
 import { convertWordForWord } from '../lib/wordConvert.js'
 import db from '../db.js'
 import type { Job, TranscribeJobPayload } from '../types.js'
@@ -342,8 +342,9 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
           await tx`DELETE FROM transcripts WHERE video_id = ${payload.video_id}`
         }
         // whole_video: the whole video was read, so nothing needs to read it again (see ai_edit)
+        // (gaps_filled_at: read with the skipped-speech re-read, nothing to fill later)
         const [inserted] = await tx`
-          INSERT INTO transcripts (video_id, language, whole_video) VALUES (${payload.video_id}, ${sarvamResult.language_code}, ${!isClipJob}) RETURNING id
+          INSERT INTO transcripts (video_id, language, whole_video, gaps_filled_at) VALUES (${payload.video_id}, ${sarvamResult.language_code}, ${!isClipJob}, now()) RETURNING id
         `
         if (!inserted) throw new Error('Failed to insert transcript row')
         transcriptId = inserted.id as string
@@ -1202,13 +1203,29 @@ export async function transcribeAudio(audioPath: string, videoId?: string, langu
 
 // ── Skipped speech ─────────────────────────────────────────────────────────────
 // (lib/skippedSpeech.ts plans it.) Gaps of 3 s+ with sound in them, read again — each stretch on its
-// own, never stitched together (stitched, Gemini skipped 9 of 13 again) — a few at a time. A stretch
-// that fails, or reads as a stuck loop, adds nothing: the piece keeps what it had.
+// own, never stitched together (stitched, Gemini skipped 9 of 13 again) — a few at a time, in rounds
+// while they still bring speech back. A stretch that fails, or reads as a stuck loop, adds nothing:
+// the piece keeps what it had.
 const REREAD_AT_ONCE = 3
 
 async function skippedSpeech(
   chunkPathHint: string, audioPath: string, chunkStartSec: number, chunkSec: number,
   words: SarvamWord[], lang: string | undefined, label: string, signal?: AbortSignal,
+): Promise<SarvamWord[]> {
+  // Round after round on what is still empty (REREAD_ROUNDS), while a round still brings speech back
+  const back: SarvamWord[] = []
+  for (let round = 1; round <= REREAD_ROUNDS; round++) {
+    const got = await skippedSpeechRound(chunkPathHint, audioPath, chunkStartSec, chunkSec, [...words, ...back], lang,
+      round > 1 ? `${label} (round ${round})` : label, round, signal)
+    back.push(...got)
+    if (got.length < REREAD_ROUND_MIN_WORDS) break
+  }
+  return back
+}
+
+async function skippedSpeechRound(
+  chunkPathHint: string, audioPath: string, chunkStartSec: number, chunkSec: number,
+  words: SarvamWord[], lang: string | undefined, label: string, round: number, signal?: AbortSignal,
 ): Promise<SarvamWord[]> {
   const gaps = skippedGaps(words, chunkSec)
   if (!gaps.length) return []
@@ -1224,7 +1241,7 @@ async function skippedSpeech(
       const n = next++
       const win = windows[n]
       signal?.throwIfAborted()
-      const path = chunkPathHint.replace('.wav', `_re${n}.wav`)
+      const path = chunkPathHint.replace('.wav', `_re${round}-${n}.wav`)
       try {
         // (-ss before -i: a WAV seeks exactly, without reading the audio before it)
         await execFileAsync('ffmpeg', ['-ss', String(chunkStartSec + win.from), '-t', String(win.to - win.from), '-i', audioPath,
@@ -1234,7 +1251,7 @@ async function skippedSpeech(
         const read = await geminiTranscribeChunk(buf, lang)
         if (runawayReason(read, win.to - win.from)) continue
         // (its own speaker labels: they only mean something within this one reading)
-        found[n] = wordsInGaps(win, read).map(w => ({ ...w, speaker: w.speaker ? `re${n}:${w.speaker}` : undefined }))
+        found[n] = wordsInGaps(win, read).map(w => ({ ...w, speaker: w.speaker ? `re${round}.${n}:${w.speaker}` : undefined }))
       } catch (e) {
         if (signal?.aborted) throw e
         console.warn(`[gemini] ${label}: reading a skipped stretch again failed, kept as it was:`, e instanceof Error ? e.message : e)
@@ -1248,6 +1265,79 @@ async function skippedSpeech(
   const gapSec = windows.reduce((t, w) => t + w.gaps.reduce((u, [a, b]) => u + b - a, 0), 0)
   console.log(`[gemini] ${label}: ${gapSec.toFixed(0)} s skipped in ${windows.length} stretch(es) read again → +${back.length} words`)
   return back
+}
+
+/**
+ * A video's transcript read before the skipped-speech re-read (gaps_filled_at NULL; the caller has found
+ * it covers the whole video — by its whole_video flag or by its words, as Make my clips judges it): its gaps of
+ * speech are read now, the same way (skippedSpeech, 5-minute piece by piece, from the audio kept in
+ * storage or else the video), spelled like the rest, and added to it. Make my clips calls it the
+ * first time it uses such a transcript (user, 2026-10-31: "when first used" — quota only for videos
+ * that are used). Done once per transcript: the first caller marks it; if the reading fails or is
+ * stopped the mark comes off and the transcript is as it was. Returns the words added (0: nothing to
+ * fill, or another job has it).
+ */
+export async function fillTranscriptGaps(videoId: string, signal?: AbortSignal): Promise<number> {
+  const [t] = await db<{ id: string; language: string | null }[]>`
+    UPDATE transcripts SET gaps_filled_at = now()
+    WHERE id = (SELECT id FROM transcripts WHERE video_id = ${videoId} ORDER BY created_at DESC LIMIT 1)
+      AND gaps_filled_at IS NULL
+    RETURNING id, language
+  `
+  if (!t) return 0
+  const t0 = Date.now()
+  const tmp = await mkdtemp(join(tmpdir(), 'fillgaps-'))
+  try {
+    const [v] = await db<{ storage_path: string | null }[]>`SELECT storage_path FROM videos WHERE id = ${videoId}`
+    if (!v?.storage_path) throw new Error('the video has no file')
+    // The audio: kept in storage (FLAC) since it was read, else from the video itself
+    const audioPath = join(tmp, 'audio.wav')
+    const toWav = (input: string) => execFileAsync('ffmpeg', ['-i', input, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', audioPath], { signal })
+    try {
+      const flac = join(tmp, 'kept.flac')
+      await writeFile(flac, await r2Download(audioKeyFor(v.storage_path)))
+      await toWav(flac)
+    } catch (e) {
+      if (signal?.aborted) throw e
+      await toWav(await r2SignedUrl(v.storage_path, 4 * 3600))
+    }
+    const { stdout } = await execFileAsync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', audioPath])
+    const totalSec = parseFloat(stdout.trim())
+    const rows = await db<{ start_ms: number; end_ms: number }[]>`SELECT start_ms, end_ms FROM transcript_words WHERE transcript_id = ${t.id} ORDER BY start_ms`
+    // Read in its own language, as it was (English: automatic)
+    const lang = t.language && t.language !== 'unknown' && !t.language.startsWith('en') ? t.language : undefined
+    const pieces = Math.max(1, Math.ceil(totalSec / GEMINI_CHUNK_SEC))
+    const found: SarvamWord[] = []
+    for (let i = 0; i < pieces; i++) {
+      const from = i * GEMINI_CHUNK_SEC, sec = Math.min(GEMINI_CHUNK_SEC, totalSec - from)
+      // (a word running on from the piece before counts: no gap there)
+      const inPiece = rows.filter(r => r.end_ms > from * 1000 && r.start_ms < (from + sec) * 1000)
+        .map(r => ({ word: '', start: r.start_ms / 1000 - from, end: r.end_ms / 1000 - from }))
+      const back = await skippedSpeech(join(tmp, `piece${i}.wav`), audioPath, from, sec, inPiece, lang, `filling ${videoId} piece ${i + 1}/${pieces}`, signal)
+      found.push(...back.map(w => ({ ...w, start: w.start + from, end: w.end + from, speaker: w.speaker ? `f${i}:${w.speaker}` : undefined })))
+    }
+    if (found.length) {
+      // Spelled like the rest of the transcript: in its own script, and in English letters
+      const code = t.language && t.language !== 'unknown' ? t.language : 'en-IN'
+      const [roman, native] = await Promise.all([transliterateToRoman(found, code), toNativeScript(found, code)])
+      await db.begin(async tx => {
+        const add = found.map((w, k) => ({
+          transcript_id: t.id, word: native[k] ?? w.word, word_roman: roman[k] ?? null,
+          start_ms: Math.round(w.start * 1000), end_ms: Math.round(w.end * 1000), speaker_id: w.speaker ?? null, confidence: null,
+        }))
+        for (let i = 0; i < add.length; i += 500) await tx`INSERT INTO transcript_words ${tx(add.slice(i, i + 500))}`
+        // (the editor's "since" check sees new words)
+        await tx`UPDATE transcripts SET created_at = now() WHERE id = ${t.id}`
+      })
+    }
+    console.log(`[transcribe] video ${videoId}: skipped speech filled in — +${found.length} words in ${((Date.now() - t0) / 1000).toFixed(0)} s`)
+    return found.length
+  } catch (e) {
+    await db`UPDATE transcripts SET gaps_filled_at = NULL WHERE id = ${t.id}`.catch(() => {})
+    throw e
+  } finally {
+    await rm(tmp, { recursive: true, force: true }).catch(() => {})
+  }
 }
 
 // ── English re-pass for gaps ──────────────────────────────────────────────────
