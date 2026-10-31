@@ -12,6 +12,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { GoogleAuth } from 'google-auth-library'
 import { r2, R2_BUCKET, r2DownloadToFile, r2SignedUrl, r2UploadFile } from '../r2.js'
 import { aiProvider, askGemini, dropCode, isNetworkDrop, retryAfterMs, retryDelayMs } from '../lib/gemini.js'
+import { sttRank, sttTurn, waitForStt, wavSeconds } from '../lib/googleBudget.js'
 import { runawayReason, trimRunaway } from '../lib/transcriptGuard.js'
 import { convertWordForWord } from '../lib/wordConvert.js'
 import db from '../db.js'
@@ -102,6 +103,13 @@ export const READING_STOPPED = 'Stopped by the user'
 export async function handleTranscribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgress) {
   const raw = job.payload
   const p = (typeof raw === 'string' ? JSON.parse(raw) : raw) as TranscribeJobPayload
+  // Its place in the shared Google line (lib/googleBudget.ts): a clip's captions (someone waits in
+  // the editor) before a whole-video reading, the top plan first within each
+  const turn = { rank: sttRank(!p.clip_id, p.priority === true), jobId: /^[0-9a-f-]{36}$/i.test(job.id) ? job.id : undefined }
+  return sttTurn.run(turn, () => runTranscribeJob(job, p, signal, onRead))
+}
+
+async function runTranscribeJob(job: Job, p: TranscribeJobPayload, signal?: AbortSignal, onRead?: ReadProgress) {
   const stoppable = !!p.transcribe_full && !p.clip_id && !p.is_retranscribe && /^[0-9a-f-]{36}$/i.test(job.id)
   if (!stoppable) return transcribeJob(job, signal, onRead)
   const stop = new AbortController()
@@ -735,7 +743,7 @@ let sttLimit = STT_MAX_IN_FLIGHT
 let sttOpen = 0
 let sttLastCut = 0
 const sttWaiting: (() => void)[] = []
-async function sttTurn<T>(send: () => Promise<T>): Promise<T> {
+async function sttGate<T>(send: () => Promise<T>): Promise<T> {
   while (sttOpen >= Math.max(1, Math.floor(sttLimit))) await new Promise<void>(r => sttWaiting.push(r))
   sttOpen++
   try {
@@ -773,8 +781,10 @@ async function vertexTranscribeChunk(buf: Buffer, languageCode?: string): Promis
   for (let attempt = 1; ; attempt++) {
     let res: Response
     try {
+      // Its turn in the shared Google line, and its share of the budget (each try is sent anew)
+      await waitForStt(wavSeconds(buf))
       const token = await auth.getAccessToken()
-      res = await sttTurn(() => fetchWithTimeout(url, {
+      res = await sttGate(() => fetchWithTimeout(url, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'x-goog-user-project': VERTEX_PROJECT!, 'Content-Type': 'application/json' },
         body,
@@ -834,6 +844,8 @@ async function geminiTranscribeChunk(buf: Buffer, languageCode?: string): Promis
     await new Promise(r => setTimeout(r, delayMs))
   }
   for (let attempt = 1; ; attempt++) {
+    // Its turn in the shared Google line, and its share of the budget (each try is sent anew)
+    await waitForStt(wavSeconds(buf))
     let file: { name: string; uri: string }
     try { file = await geminiUploadAudio(buf) } catch (e) { await dropped(e, attempt); continue }
     try {
