@@ -1501,7 +1501,7 @@ type Word = { word: string; start_ms: number; end_ms: number; speaker_id?: strin
 // Gemini picks the clips: the numbered-line, windowed, scored method shared with the app's
 // "Best moments" (src/lib/clipFinder.ts)
 async function selectHighlights(words: Word[], clipCount: number, durationMs: number, exclude: Array<[number, number]> = []): Promise<FoundClip[]> {
-  const ask = (system: string, user: string) => askGemini(user, { system })
+  const ask = (system: string, user: string, o?: { temperature?: number }) => askGemini(user, { system, ...o })
   // Enough candidates per window that a short video (one window) can still fill the request
   const windowCount = Math.max(1, Math.ceil(durationMs / (9 * 60_000)))
   // More candidates when earlier batches already took some moments
