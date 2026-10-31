@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { r2DownloadToFile } from '../r2.js'
 import db from '../db.js'
 import type { Job, AiEditJobPayload } from '../types.js'
-import { handleTranscribeJob } from './transcribe.js'
+import { handleTranscribeJob, fillTranscriptGaps } from './transcribe.js'
 import { findClips, type FoundClip } from '../lib/clipFinder.js'
 import { askGemini } from '../lib/gemini.js'
 import { findLoops } from '../lib/transcriptGuard.js'
@@ -1678,6 +1678,15 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
     const loops = complete() ? findLoops(words) : []
     if (complete() && !loops.length) {
       console.log(`[ai_edit] Using the saved transcript of ${video_id} (${words.length} words): nothing is sent for captions`)
+      // Read before the skipped-speech re-read: the speech it skipped is read once now, so the clips
+      // see every setup and answer (and their captions have every word). If that fails, the clips are
+      // made from the transcript as it is
+      const added = await fillTranscriptGaps(video_id, signal).catch(e => {
+        if (signal?.aborted) throw e
+        console.warn(`[ai_edit] filling the skipped speech of ${video_id} failed, the transcript is used as it is:`, e instanceof Error ? e.message : e)
+        return 0
+      })
+      if (added) ({ words, whole } = await loadWords(video_id))
     } else {
       console.log(loops.length
         ? `[ai_edit] The saved transcript of ${video_id} has a stuck reading (${loops.reduce((n, l) => n + l.words * l.copies, 0)} of ${words.length} words are loops) — reading the video again`
