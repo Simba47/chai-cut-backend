@@ -24,6 +24,13 @@ export const REREAD_JOIN_SEC = 6
 export const REREAD_PAD_SEC = 0.3
 /** At most this many stretches per piece (the ones with the most gap in them) */
 export const REREAD_MAX = 16
+/**
+ * Gemini skips inside a stretch read again too (an 11-minute interview: the first round brought back
+ * 516 words, a second 260 more), so what is still empty is read again — at most this many rounds,
+ * stopping when a round brings back fewer than REREAD_ROUND_MIN_WORDS
+ */
+export const REREAD_ROUNDS = 3
+export const REREAD_ROUND_MIN_WORDS = 5
 
 type Timed = { start: number; end: number }
 export type Gap = [number, number]

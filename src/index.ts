@@ -40,6 +40,10 @@ async function runMigrations() {
   // The transcript comes from reading the whole video (not just a clip of it): Make my clips,
   // Best moments and Ask AI then use it as it is and never send the video for captions again
   await db`ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS whole_video BOOLEAN NOT NULL DEFAULT false`
+  // When the speech Gemini skipped was read again (transcribe.ts fillTranscriptGaps): set for every
+  // reading made since that re-read was part of reading (2026-10-31); NULL on older ones, filled the
+  // first time Make my clips uses them
+  await db`ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS gaps_filled_at timestamptz`
   // Captions on/off per clip. Turning captions off used to delete the style, and the editor then
   // switched them back on for any clip whose video has a transcript. Existing styles count as on.
   await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT true`
