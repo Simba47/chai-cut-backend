@@ -14,6 +14,7 @@ import { r2, R2_BUCKET, r2DownloadToFile, r2SignedUrl, r2UploadFile } from '../r
 import { aiProvider, askGemini, dropCode, isNetworkDrop, retryAfterMs, retryDelayMs } from '../lib/gemini.js'
 import { sttRank, sttTurn, waitForStt, wavSeconds } from '../lib/googleBudget.js'
 import { runawayReason, trimRunaway } from '../lib/transcriptGuard.js'
+import { skippedGaps, rereadWindows, wordsInGaps, REREAD_MIN_SOUND_SEC } from '../lib/skippedSpeech.js'
 import { convertWordForWord } from '../lib/wordConvert.js'
 import db from '../db.js'
 import type { Job, TranscribeJobPayload } from '../types.js'
@@ -987,6 +988,14 @@ export async function transcribeAudio(audioPath: string, videoId?: string, langu
         words = [...words, ...extra].sort((a, b) => a.start - b.start)
       }
     }
+    // Gemini also skips stretches of speech inside a piece, at any length (lib/skippedSpeech.ts): most
+    // are English sentences in Telugu or Hindi talk, which the English pass above brings back; each gap
+    // still empty (with sound) is read again on its own, in the same language. (Not the language samples)
+    if (!tag.startsWith('probe')) {
+      const chunkSec = Math.min(durSec, Math.max(0, totalSec - startSec))
+      const back = await skippedSpeech(chunkPath, audioPath, startSec, chunkSec, words, lang, label, signal)
+      if (back.length) words = [...words, ...back].sort((a, b) => a.start - b.start)
+    }
     // Speaker labels are only consistent within one request, so scope them to the chunk
     return words.map(w => ({ ...w, start: w.start + startSec, end: w.end + startSec, speaker: w.speaker ? `c${tag}:${w.speaker}` : undefined }))
   }
@@ -1132,6 +1141,56 @@ export async function transcribeAudio(audioPath: string, videoId?: string, langu
   }
 
   return { language_code: language, words: allWords }
+}
+
+// ── Skipped speech ─────────────────────────────────────────────────────────────
+// (lib/skippedSpeech.ts plans it.) Gaps of 3 s+ with sound in them, read again — each stretch on its
+// own, never stitched together (stitched, Gemini skipped 9 of 13 again) — a few at a time. A stretch
+// that fails, or reads as a stuck loop, adds nothing: the piece keeps what it had.
+const REREAD_AT_ONCE = 3
+
+async function skippedSpeech(
+  chunkPathHint: string, audioPath: string, chunkStartSec: number, chunkSec: number,
+  words: SarvamWord[], lang: string | undefined, label: string, signal?: AbortSignal,
+): Promise<SarvamWord[]> {
+  const gaps = skippedGaps(words, chunkSec)
+  if (!gaps.length) return []
+  // Pauses aren't read again: only gaps with sound in them (on an error finding the silences, all of them)
+  const voiced = await voicedParts(audioPath, chunkStartSec, chunkSec, gaps)
+  const sound = (a: number, b: number) => voiced.reduce((t, [x, y]) => t + Math.max(0, Math.min(b, y) - Math.max(a, x)), 0)
+  const windows = rereadWindows(gaps.filter(([a, b]) => sound(a, b) >= REREAD_MIN_SOUND_SEC), chunkSec)
+  if (!windows.length) return []
+  const found: SarvamWord[][] = windows.map(() => [])
+  let next = 0
+  const readNext = async () => {
+    while (next < windows.length) {
+      const n = next++
+      const win = windows[n]
+      signal?.throwIfAborted()
+      const path = chunkPathHint.replace('.wav', `_re${n}.wav`)
+      try {
+        // (-ss before -i: a WAV seeks exactly, without reading the audio before it)
+        await execFileAsync('ffmpeg', ['-ss', String(chunkStartSec + win.from), '-t', String(win.to - win.from), '-i', audioPath,
+          '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', '-y', path])
+        const buf = await readFile(path)
+        if (buf.length < 16_000) continue
+        const read = await geminiTranscribeChunk(buf, lang)
+        if (runawayReason(read, win.to - win.from)) continue
+        // (its own speaker labels: they only mean something within this one reading)
+        found[n] = wordsInGaps(win, read).map(w => ({ ...w, speaker: w.speaker ? `re${n}:${w.speaker}` : undefined }))
+      } catch (e) {
+        if (signal?.aborted) throw e
+        console.warn(`[gemini] ${label}: reading a skipped stretch again failed, kept as it was:`, e instanceof Error ? e.message : e)
+      } finally {
+        await unlink(path).catch(() => {})
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(REREAD_AT_ONCE, windows.length) }, readNext))
+  const back = found.flat()
+  const gapSec = windows.reduce((t, w) => t + w.gaps.reduce((u, [a, b]) => u + b - a, 0), 0)
+  console.log(`[gemini] ${label}: ${gapSec.toFixed(0)} s skipped in ${windows.length} stretch(es) read again → +${back.length} words`)
+  return back
 }
 
 // ── English re-pass for gaps ──────────────────────────────────────────────────
