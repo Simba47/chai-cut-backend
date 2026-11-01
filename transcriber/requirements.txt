@@ -1,0 +1,9 @@
+# The transcriber service (transcriber/). Not used by the Node worker.
+torch
+torchaudio
+transformers>=5
+huggingface_hub
+sentencepiece
+soundfile
+silero-vad
+numpy
