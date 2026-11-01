@@ -20,16 +20,18 @@ secret = modal.Secret.from_name("shortcut-transcriber")
 def _download_models():
     # Into the image at build time, so a cold start does not download ~10 GB
     from huggingface_hub import snapshot_download
-    snapshot_download("bodhan-ai/indic-transcribe-core")
-    snapshot_download("ARTPARK-IISc/SraVaani-1.0")
+    from transcriber.pipeline import TEXT_MODEL, TIME_MODELS
+    snapshot_download(TEXT_MODEL)
+    for name, revision in TIME_MODELS.values():
+        snapshot_download(name, revision=revision, ignore_patterns=["*.msgpack", "*.h5"])
 
 
 gpu_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "libsndfile1")
     .pip_install_from_requirements("transcriber/requirements.txt")
+    .add_local_python_source("transcriber", copy=True)
     .run_function(_download_models, secrets=[secret])
-    .add_local_python_source("transcriber")
 )
 web_image = modal.Image.debian_slim(python_version="3.12").pip_install("fastapi[standard]")
 

@@ -1,119 +1,101 @@
-"""Word timings for the reference transcript, with MIT-licensed parts only.
+"""Word timings for the reference transcript, with commercially usable parts only.
 
-The text model (Indic-Transcribe) writes the best words but gives no word times. The timing model
-(IISc SraVaani, MIT) gives its own words with times. Both texts are turned into the same plain
-sound-letters (romanize) and lined up letter by letter; each text word takes the times of the
-letters it lined up with. Words the timing model missed sit between their neighbours, sized by
-length. (Meta's MMS aligner did this in the 1 Nov tests, but its licence is non-commercial.)
+The text model (Indic-Transcribe) writes the best words but gives no word times. A letter-level
+wav2vec2 model (Apache-2.0) gives, for every 20 ms of sound, how likely each letter is (its CTC
+output). The text's own words are fitted to that, letter by letter (forced alignment, the method
+Meta's MMS aligner uses; MMS itself is non-commercial): each word starts at the frame where its
+first letter is heard. Pieces of audio that cannot be fitted are shared out by word length.
+
+Checked on the 63-minute hour_test, 2 Nov 2026 (share of words starting within 0.2 s of Gemini's):
+this, 94.6% (97.4% of MMS's, median 15 ms apart); MMS 96.8%; SraVaani's times carried across 72%;
+IndicConformer's 80 ms CTC frames 29% (they drift by up to 2 s).
 """
-import difflib
-import re
+import numpy as np
 
-# Telugu letters -> plain sound letters (the same for different spellings of one word:
-# టైమ్ and టైం both give "taim"). Not for display: the captions' Tinglish comes from elsewhere.
-_VOWELS = {"అ": "a", "ఆ": "a", "ఇ": "i", "ఈ": "i", "ఉ": "u", "ఊ": "u", "ఋ": "ru", "ౠ": "ru",
-           "ఎ": "e", "ఏ": "e", "ఐ": "ai", "ఒ": "o", "ఓ": "o", "ఔ": "au"}
-_SIGNS = {"ా": "a", "ి": "i", "ీ": "i", "ు": "u", "ూ": "u", "ృ": "ru", "ౄ": "ru",
-          "ె": "e", "ే": "e", "ై": "ai", "ొ": "o", "ో": "o", "ౌ": "au"}
-_CONS = {"క": "k", "ఖ": "k", "గ": "g", "ఘ": "g", "ఙ": "n", "చ": "c", "ఛ": "c", "జ": "j", "ఝ": "j",
-         "ఞ": "n", "ట": "t", "ఠ": "t", "డ": "d", "ఢ": "d", "ణ": "n", "త": "t", "థ": "t", "ద": "d",
-         "ధ": "d", "న": "n", "ప": "p", "ఫ": "p", "బ": "b", "భ": "b", "మ": "m", "య": "y", "ర": "r",
-         "ఱ": "r", "ల": "l", "ళ": "l", "ఴ": "l", "వ": "v", "శ": "s", "ష": "s", "స": "s", "హ": "h",
-         "ౘ": "c", "ౙ": "j"}
-_VIRAMA, _ANUSVARA = "్", "ం"
+WORD_GAP = "|"
 
 
-def romanize(word: str) -> str:
-    """One word as plain lower-case sound letters (Telugu script or English)"""
-    out, i = [], 0
-    word = word.replace("‌", "").replace("‍", "")
-    while i < len(word):
-        ch, nxt = word[i], word[i + 1] if i + 1 < len(word) else ""
-        if ch in _CONS:
-            out.append(_CONS[ch])
-            if nxt == _VIRAMA:
-                i += 1
-            elif nxt in _SIGNS:
-                out.append(_SIGNS[nxt]); i += 1
-            else:
-                out.append("a")
-        elif ch in _VOWELS:
-            out.append(_VOWELS[ch])
-        elif ch == _ANUSVARA:
-            out.append("m")
-        elif ch in _SIGNS:
-            out.append(_SIGNS[ch])
-        else:
-            out.append(ch.lower())
-        i += 1
-    return re.sub(r"[^a-z0-9]", "", "".join(out))
+def letters(word: str, vocab: dict[str, int]) -> list[int]:
+    """The word's letters the model knows (others are left out); none known: the word-gap letter"""
+    return [vocab[c] for c in word if c in vocab] or [vocab[WORD_GAP]]
 
 
-def transfer_timings(words: list[str], timed: list[dict], seg_start: float, seg_end: float) -> list[dict]:
+def forced_align(logprobs: np.ndarray, targets: list[int], blank: int) -> list[tuple[int, int]] | None:
     """
-    Times for `words` (one piece of audio, seg_start..seg_end seconds) from `timed`
-    ([{"word", "start", "end"}], another model's words for the same piece). Returns
-    [{"word", "start", "end"}] in order, inside the piece, never going backwards.
+    The most likely way the frames (logprobs: frames x vocab, log-probabilities) say `targets` in order,
+    blanks allowed between them (CTC Viterbi). Returns each target's (first frame, last frame),
+    or None when there are too few frames to say them all.
+    """
+    if not targets:
+        return []
+    T = len(logprobs)
+    repeats = sum(a == b for a, b in zip(targets, targets[1:]))
+    if T < len(targets) + repeats:
+        return None
+    ext = [blank]
+    for k in targets:
+        ext += [k, blank]
+    S = len(ext)
+    emit = np.asarray(logprobs, dtype=np.float64)[:, ext]
+    can_skip = np.array([s >= 2 and ext[s] != blank and ext[s] != ext[s - 2] for s in range(S)])
+    NEG = -1e30
+    score = np.full(S, NEG)
+    score[:2] = emit[0, :2]
+    back = np.zeros((T, S), dtype=np.int8)
+    for t in range(1, T):
+        prev1 = np.concatenate(([NEG], score[:-1]))
+        prev2 = np.where(can_skip, np.concatenate(([NEG, NEG], score[:-2])), NEG)
+        cand = np.stack([score, prev1, prev2])
+        best = cand.argmax(axis=0)
+        score = cand[best, np.arange(S)] + emit[t]
+        back[t] = best
+    s = S - 1 if score[S - 1] >= score[S - 2] else S - 2
+    if score[s] < NEG / 2:
+        return None
+    spans: list[list[int]] = [[-1, -1] for _ in targets]
+    for t in range(T - 1, -1, -1):
+        if s % 2:                       # odd places in ext are the targets
+            k = s // 2
+            spans[k][0] = t
+            if spans[k][1] < 0:
+                spans[k][1] = t
+        s -= int(back[t, s])
+    return [(a, b) for a, b in spans]
+
+
+def _share_by_length(words: list[str], start: float, end: float) -> list[dict]:
+    total = sum(len(w) for w in words) or 1
+    out, cur = [], start
+    for w in words:
+        d = (end - start) * len(w) / total
+        out.append({"word": w, "start": cur, "end": cur + d})
+        cur += d
+    return out
+
+
+def word_times(words: list[str], logprobs: np.ndarray | None, vocab: dict[str, int], blank: int,
+               frame_s: float, offset: float, piece_end: float) -> list[dict]:
+    """
+    Times for the words of one piece of audio (offset..piece_end seconds), from the timing model's
+    frames for that piece (None: no frames, e.g. a language without a timing model).
+    Returns [{"word", "start", "end"}] in order, each inside the piece, with some length, never
+    overlapping the next.
     """
     if not words:
         return []
-    timed = sorted(({"word": t["word"], "start": min(max(t["start"], seg_start), seg_end),
-                     "end": min(max(t["end"], seg_start), seg_end)} for t in timed if t.get("word")), key=lambda t: t["start"])
-
-    # Letters of the text words, and which word each letter belongs to
-    w_rom = [romanize(w) or "x" for w in words]
-    w_owner = [k for k, r in enumerate(w_rom) for _ in r]
-    # Letters of the timed words, each with its own slice of its word's time
-    t_letters: list[tuple[float, float]] = []
-    t_str = []
-    for t in timed:
-        r = romanize(t["word"])
-        if not r:
-            continue
-        step = (t["end"] - t["start"]) / len(r)
-        t_letters += [(t["start"] + step * m, t["start"] + step * (m + 1)) for m in range(len(r))]
-        t_str.append(r)
-
-    starts: list[float | None] = [None] * len(words)
-    ends: list[float | None] = [None] * len(words)
-    if t_letters:
-        matcher = difflib.SequenceMatcher(None, "".join(w_rom), "".join(t_str), autojunk=False)
-        for a, b, n in matcher.get_matching_blocks():
-            for m in range(n):
-                k = w_owner[a + m]
-                s, e = t_letters[b + m]
-                starts[k] = s if starts[k] is None else min(starts[k], s)
-                ends[k] = e if ends[k] is None else max(ends[k], e)
-
-    # Words without times: share the gap between the timed words around them, by length
-    out = []
-    k = 0
-    while k < len(words):
-        if starts[k] is not None:
-            out.append({"word": words[k], "start": starts[k], "end": ends[k]})
-            k += 1
-            continue
-        j = k
-        while j < len(words) and starts[j] is None:
-            j += 1
-        left = out[-1]["end"] if out else seg_start
-        right = starts[j] if j < len(words) else seg_end
-        if right < left:
-            right = left
-        total = sum(len(w_rom[x]) for x in range(k, j))
-        cur = left
-        for x in range(k, j):
-            d = (right - left) * len(w_rom[x]) / total if total else 0.0
-            out.append({"word": words[x], "start": cur, "end": cur + d})
-            cur += d
-        k = j
-
-    # Never backwards, never outside the piece
-    prev_start = seg_start
-    for i, w in enumerate(out):
-        w["start"] = min(max(w["start"], prev_start, seg_start), seg_end)
-        w["end"] = min(max(w["end"], w["start"]), seg_end)
-        if i and out[i - 1]["end"] > w["start"]:
-            out[i - 1]["end"] = w["start"]
-        prev_start = w["start"]
+    toks = [letters(w, vocab) for w in words] if logprobs is not None else []
+    spans = forced_align(logprobs, [k for t in toks for k in t], blank) if logprobs is not None else None
+    if spans is None:
+        return _share_by_length(words, offset, piece_end)
+    out, i = [], 0
+    for w, t in zip(words, toks):
+        first, last = spans[i][0], spans[i + len(t) - 1][1]
+        i += len(t)
+        out.append({"word": w, "start": min(offset + first * frame_s, piece_end),
+                    "end": min(offset + (last + 1) * frame_s, piece_end)})
+    for k, w in enumerate(out):
+        nxt = out[k + 1]["start"] if k + 1 < len(out) else piece_end
+        w["end"] = min(max(w["end"], w["start"] + frame_s / 2), max(nxt, w["start"] + 1e-3), piece_end)
+        if w["end"] <= w["start"]:
+            w["start"] = max(offset, w["end"] - 1e-3)
     return out

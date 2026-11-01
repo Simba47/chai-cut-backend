@@ -1,54 +1,87 @@
-"""Tests for the word-timing transfer (pure Python, no models):  python3 -m unittest transcriber/test_align.py"""
+"""Tests for the word timings (pure Python + numpy, no models):  python3 -m unittest transcriber/test_align.py"""
 import unittest
 
-from transcriber.align import romanize, transfer_timings
+import numpy as np
+
+from transcriber.align import forced_align, letters, word_times
+
+# A tiny letter vocabulary in the timing model's style, with a blank
+VOCAB = {"<pad>": 0, "మ": 1, "న": 2, "వ": 3, "ి": 4, "ల": 5, "ు": 6, "|": 7}
+BLANK = 0
 
 
-def W(text: str, start: float, end: float) -> dict:
-    return {"word": text, "start": start, "end": end}
+def frames(path: list[int], n_vocab: int = len(VOCAB)) -> np.ndarray:
+    """Log-probabilities that clearly favour one frame-by-frame path"""
+    lp = np.full((len(path), n_vocab), -10.0, dtype=np.float32)
+    for t, k in enumerate(path):
+        lp[t, k] = -0.01
+    return lp
 
 
-class Romanize(unittest.TestCase):
-    def test_telugu_and_english_end_up_in_the_same_letters(self):
-        self.assertEqual(romanize("నమస్తే"), "namaste")
-        self.assertEqual(romanize("Hello,"), "hello")
+class Letters(unittest.TestCase):
+    def test_a_word_is_its_letters(self):
+        self.assertEqual(letters("విలువ", VOCAB), [3, 4, 5, 6, 3])
+
+    def test_letters_the_model_lacks_are_left_out(self):
+        self.assertEqual(letters("మxన", VOCAB), [1, 2])
+
+    def test_a_word_with_no_known_letters_becomes_a_word_gap(self):
+        self.assertEqual(letters("42", VOCAB), [7])
 
 
-class TransferTimings(unittest.TestCase):
-    def test_same_words_take_the_timed_words_times(self):
-        timed = [W("మనిషికి", 0.2, 0.8), W("విలువ", 0.9, 1.3), W("కాదు", 1.4, 1.8)]
-        out = transfer_timings(["మనిషికి", "విలువ", "కాదు"], timed, 0.0, 2.0)
-        self.assertEqual([round(w["start"], 2) for w in out], [0.2, 0.9, 1.4])
-        self.assertEqual([round(w["end"], 2) for w in out], [0.8, 1.3, 1.8])
+class ForcedAlign(unittest.TestCase):
+    def test_each_token_gets_the_frames_where_the_model_heard_it(self):
+        B = BLANK
+        lp = frames([B, 1, 1, B, 2, B, B, 3, 4, 4, 5, B])
+        self.assertEqual(forced_align(lp, [1, 2, 3, 4, 5], B), [(1, 2), (4, 4), (7, 7), (8, 9), (10, 10)])
 
-    def test_different_spellings_still_match(self):
-        # the text model writes టైమ్, the timing model టైం: the same word
-        timed = [W("సెకండ్", 1.0, 1.5), W("టైం", 1.6, 2.0)]
-        out = transfer_timings(["సెకండ్", "టైమ్"], timed, 0.5, 2.5)
-        self.assertAlmostEqual(out[1]["start"], 1.6, places=1)
-        self.assertAlmostEqual(out[1]["end"], 2.0, places=1)
+    def test_the_same_token_twice_needs_a_blank_between(self):
+        B = BLANK
+        lp = frames([2, 2, B, 2, B])
+        self.assertEqual(forced_align(lp, [2, 2], B), [(0, 1), (3, 3)])
 
-    def test_a_word_the_timing_model_missed_sits_between_its_neighbours(self):
-        timed = [W("ఒకటి", 0.0, 0.5), W("మూడు", 1.5, 2.0)]
-        out = transfer_timings(["ఒకటి", "రెండు", "మూడు"], timed, 0.0, 2.0)
-        self.assertGreaterEqual(out[1]["start"], out[0]["end"] - 1e-6)
-        self.assertLessEqual(out[1]["end"], out[2]["start"] + 1e-6)
+    def test_a_long_piece_with_many_tokens_aligns(self):
+        B = BLANK
+        targets = [1, 2] * 100                       # 200 tokens: 401 places in the alignment
+        lp = frames([k for t in targets for k in (t, B)])
+        spans = forced_align(lp, targets, B)
+        self.assertEqual(spans[0], (0, 0))
+        self.assertEqual(spans[-1], (398, 398))
 
-    def test_without_timed_words_the_piece_is_shared_by_length(self):
-        out = transfer_timings(["aa", "bbbb"], [], 10.0, 13.0)
+    def test_too_few_frames_gives_none(self):
+        self.assertIsNone(forced_align(frames([1, 2]), [1, 2, 3], BLANK))
+
+
+class WordTimes(unittest.TestCase):
+    def test_words_start_where_their_first_letter_is_heard(self):
+        B = BLANK
+        lp = frames([B, B, 1, 2, B, B, B, 3, 4, 5, 6, 3, B, B])   # మన at frame 2, విలువ at frame 7
+        out = word_times(["మన", "విలువ"], lp, VOCAB, B, frame_s=0.02, offset=10.0, piece_end=11.0)
+        self.assertEqual([w["word"] for w in out], ["మన", "విలువ"])
+        self.assertAlmostEqual(out[0]["start"], 10.04)
+        self.assertAlmostEqual(out[1]["start"], 10.14)
+        self.assertAlmostEqual(out[1]["end"], 10.24)
+        self.assertLessEqual(out[0]["end"], out[1]["start"])
+
+    def test_without_an_alignment_the_piece_is_shared_by_length(self):
+        out = word_times(["మ", "విలువ"], frames([1]), VOCAB, BLANK, frame_s=0.02, offset=10.0, piece_end=13.0)
         self.assertAlmostEqual(out[0]["start"], 10.0)
         self.assertAlmostEqual(out[-1]["end"], 13.0)
         self.assertLess(out[0]["end"] - out[0]["start"], out[1]["end"] - out[1]["start"])
 
-    def test_times_always_move_forward_and_stay_in_the_piece(self):
-        timed = [W("b", 1.8, 1.9), W("a", 0.1, 0.2)]   # out of order on purpose
-        out = transfer_timings(["a", "b", "c"], timed, 0.0, 2.0)
+    def test_without_frames_the_piece_is_shared_by_length(self):
+        out = word_times(["మ", "విలువ"], None, {}, -1, frame_s=0.02, offset=2.0, piece_end=3.0)
+        self.assertAlmostEqual(out[0]["start"], 2.0)
+        self.assertAlmostEqual(out[-1]["end"], 3.0)
+
+    def test_every_word_has_some_length_and_stays_in_the_piece(self):
+        B = BLANK
+        lp = frames([1, 3, 4, 5, 6, 3, B])
+        out = word_times(["మ", "విలువ"], lp, VOCAB, B, frame_s=0.02, offset=0.0, piece_end=0.13)
         for w in out:
+            self.assertGreater(w["end"], w["start"])
             self.assertGreaterEqual(w["start"], 0.0)
-            self.assertLessEqual(w["end"], 2.0)
-            self.assertGreaterEqual(w["end"], w["start"])
-        self.assertEqual(out, sorted(out, key=lambda w: w["start"]))
-        self.assertEqual([w["word"] for w in out], ["a", "b", "c"])
+            self.assertLessEqual(w["end"], 0.13)
 
 
 if __name__ == "__main__":
