@@ -1718,6 +1718,13 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
     const kept = payload.confirmed ? await foundMoments(ai_edit_job_id) : []
     const highlights = kept.length ? kept : await selectHighlights(words, clip_count, durationMs, exclude)
     signal.throwIfAborted()
+    // Shadow mode only (REFERENCE_TRANSCRIBER=shadow): the same picker on the reference transcript, saved for
+    // comparison in the background. Never waited for, never changes these clips.
+    if (!kept.length) {
+      void import('./reference_transcripts.js')
+        .then(m => m.shadowCompareMoments(video_id, highlights, (w, d) => selectHighlights(w, clip_count, d, exclude)))
+        .catch(e => console.warn('[ai_edit] shadow comparison failed:', e instanceof Error ? e.message : e))
+    }
     if (highlights.length === 0) {
       throw new Error(exclude.length
         ? `AI could not find new moments beyond the ${exclude.length} clips already made from this video`

@@ -27,6 +27,7 @@ try {
 
 import db from './db.js'
 import { registerHandler, startQueue } from './queue.js'
+import { ensureReferenceSchema, startReferencePoller } from './jobs/reference_transcripts.js'
 import { handleTranscribeJob } from './jobs/transcribe.js'
 import { handleRenderJob } from './jobs/render.js'
 import { handleAiEditJob } from './jobs/ai_edit.js'
@@ -331,6 +332,8 @@ async function runMigrations() {
   for (const [name, q] of indexes) {
     try { await q } catch (e) { console.warn(`[startup] index ${name} not made:`, e instanceof Error ? e.message : e) }
   }
+  // Reference transcripts (jobs/reference_transcripts.ts): their own tables, made even while the switch is off
+  await ensureReferenceSchema()
   console.log('[startup] migrations ok')
 }
 
@@ -376,7 +379,7 @@ if (!mayTakeJobs()) {
     + 'Set LOCAL_WORKER=on in .env to run this worker on it anyway.')
 } else {
   migrateInTurn()
-    .then(() => startQueue())
+    .then(() => { startReferencePoller(); return startQueue() })
     .catch(err => {
       console.error('[worker] Fatal error:', err)
       process.exit(1)

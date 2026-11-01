@@ -120,6 +120,9 @@ export async function handleProxyJob(job: Job, signal?: AbortSignal) {
     console.log(`[proxy] video ${video_id}: editing copy made in ${Math.round((Date.now() - started) / 1000)} s, ${(b.size / 1e6).toFixed(1)} MB (original ${(a.size / 1e6).toFixed(1)} MB)`)
     await keepAudio(storagePath, src, tmp, signal)
       .catch(e => console.warn(`[proxy] video ${video_id}: could not keep its audio:`, (e instanceof Error ? e.message : String(e)).split('\n')[0]))
+    // The reference transcript (REFERENCE_TRANSCRIBER; nothing happens while it is off): never holds up the copy
+    void import('./reference_transcripts.js').then(m => m.submitReferenceFor(video_id, storagePath))
+      .catch(e => console.warn(`[proxy] video ${video_id}: reference transcript not sent:`, e instanceof Error ? e.message : e))
   } finally {
     await rm(tmp, { recursive: true, force: true })
   }
