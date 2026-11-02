@@ -18,10 +18,10 @@ secret = modal.Secret.from_name("shortcut-transcriber")
 
 
 def _download_models():
-    # Into the image at build time, so a cold start does not download ~10 GB
+    # Into the image at build time, so a cold start does not download ~6 GB
     from huggingface_hub import snapshot_download
-    from transcriber.pipeline import TEXT_MODEL, TIME_MODELS
-    snapshot_download(TEXT_MODEL)
+    from transcriber.pipeline import TEXT_MODEL, TEXT_REVISION, TEXT_SKIP, TIME_MODELS
+    snapshot_download(TEXT_MODEL, revision=TEXT_REVISION, ignore_patterns=TEXT_SKIP)
     for name, revision in TIME_MODELS.values():
         snapshot_download(name, revision=revision, ignore_patterns=["*.msgpack", "*.h5"])
 

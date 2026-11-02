@@ -22,6 +22,9 @@ SR = 16_000
 MAX_PIECE_S = 25.0
 PAD_S = 0.15
 TEXT_MODEL = "bodhan-ai/indic-transcribe-core"
+# The checked release (its licence terms are fixed per release); nemo/ is a second 4.6 GB copy for NeMo, unused
+TEXT_REVISION = "e083ab7dfeeddcb5c0b4a2d7df53f53e7b0f1537"
+TEXT_SKIP = ["nemo/*", "*.png"]
 # Letter-level timing models (wav2vec2 CTC, one frame per 20 ms) by language, pinned to the checked
 # revision. Telugu: XLSR-53 fine-tuned on OpenSLR 66, Apache-2.0. A language without one gets its
 # pieces shared out by word length (other languages: Phase 4).
@@ -80,7 +83,7 @@ class Transcriber:
         from silero_vad import load_silero_vad
         self.device = device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
         self.vad = load_silero_vad()
-        text_dir = snapshot_download(TEXT_MODEL)
+        text_dir = snapshot_download(TEXT_MODEL, revision=TEXT_REVISION, ignore_patterns=TEXT_SKIP)
         sys.path.insert(0, text_dir)          # the model's code ships inside its download
         from indic_transcribe import IndicTranscribe
         self.text = IndicTranscribe.from_pretrained(text_dir, device=self.device)
