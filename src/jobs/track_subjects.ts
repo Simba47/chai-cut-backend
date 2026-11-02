@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
@@ -7,7 +7,7 @@ import { r2DownloadToFile, r2SignedUrl } from '../r2.js'
 import db from '../db.js'
 import type { TransactionSql } from 'postgres'
 import type { Job, TrackSubjectsJobPayload } from '../types.js'
-import { detectFaces, detectCuts, trackFaces, probeSize, FRAME_INTERVAL_MS, type FrameDetection, type CropBox, type SpokenWord } from './ai_edit.js'
+import { detectFaces, detectCuts, trackFaces, probeSize, extractFrames, readFramesDir, FRAME_INTERVAL_MS, type FrameDetection, type CropBox, type SpokenWord } from './ai_edit.js'
 import { autoDirectChanges, followChanges, buildKeyframes, type SubjectPoint } from './subject_framing.js'
 import { snapSectionBoundaries } from '../lib/snapSections.js'
 
@@ -721,6 +721,130 @@ const SEEN_SMALL = 0.05
  */
 const SHORT_SHOT_MIN_MS = 300
 
+// ── Close looks (user, 2026-11-01: "frame even if 0.5 sec") ───────────────────
+// At 4 frames a second someone on screen for half a second is seen in two frames — under the three
+// PRESENCE_MIN_FRAMES asks (the bar that keeps one- and two-frame misreads out), and fewer still when
+// a frame falls on a cut. So the short pieces of a clip are read again 10 times a second: the camera
+// shots under CLOSE_SHOT_MS, and around a face seen only once or twice in its neighbourhood. A person
+// there is then seen in four or five frames and passes the same bar; a misread still shows in one or
+// two. Who these readings find on top of a scene's people is a brief appearance (Angle.brief): the
+// scene keeps its format and people, and its view widens to take them in for that moment (user's pick).
+
+const CLOSE_FPS = 10
+/** A 10-a-second frame shows the picture from about this far into its tenth (FFmpeg's fps filter keeps a late one, as FRAME_SHOWS_MS) */
+const CLOSE_SHOWS_MS = 40
+/** A camera shot shorter than this is read closely, whole */
+const CLOSE_SHOT_MS = 1200
+/** A face seen in at most this many frames of LONE_FRAMES either side is read closely around it… */
+const LONE_MAX = 2
+const LONE_FRAMES = 3
+/** …this far either side of it */
+const LONE_REACH_MS = 450
+/** A face as sure as this counts as a sighting worth a closer look (and a brief person must be: SEEN_SURE) */
+const LONE_SURE = 0.6
+/** At most this share of a clip is read closely (a wide shot full of half-read faces would else be all of it) */
+const CLOSE_MAX_SHARE = 0.25
+/** A frame this close to a camera cut, at 10 a second, may already show the next shot */
+const CLOSE_EDGE_MS = 80
+/** A brief appearance's sightings are at most this far apart (a frame or two missed at 10 a second) */
+const BRIEF_GAP_MS = 400
+/** …and its moment reaches this far past its first and last sighting (within its stretch) */
+const BRIEF_PAD_MS = 150
+
+/**
+ * Where to look closely (ms from the scan's start, merged, in order): every camera shot under
+ * CLOSE_SHOT_MS, and LONE_REACH_MS around a sure face seen in at most LONE_MAX of the 4-a-second frames
+ * near it in its shot — within the shot. The short shots first, then the lone faces by how sure they
+ * are, up to CLOSE_MAX_SHARE of the clip.
+ */
+export function closeLookWindows(frames: FrameDetection[], cuts: number[], durationMs: number): Turn[] {
+  const fr = [...frames].filter(f => !f.close).sort((a, b) => a.frame_index - b.frame_index)
+  const timeOf = (f: FrameDetection) => f.frame_index * FRAME_INTERVAL_MS + FRAME_SHOWS_MS
+  const bounds = [0, ...cuts.filter(c => c > 0 && c < durationMs).sort((a, b) => a - b), durationMs]
+  const shotOf = (t: number) => { const k = bounds.findIndex((b, i) => i > 0 && t < b); return k < 0 ? [bounds[bounds.length - 2], durationMs] : [bounds[k - 1], bounds[k]] }
+  const wanted: Array<{ a: number; b: number; rank: number }> = []
+  for (let k = 0; k + 1 < bounds.length; k++) {
+    const a = bounds[k], b = bounds[k + 1]
+    if (b - a >= 150 && b - a < CLOSE_SHOT_MS) wanted.push({ a, b, rank: 2 })
+  }
+  const near = (f: CropBox, g: CropBox) => Math.abs(f.x + f.w / 2 - (g.x + g.w / 2)) <= 0.08 && Math.abs(f.y + f.h / 2 - (g.y + g.h / 2)) <= 0.1
+    && Math.max(f.w / g.w, g.w / f.w) <= 1.6
+  fr.forEach((f, fi) => {
+    const t = timeOf(f), [sa, sb] = shotOf(t)
+    for (const face of f.faces) {
+      if ((face.score ?? 0) < LONE_SURE || face.still) continue
+      let seen = 0
+      for (let j = Math.max(0, fi - LONE_FRAMES); j <= Math.min(fr.length - 1, fi + LONE_FRAMES); j++) {
+        const tj = timeOf(fr[j])
+        if (tj < sa || tj >= sb) continue
+        if (fr[j].faces.some(g => near(face, g))) seen++
+      }
+      if (seen <= LONE_MAX) wanted.push({ a: Math.max(sa, t - LONE_REACH_MS), b: Math.min(sb, t + LONE_REACH_MS), rank: face.score ?? 0 })
+    }
+  })
+  // The most wanted first, up to the share; then merged, in order
+  let budget = CLOSE_MAX_SHARE * durationMs
+  const kept: Turn[] = []
+  for (const w of wanted.sort((p, q) => q.rank - p.rank || (p.b - p.a) - (q.b - q.a))) {
+    if (w.b - w.a > budget) continue
+    budget -= w.b - w.a
+    kept.push([Math.round(w.a), Math.round(w.b)])
+  }
+  kept.sort((p, q) => p[0] - q[0])
+  const out: Turn[] = []
+  for (const w of kept) {
+    const last = out[out.length - 1]
+    // (only overlapping ones: joining across a gap would read more than the share)
+    if (last && w[0] <= last[1]) last[1] = Math.max(last[1], w[1])
+    else out.push([...w])
+  }
+  return out
+}
+
+/**
+ * The close looks: `windows` (ms from `startMs`, closeLookWindows) read 10 times a second in people
+ * mode, all in one run of the face reader. Each frame comes back `close`, its frame_index the time it
+ * shows on the 4-a-second scale. None when there's nothing to look at or the reader fails.
+ */
+export async function readCloseLooks(tmp: string, videoPath: string, startMs: number, windows: Turn[], signal?: AbortSignal): Promise<FrameDetection[]> {
+  if (!windows.length) return []
+  const dir = join(tmp, `close-${startMs}`)
+  await mkdir(dir, { recursive: true })
+  try {
+    // (one folder: the files' names keep each window's frames together and in order)
+    for (let k = 0; k < windows.length; k++) {
+      const [a, b] = windows[k]
+      await extractFrames(videoPath, startMs + a, startMs + b, dir, signal, CLOSE_FPS, `w${String(k).padStart(3, '0')}`)
+    }
+    const names = (await readdir(dir)).filter(n => n.endsWith('.jpg')).sort()
+    const timeOfName = names.map(n => {
+      const m = /^w(\d{3})_(\d{4})\.jpg$/.exec(n)
+      return m ? windows[Number(m[1])][0] + (Number(m[2]) - 1) * (1000 / CLOSE_FPS) + CLOSE_SHOWS_MS : null
+    })
+    const info = await readFramesDir(dir, signal, false, false, true)
+    return info.frames.flatMap(f => {
+      const t = timeOfName[f.frame_index]
+      if (t == null) return []
+      const w = windows.find(([a, b]) => t >= a && t < b + CLOSE_SHOWS_MS)
+      if (!w || t >= w[1]) return []
+      return [{ ...f, frame_index: (t - FRAME_SHOWS_MS) / FRAME_INTERVAL_MS, close: true }]
+    })
+  } catch (e) {
+    if (signal?.aborted) throw e
+    console.warn('[track_subjects] close looks skipped:', e instanceof Error ? e.message : e)
+    return []
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+/**
+ * Someone on screen too briefly to be one of a scene's people (seen in under PRESENCE_MIN_FRAMES of its
+ * 4-a-second frames), whom the close looks show clearly: their face (the middle of their sightings) and
+ * when ([from, to] ms from the scan's start, inside one stretch of the scene)
+ */
+export interface Brief { x: number; y: number; w: number; h: number; from: number; to: number }
+
 export interface Angle {
   /** How many people it shows; 0: the other shots (no faces, or too short to be an angle) */
   people: number
@@ -738,6 +862,8 @@ export interface Angle {
    * a transcript.
    */
   talk?: number[][]
+  /** Brief appearances in it (close looks): the scene's view widens to take each in for its moment */
+  brief?: Brief[]
 }
 
 /**
@@ -746,10 +872,14 @@ export interface Angle {
  * people in the same places); stretches with no faces, or too short, are the last one (people: 0).
  */
 export function findAngles(frames: FrameDetection[], cuts: number[], durationMs: number, speech: SpokenWord[] = []): Angle[] {
-  const fr: FrameDetection[] = [...frames]
+  // (everything below reads the 4-a-second frames; the close looks only find short shots' people and
+  // brief appearances, so a scene's people and format are what they were)
+  const fr: FrameDetection[] = [...frames].filter(f => !f.close)
     .sort((a, b) => a.frame_index - b.frame_index)
     .map(f => ({ ...f, faces: f.faces.filter(face => (face.score ?? 0) > 0) }))
+  const closeFr = frames.filter(f => f.close).map(f => ({ ...f, faces: f.faces.filter(face => (face.score ?? 0) > 0) }))
   const timeOf = (fi: number) => fr[fi].frame_index * FRAME_INTERVAL_MS + FRAME_SHOWS_MS
+  const closeTime = (f: FrameDetection) => f.frame_index * FRAME_INTERVAL_MS + FRAME_SHOWS_MS
   const bounds = [0, ...cuts.filter(c => c > 0 && c < durationMs).sort((a, b) => a - b), durationMs]
   const stretches = bounds.slice(0, -1).map((a, k) => ({ a, b: bounds[k + 1], angle: -1 }))
   const overlap = (s: { a: number; b: number }, spans: Turn[]) => spans.reduce((n, [a, b]) => n + Math.max(0, Math.min(b, s.b) - Math.max(a, s.a)), 0)
@@ -850,8 +980,12 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
   // most common count of them, away from the cuts when it can be (SHORT_SHOT_MIN_MS)
   for (const st of stretches) {
     if (st.angle >= 0 || st.b - st.a < SHORT_SHOT_MIN_MS) continue
-    const inside = fr.map((f, fi) => ({ faces: f.faces.filter(face => (face.score ?? 0) >= SEEN_SURE), t: timeOf(fi) })).filter(x => x.t >= st.a && x.t < st.b)
-    const away = inside.filter(x => (st.a <= 0 || x.t - st.a >= SHORT_EDGE_MS) && (st.b >= durationMs || st.b - x.t >= SHORT_EDGE_MS))
+    // (a short shot's close look too: it has few 4-a-second frames, often one or two on its cuts)
+    const inside = [
+      ...fr.map((f, fi) => ({ faces: f.faces.filter(face => (face.score ?? 0) >= SEEN_SURE), t: timeOf(fi), edge: SHORT_EDGE_MS })),
+      ...(st.b - st.a < SHOT_MIN_MS ? closeFr : []).map(f => ({ faces: f.faces.filter(face => (face.score ?? 0) >= SEEN_SURE), t: closeTime(f), edge: CLOSE_EDGE_MS })),
+    ].filter(x => x.t >= st.a && x.t < st.b).sort((p, q) => p.t - q.t)
+    const away = inside.filter(x => (st.a <= 0 || x.t - st.a >= x.edge) && (st.b >= durationMs || st.b - x.t >= x.edge))
     const pool = (away.some(x => x.faces.length) ? away : inside).filter(x => x.faces.length)
     if (!pool.length) continue
     const counts = new Map<number, number>()
@@ -919,6 +1053,12 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
    * left to right. Two faces are one person in one place: about the same place and size, and not two
    * different people by who they are
    */
+  /** A face in about the place of another, of about its size (one person in one place) */
+  const nearPlace = (g: CropBox, r: CropBox) => {
+    const reach = Math.max(SHOT_REACH_X, SHOT_REACH_FACE * r.w)
+    return Math.abs(g.x + g.w / 2 - (r.x + r.w / 2)) <= reach && Math.abs(g.y + g.h / 2 - (r.y + r.h / 2)) <= Math.max(SHOT_REACH_Y, reach)
+      && Math.max(g.w / r.w, r.w / g.w) <= SHOT_SIZE_RATIO
+  }
   const seenIn = (faces: CropBox[], id: number) => {
     // (frames right on a camera cut may already show the next shot's people: they aren't in this one)
     const inAngle = fr.filter((_, fi) => {
@@ -926,11 +1066,7 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
       return stretches.some(s => s.angle === id && t >= s.a && t < s.b
         && (s.a <= 0 || t - s.a >= SHORT_EDGE_MS) && (s.b >= durationMs || s.b - t >= SHORT_EDGE_MS))
     })
-    const near = (g: CropBox, r: CropBox) => {
-      const reach = Math.max(SHOT_REACH_X, SHOT_REACH_FACE * r.w)
-      return Math.abs(g.x + g.w / 2 - (r.x + r.w / 2)) <= reach && Math.abs(g.y + g.h / 2 - (r.y + r.h / 2)) <= Math.max(SHOT_REACH_Y, reach)
-        && Math.max(g.w / r.w, r.w / g.w) <= SHOT_SIZE_RATIO && samePerson(g, r) !== false
-    }
+    const near = (g: CropBox, r: CropBox) => nearPlace(g, r) && samePerson(g, r) !== false
     const places = faces.map(f => ({ rep: f, seen: [f], own: true, tracks: new Set([trackAt.get(f)]), frames: new Set<number>() }))
     inAngle.forEach((f, k) => f.faces.forEach(g => {
       const tid = trackAt.get(g)
@@ -958,16 +1094,56 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
       .map(pl => (pl.own ? pl.rep : { x: median(pl.seen.map(g => g.x)), y: median(pl.seen.map(g => g.y)), w: median(pl.seen.map(g => g.w)), h: median(pl.seen.map(g => g.h)), score: pl.rep.score }))
       .sort((p, q) => p.x + p.w / 2 - (q.x + q.w / 2))
   }
+  const median = (v: number[]) => [...v].sort((p, q) => p - q)[Math.floor(v.length / 2)]
+  /**
+   * The angle's brief appearances: faces in its stretches (4-a-second and close-look frames, away from
+   * the cuts) in no place of its people, grouped by place and time — each sighting near the last, at
+   * most BRIEF_GAP_MS after it, in one stretch. A group is a brief appearance when the close looks see
+   * it in at least PRESENCE_MIN_FRAMES frames (≈ 0.3 s: a misread shows in one or two there too — its
+   * 4-a-second frames, the same moments, don't add to that) but the 4-a-second frames in fewer (with
+   * more it is one of the people already, or was left out for not being sure), sure (SEEN_SURE, or a
+   * small face) and not a still picture
+   */
+  const briefIn = (people: CropBox[], id: number): Brief[] => {
+    const mine = stretches.filter(s => s.angle === id)
+    const sightings = [
+      ...fr.map((f, fi) => ({ f, t: timeOf(fi), close: false })),
+      ...closeFr.map(f => ({ f, t: closeTime(f), close: true })),
+    ].flatMap(({ f, t, close }) => {
+      const s = mine.find(x => t >= x.a && t < x.b)
+      const edge = close ? CLOSE_EDGE_MS : SHORT_EDGE_MS
+      if (!s || (s.a > 0 && t - s.a < edge) || (s.b < durationMs && s.b - t < edge)) return []
+      return f.faces.filter(g => !g.still && !people.some(p => nearPlace(g, p))).map(g => ({ g, t, close, s }))
+    }).sort((p, q) => p.t - q.t)
+    const groups: Array<typeof sightings> = []
+    for (const x of sightings) {
+      const g = groups.find(gr => { const last = gr[gr.length - 1]; return last.s === x.s && x.t - last.t <= BRIEF_GAP_MS && x.t > last.t && nearPlace(x.g, last.g) })
+      if (g) g.push(x)
+      else groups.push([x])
+    }
+    return groups.flatMap(list => {
+      if (list.filter(x => x.close).length < PRESENCE_MIN_FRAMES || list.filter(x => !x.close).length >= PRESENCE_MIN_FRAMES) return []
+      if (!(median(list.map(x => x.g.score ?? 0)) >= SEEN_SURE || median(list.map(x => x.g.w)) < SEEN_SMALL)) return []
+      const s = list[0].s
+      return [{
+        x: round4(median(list.map(x => x.g.x))), y: round4(median(list.map(x => x.g.y))),
+        w: round4(median(list.map(x => x.g.w))), h: round4(median(list.map(x => x.g.h))),
+        from: Math.round(Math.max(s.a, list[0].t - BRIEF_PAD_MS)), to: Math.round(Math.min(s.b, list[list.length - 1].t + BRIEF_PAD_MS)),
+      }]
+    })
+  }
   const angles: Angle[] = found.flatMap((a, id) => {
     if (!kept.has(id)) return []
     const faces = seenIn(a.faces, id)
     const persons = personsOf(faces, id)
     const spans = spansOf(s => s.angle === id)
+    const brief = briefIn(faces, id)
     return [{
       people: faces.length, at: Math.round(a.at),
       faces: faces.map((f, i) => ({ x: round4(f.x), y: round4(f.y), w: round4(f.w), h: round4(f.h), ...(persons[i] !== undefined ? { person: persons[i] } : {}) })),
       spans,
       ...(turns ? { talk: spans.map(span => persons.map(p => talking(p, span))) } : {}),
+      ...(brief.length ? { brief } : {}),
     }]
   })
   // (in the order they first come up: a short shot's scene was made after the others)
@@ -1188,9 +1364,16 @@ async function scanAngles(clipId: string, from: number, to: number, signal?: Abo
     ])
     signal?.throwIfAborted()
     info.frames = withoutPictures(info.frames, cuts)
-    const angles = findAngles(info.frames, cuts, to - from, speech).map(a => ({
+    // The short pieces read again, 10 times a second: someone there half a second is seen (brief appearances)
+    const windows = closeLookWindows(info.frames, cuts, to - from)
+    const close = await readCloseLooks(tmp, videoPath, from, windows, signal)
+    await db`UPDATE clip_angles SET progress = 80, updated_at = now() WHERE clip_id = ${clipId}`
+    const angles = findAngles([...info.frames, ...close], cuts, to - from, speech).map(a => ({
       ...a, at: a.at + from, spans: a.spans.map(([s, e]) => [s + from, e + from]),
+      ...(a.brief ? { brief: a.brief.map(b => ({ ...b, from: b.from + from, to: b.to + from })) } : {}),
     }))
+    const briefs = angles.reduce((n, a) => n + (a.brief?.length ?? 0), 0)
+    console.log(`[track_subjects] clip ${clipId}: close looks over ${windows.reduce((n, [a, b]) => n + b - a, 0)} ms (${windows.length} piece(s), ${close.length} frames): ${briefs} brief appearance(s)`)
     await db`
       UPDATE clip_angles SET status = 'done', progress = 100, error = NULL, angles = ${db.json(angles as never)},
         scan_start_ms = ${from}, scan_end_ms = ${to}, updated_at = now()
