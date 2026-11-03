@@ -36,7 +36,8 @@ gpu_image = (
 web_image = modal.Image.debian_slim(python_version="3.12").pip_install("fastapi[standard]")
 
 
-@app.cls(gpu="L4", image=gpu_image, secrets=[secret], timeout=60 * 60, scaledown_window=120, max_containers=20)
+# cpu=4: cutting at pauses, audio decoding and the timing fit run on the CPU (the default slice starved them)
+@app.cls(gpu="L4", cpu=4.0, image=gpu_image, secrets=[secret], timeout=60 * 60, scaledown_window=120, max_containers=20)
 class Worker:
     @modal.enter()
     def load(self):

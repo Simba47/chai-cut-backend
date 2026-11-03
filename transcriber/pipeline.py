@@ -30,6 +30,7 @@ TEXT_SKIP = ["nemo/*", "*.png"]
 # pieces shared out by word length (other languages: Phase 4).
 TIME_MODELS = {"te": ("anuragshas/wav2vec2-large-xlsr-53-telugu", "102b87629072c9e8562f43a1864fb3ede8df11fa")}
 FRAME_S = 0.02
+TEXT_BATCH = 16   # pieces decoded together on the GPU (one at a time leaves it mostly idle)
 
 
 def load_audio(source: str) -> np.ndarray:
@@ -55,6 +56,23 @@ def pieces(audio: np.ndarray, vad) -> list[tuple[float, float]]:
                 segs.append([s, s + MAX_PIECE_S]); s += MAX_PIECE_S
             segs.append([s, e])
     return [(a, b) for a, b in segs]
+
+
+def text_batches(lengths: list[float], size: int) -> list[list[int]]:
+    """Piece indexes in groups of at most `size`, longest first (similar lengths pad least)"""
+    order = sorted(range(len(lengths)), key=lambda i: lengths[i], reverse=True)
+    return [order[k:k + size] for k in range(0, len(order), size)]
+
+
+def pad_pieces(chunks: list[np.ndarray], min_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """One padded batch and its lengths. A piece shorter than min_len is centred in min_len,
+    as Indic-Transcribe's own one-piece path does, so batching does not change what it hears."""
+    lens = [max(len(c), min_len) for c in chunks]
+    batch = torch.zeros(len(chunks), max(lens))
+    for i, c in enumerate(chunks):
+        off = round((min_len - len(c)) / 2) if len(c) < min_len else 0
+        batch[i, off:off + len(c)] = torch.from_numpy(c)
+    return batch, torch.tensor(lens)
 
 
 class LetterFrames:
@@ -99,22 +117,46 @@ class Transcriber:
         return votes.most_common(1)[0][0] if votes else "te"
 
     @torch.inference_mode()
+    def _texts(self, chunks: list[np.ndarray], lang: str) -> list[str]:
+        """Native-script text of every piece, TEXT_BATCH pieces per GPU pass. The same steps as
+        IndicTranscribe.transcribe (features, prompt, generate, strip), only batched."""
+        from indic_transcribe import MODES
+        m = self.text
+        itn, romanized = MODES["native"]
+        prompt = m.tokenizer.encode_prompt(lang, itn=itn, romanized=romanized)
+        texts = [""] * len(chunks)
+        for group in text_batches([len(c) for c in chunks], TEXT_BATCH):
+            batch, lens = pad_pieces([chunks[i] for i in group], m.fe.sample_rate)
+            feats, feat_lens = m.fe(batch.to(self.device), lens.to(self.device))
+            mask = (torch.arange(feats.size(2), device=self.device)[None, :] < feat_lens[:, None]).long()
+            ids = torch.tensor([prompt] * len(group), device=self.device)
+            out = m.model.generate(input_features=feats, attention_mask=mask, decoder_input_ids=ids, max_new_tokens=512)
+            for i, row in zip(group, out.tolist()):
+                texts[i] = m.tokenizer.decode(m.tokenizer.strip_prompt_and_trim(row, prompt)).strip()
+        return texts
+
+    @torch.inference_mode()
     def transcribe(self, audio: np.ndarray, language: str | None = None) -> dict:
         t0 = time.time()
         segs = pieces(audio, self.vad)
+        t_vad = time.time()
         lang = language or (self._language(audio, segs) if segs else "te")
+        chunks = [audio[int(a * SR):int(b * SR)] for a, b in segs]
+        texts = self._texts(chunks, lang)
+        t_text = time.time()
         timer = self.timers.get(lang)
         words = []
-        for a, b in segs:
-            chunk = audio[int(a * SR):int(b * SR)]
-            text = self.text.transcribe(chunk, lang=lang, mode="native").strip()
+        for (a, b), chunk, text in zip(segs, chunks, texts):
             if not text:
                 continue
             lp = timer(chunk) if timer else None
             for w in word_times(text.split(), lp, timer.vocab if timer else {}, timer.blank if timer else -1, FRAME_S, a, b):
                 words.append({"word": w["word"], "start_ms": round(w["start"] * 1000), "end_ms": round(w["end"] * 1000)})
+        t_end = time.time()
         return {"model": "indic-transcribe-core+wav2vec2-letter-times", "language": lang,
-                "audio_seconds": round(len(audio) / SR, 2), "gpu_seconds": round(time.time() - t0, 2), "words": words}
+                "audio_seconds": round(len(audio) / SR, 2), "gpu_seconds": round(t_end - t0, 2),
+                "stage_seconds": {"pieces": round(t_vad - t0, 1), "text": round(t_text - t_vad, 1), "times": round(t_end - t_text, 1)},
+                "words": words}
 
 
 if __name__ == "__main__":
