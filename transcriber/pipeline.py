@@ -103,8 +103,9 @@ class Transcriber:
         self.vad = load_silero_vad()
         text_dir = snapshot_download(TEXT_MODEL, revision=TEXT_REVISION, ignore_patterns=TEXT_SKIP)
         sys.path.insert(0, text_dir)          # the model's code ships inside its download
-        from indic_transcribe import IndicTranscribe
+        from indic_transcribe import _GEN_LOG, _QUIET_LENGTH_CLASH, IndicTranscribe
         self.text = IndicTranscribe.from_pretrained(text_dir, device=self.device)
+        _GEN_LOG.addFilter(_QUIET_LENGTH_CLASH)   # its harmless max_length notice, once per batch otherwise
         self.timers = {lang: LetterFrames(lang, self.device) for lang in TIME_MODELS}
 
     def _language(self, audio: np.ndarray, segs: list[tuple[float, float]]) -> str:

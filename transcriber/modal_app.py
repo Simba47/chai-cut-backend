@@ -36,13 +36,18 @@ gpu_image = (
 web_image = modal.Image.debian_slim(python_version="3.12").pip_install("fastapi[standard]")
 
 
-# cpu=4: cutting at pauses, audio decoding and the timing fit run on the CPU (the default slice starved them)
-@app.cls(gpu="L4", cpu=4.0, image=gpu_image, secrets=[secret], timeout=60 * 60, scaledown_window=120, max_containers=20)
+# cpu=4: cutting at pauses, audio decoding and the timing fit run on the CPU (the default slice starved them).
+# A10G when no L4 is free (3 Nov: an L4 queue held a cold start for 7+ min); both 24 GB, bf16.
+@app.cls(gpu=["L4", "A10G"], cpu=4.0, image=gpu_image, secrets=[secret], timeout=60 * 60, scaledown_window=120, max_containers=20)
 class Worker:
     @modal.enter()
     def load(self):
+        import time
+        t0 = time.time()
+        print(f"container up at {time.strftime('%H:%M:%S')}", flush=True)
         from transcriber.pipeline import Transcriber
         self.t = Transcriber("cuda")
+        print(f"models loaded in {time.time() - t0:.0f} s", flush=True)
 
     @modal.method()
     def run(self, audio_url: str, language: str | None = None) -> dict:
