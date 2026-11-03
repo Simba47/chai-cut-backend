@@ -268,6 +268,58 @@ export function withoutPictures(frames: FrameDetection[], cuts: number[], marks:
   })
 }
 
+/** A missed cut's two sides are read at most this far apart (frames with no sure face between — a wipe's own frames — are passed over) */
+const FACE_CUT_GAP_MS = 1000
+/** …and a face still counts as there if the next is this near (a share of the width, or face widths) and this alike in size */
+const FACE_CUT_REACH = 0.15
+const FACE_CUT_REACH_FACES = 2.5
+const FACE_CUT_SIZE = 1.6
+
+/**
+ * Camera cuts FFmpeg misses, from the faces (the user, 2026-11-03: an audition show changes shots with
+ * animated wipes — a clapperboard sweeping across — and soft cuts; with no sudden change of the whole
+ * frame they weren't cuts, the judges' panel and the audience went into the man's stage shot, and a
+ * place showing only him got a Split for six). A cut is where everyone on screen changes at once: no
+ * sure face after it goes on from one before it (the face tracker's id, or who they are) and none
+ * before it goes on after it — and the next frame is new too — and the picture's people change: as many
+ * faces, all in other places, or another number of them (one man turning side-on loses his track and
+ * reads as someone else, in the same place: 9 of 11 first tries were him). Placed halfway between the
+ * two frames. Returns only the new cuts (ms from the scan's start), none closer than 1 s to a cut already found.
+ */
+export function faceCuts(frames: FrameDetection[], cuts: number[]): number[] {
+  const fr = [...frames].filter(f => !f.close).sort((a, b) => a.frame_index - b.frame_index)
+    .map(f => ({ ...f, faces: f.faces.filter(face => (face.score ?? 0) > 0) }))
+  if (fr.length < 4) return []
+  const ids = trackFaces(fr, cuts.map(c => c - FRAME_SHOWS_MS))
+  const who = whoIs(fr, cuts)
+  const timeOf = (fi: number) => fr[fi].frame_index * FRAME_INTERVAL_MS + FRAME_SHOWS_MS
+  // The frames with sure faces, each face with its track and person
+  const seq = fr.map((f, fi) => ({ t: timeOf(fi), faces: f.faces.map((face, k) => ({ face, id: ids[fi][k], p: who.get(face) })).filter(x => (x.face.score ?? 0) >= SEEN_SURE) }))
+    .filter(x => x.faces.length)
+  type Seen = (typeof seq)[number]
+  /** Nobody of `b` goes on from `a`, nor the other way */
+  const allNew = (a: Seen, b: Seen) => !a.faces.some(x => b.faces.some(y => x.id === y.id || (x.p !== undefined && x.p === y.p)))
+  /** A face where another could have moved to in a quarter second (a man dancing went 0.06–0.10 across), of about its size */
+  const near = (f: CropBox, r: CropBox) => {
+    const reach = Math.max(FACE_CUT_REACH, FACE_CUT_REACH_FACES * r.w)
+    return Math.abs(f.x + f.w / 2 - (r.x + r.w / 2)) <= reach && Math.abs(f.y + f.h / 2 - (r.y + r.h / 2)) <= reach
+      && Math.max(f.w / r.w, r.w / f.w) <= FACE_CUT_SIZE
+  }
+  /** The picture's people changed: another number of faces, or as many, none where one was */
+  const otherPicture = (a: Seen, b: Seen) => a.faces.length !== b.faces.length || !b.faces.some(y => a.faces.some(x => near(y.face, x.face)))
+  const cutBetween = (a: number, b: number) => cuts.some(c => c > a && c <= b)
+  const found: number[] = []
+  for (let k = 1; k + 1 < seq.length; k++) {
+    const a = seq[k - 1], b = seq[k], c = seq[k + 1]
+    if (b.t - a.t > FACE_CUT_GAP_MS || c.t - b.t > FACE_CUT_GAP_MS || cutBetween(a.t, c.t)) continue
+    if (!allNew(a, b) || !allNew(a, c) || !otherPicture(a, b) || !otherPicture(a, c)) continue
+    const t = Math.round((a.t + b.t) / 2)
+    if ([...cuts, ...found].some(x => Math.abs(x - t) < 1000)) continue
+    found.push(t)
+  }
+  return found
+}
+
 /**
  * How well a click points at a face: the face itself, or the person under it (their body is below
  * their head, a little wider). Lower is better; null when the click is not on that person.
@@ -857,6 +909,11 @@ export interface Angle {
   /** Wherever the clip shows it: [start, end] ms from the start of the scan */
   spans: Turn[]
   /**
+   * Who is in each of `spans` (indexes into `faces`), when not everyone is in every one (user, 2026-11-03:
+   * a place showing only one man was formatted for the scene's six). Missing: everyone, in every place
+   */
+  present?: number[][]
+  /**
    * Who talks in each of `spans` (user, 2026-10-24: Auto format puts the speaker at the bottom):
    * talk[i][k] is how long faces[k]'s person talks in spans[i] (ms; 0 when not known). None without
    * a transcript.
@@ -1059,22 +1116,27 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
     return Math.abs(g.x + g.w / 2 - (r.x + r.w / 2)) <= reach && Math.abs(g.y + g.h / 2 - (r.y + r.h / 2)) <= Math.max(SHOT_REACH_Y, reach)
       && Math.max(g.w / r.w, r.w / g.w) <= SHOT_SIZE_RATIO
   }
-  const seenIn = (faces: CropBox[], id: number) => {
+  /** Everyone seen in the angle (`at`: the moment of its own faces), each with the moments they are seen */
+  const seenIn = (faces: CropBox[], id: number, at: number) => {
     // (frames right on a camera cut may already show the next shot's people: they aren't in this one)
-    const inAngle = fr.filter((_, fi) => {
-      const t = timeOf(fi)
-      return stretches.some(s => s.angle === id && t >= s.a && t < s.b
-        && (s.a <= 0 || t - s.a >= SHORT_EDGE_MS) && (s.b >= durationMs || s.b - t >= SHORT_EDGE_MS))
-    })
+    const inAngle = fr.map((f, fi) => ({ f, t: timeOf(fi) })).filter(({ t }) => stretches.some(s => s.angle === id && t >= s.a && t < s.b
+      && (s.a <= 0 || t - s.a >= SHORT_EDGE_MS) && (s.b >= durationMs || s.b - t >= SHORT_EDGE_MS)))
     const near = (g: CropBox, r: CropBox) => nearPlace(g, r) && samePerson(g, r) !== false
-    const places = faces.map(f => ({ rep: f, seen: [f], own: true, tracks: new Set([trackAt.get(f)]), frames: new Set<number>() }))
-    inAngle.forEach((f, k) => f.faces.forEach(g => {
-      const tid = trackAt.get(g)
-      // Their own track first (they moved), then the same place
-      const at = places.find(pl => tid !== undefined && pl.tracks.has(tid)) ?? places.find(pl => near(g, pl.rep))
-      if (at) { at.seen.push(g); at.tracks.add(tid); at.frames.add(k) }
-      else places.push({ rep: g, seen: [g], own: false, tracks: new Set([tid]), frames: new Set([k]) })
-    }))
+    const places = faces.map(f => ({ rep: f, seen: [f], own: true, tracks: new Set([trackAt.get(f)]), frames: new Set<number>(), times: [at] }))
+    const apart = (g: CropBox, r: CropBox) => Math.abs(g.x + g.w / 2 - (r.x + r.w / 2)) + Math.abs(g.y + g.h / 2 - (r.y + r.h / 2))
+    inAngle.forEach(({ f, t }, k) => {
+      // Their own track first (they moved), then the nearest place — one face a place in a frame (two men
+      // sitting close at the end of a table were both taken as the first: 2026-11-03)
+      const used = new Set<object>()
+      const known = (g: CropBox) => places.some(x => x.tracks.has(trackAt.get(g)))
+      for (const g of [...f.faces].sort((p, q) => Number(known(q)) - Number(known(p)))) {
+        const tid = trackAt.get(g)
+        const pl = places.find(x => !used.has(x) && tid !== undefined && x.tracks.has(tid))
+          ?? places.filter(x => !used.has(x) && near(g, x.rep)).sort((p, q) => apart(g, p.rep) - apart(g, q.rep))[0]
+        if (pl) { pl.seen.push(g); pl.tracks.add(tid); pl.frames.add(k); pl.times.push(t); used.add(pl) }
+        else { const np = { rep: g, seen: [g], own: false, tracks: new Set([tid]), frames: new Set([k]), times: [t] }; places.push(np); used.add(np) }
+      }
+    })
     const median = (v: number[]) => [...v].sort((p, q) => p - q)[Math.floor(v.length / 2)]
     // One person in two places (moved, or the video's own edit put them elsewhere for a while): a place
     // never seen in the same frame as another, with a face about the same size, is that one — unless who
@@ -1084,15 +1146,29 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
       const same = places.find(o => o !== pl && !o.frames.has(-1) && ![...pl.frames].some(k => o.frames.has(k))
         && Math.max(w / median(o.seen.map(g => g.w)), median(o.seen.map(g => g.w)) / w) <= SHOT_SIZE_RATIO && samePerson(pl.rep, o.rep) !== false)
       if (!same) continue
-      same.seen.push(...pl.seen); pl.tracks.forEach(t => same.tracks.add(t)); pl.frames.forEach(k => same.frames.add(k))
+      same.seen.push(...pl.seen); pl.tracks.forEach(t => same.tracks.add(t)); pl.frames.forEach(k => same.frames.add(k)); same.times.push(...pl.times)
       pl.frames.add(-1)   // (merged: gone)
       pl.seen = []
     }
     return places
       .filter(pl => pl.own || (pl.seen.length >= PRESENCE_MIN_FRAMES && !pl.frames.has(-1)
         && (median(pl.seen.map(g => g.score ?? 0)) >= SEEN_SURE || median(pl.seen.map(g => g.w)) < SEEN_SMALL)))
-      .map(pl => (pl.own ? pl.rep : { x: median(pl.seen.map(g => g.x)), y: median(pl.seen.map(g => g.y)), w: median(pl.seen.map(g => g.w)), h: median(pl.seen.map(g => g.h)), score: pl.rep.score }))
-      .sort((p, q) => p.x + p.w / 2 - (q.x + q.w / 2))
+      .map(pl => ({ box: pl.own ? pl.rep : { x: median(pl.seen.map(g => g.x)), y: median(pl.seen.map(g => g.y)), w: median(pl.seen.map(g => g.w)), h: median(pl.seen.map(g => g.h)), score: pl.rep.score }, times: pl.times }))
+      .sort((p, q) => p.box.x + p.box.w / 2 - (q.box.x + q.box.w / 2))
+  }
+  /**
+   * Who of the angle's people is in each of its places: seen there at all — they are one of its people
+   * already (PRESENCE_MIN_FRAMES over the angle), and a place's own reading can miss them (two men at the
+   * dark end of a table were read in 1–2 frames of a 2-s place: still there). A place where nobody is
+   * seen has everyone (too short to tell). Null when everyone is in every place
+   */
+  const presentIn = (people: Array<{ times: number[] }>, spans: Turn[]) => {
+    const all = people.map((_, k) => k)
+    const out = spans.map(([a, b]) => {
+      const here = all.filter(k => people[k].times.some(t => t >= a && t < b))
+      return here.length ? here : all
+    })
+    return out.every(x => x.length === all.length) ? null : out
   }
   const median = (v: number[]) => [...v].sort((p, q) => p - q)[Math.floor(v.length / 2)]
   /**
@@ -1134,16 +1210,19 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
   }
   const angles: Angle[] = found.flatMap((a, id) => {
     if (!kept.has(id)) return []
-    const faces = seenIn(a.faces, id)
+    const seen = seenIn(a.faces, id, a.at)
+    const faces = seen.map(x => x.box)
     const persons = personsOf(faces, id)
     const spans = spansOf(s => s.angle === id)
     const brief = briefIn(faces, id)
+    const present = presentIn(seen, spans)
     return [{
       people: faces.length, at: Math.round(a.at),
       faces: faces.map((f, i) => ({ x: round4(f.x), y: round4(f.y), w: round4(f.w), h: round4(f.h), ...(persons[i] !== undefined ? { person: persons[i] } : {}) })),
       spans,
       ...(turns ? { talk: spans.map(span => persons.map(p => talking(p, span))) } : {}),
       ...(brief.length ? { brief } : {}),
+      ...(present ? { present } : {}),
     }]
   })
   // (in the order they first come up: a short shot's scene was made after the others)
@@ -1295,6 +1374,8 @@ async function followMarked(clip_id: string, start_ms: number, end_ms: number, s
     signal?.throwIfAborted()
     await setSubjects(ids, { progress: 90 })
     info.frames = withoutPictures(info.frames, cuts, subjects.filter(s => !s.shot).map(s => ({ t: s.mark_ms - from, x: s.mark_x, y: s.mark_y })))
+    // (and the camera cuts FFmpeg missed: wipes, soft cuts — faceCuts)
+    cuts.push(...faceCuts(info.frames, cuts)); cuts.sort((x, y) => x - y)
 
     // People are followed; a group subject (a marked shot) is found wherever the clip shows that shot
     const people = subjects.filter(s => !s.shot), shots = subjects.filter(s => s.shot)
@@ -1364,6 +1445,8 @@ async function scanAngles(clipId: string, from: number, to: number, signal?: Abo
     ])
     signal?.throwIfAborted()
     info.frames = withoutPictures(info.frames, cuts)
+    // (and the camera cuts FFmpeg missed: wipes, soft cuts — faceCuts)
+    cuts.push(...faceCuts(info.frames, cuts)); cuts.sort((x, y) => x - y)
     // The short pieces read again, 10 times a second: someone there half a second is seen (brief appearances)
     const windows = closeLookWindows(info.frames, cuts, to - from)
     const close = await readCloseLooks(tmp, videoPath, from, windows, signal)
@@ -1495,6 +1578,8 @@ async function subEditSteps(clipId: string, signal: AbortSignal, onCreated: (ids
     ])
     signal?.throwIfAborted()
     info.frames = withoutPictures(info.frames, cuts)
+    // (and the camera cuts FFmpeg missed: wipes, soft cuts — faceCuts)
+    cuts.push(...faceCuts(info.frames, cuts)); cuts.sort((x, y) => x - y)
     const found = findPeople(info.frames, cuts)
     if (!found.length) throw new Error('No people could be found in this clip')
 

@@ -139,3 +139,18 @@ test('a long stretch with nobody is still a centred cutaway', () => {
   const parts = formatClip(frames, cuts, DUR, [], SIZE)
   assert.equal(parts.find(p => p.start_ms === 12000)!.why, 'cutaway')
 })
+
+test('a place showing one of a scene\'s people is Vertical on them, though the scene has more (missed cut, 2026-11-03)', () => {
+  // The man on stage; 8.5–9.5 s a wipe to a panel of four (no cut found by FFmpeg)
+  const fw: FrameDetection[] = []
+  for (let n = 0; n * 250 + 100 < 20000; n++) {
+    const t = n * 250 + 100
+    const faces = t >= 8500 && t < 9500 ? [0.2, 0.39, 0.61, 0.77].map((x, k) => face(x, 0.3 + k * 0.1, 0.035)) : [face(0.5, 0.05, 0.055)]
+    fw.push({ frame_index: n, person_count: faces.length, faces })
+  }
+  const parts = formatClip(fw, [], 20000, [], SIZE)
+  const at = (t: number) => parts.find(p => p.start_ms <= t && p.end_ms > t)!
+  assert.equal(at(4000).layout, 'vertical')
+  assert.equal(at(15000).layout, 'vertical')
+  assert.equal(at(9000).people, 4)
+})

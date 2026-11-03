@@ -17,7 +17,7 @@ import { brandCaptionWords, brandClipText, brandVoice } from '../lib/brandWords.
 import { brollEnabled, pickBrollMoments, searchCandidates, chooseBroll, brollWindow, downloadStock, withBroll, type BrollShot } from '../lib/broll.js'
 import { findVisuals, describeVisuals, pickVisualMoments, detectPanels, refinePanels, type Visual, type VisualMoment, type Panel } from '../lib/visuals.js'
 import { formatClip } from './clip_formats.js'
-import { closeLookWindows, readCloseLooks } from './track_subjects.js'
+import { closeLookWindows, readCloseLooks, faceCuts, withoutPictures } from './track_subjects.js'
 import { personView } from './auto_format.js'
 import { r2UploadFile } from '../r2.js'
 import { fileURLToPath } from 'node:url'
@@ -1813,6 +1813,8 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         // people, the views following them), its graphic panels over one-person parts; else frame by frame
         let segments: ClipSegment[]
         if (rulebook && analysis.info.frames.length) {
+          // The camera cuts FFmpeg missed (wipes, soft cuts), found from the faces — posters left out
+          analysis.cuts.push(...faceCuts(withoutPictures(analysis.info.frames, analysis.cuts), analysis.cuts)); analysis.cuts.sort((x, y) => x - y)
           // The short pieces read again 10 times a second (someone on screen half a second: the view takes them in)
           const close = await readCloseLooks(tmp, videoPath, highlight.start_ms, closeLookWindows(analysis.info.frames, analysis.cuts, clipDurationMs), signal)
           const parts = formatClip([...analysis.info.frames, ...close], analysis.cuts, clipDurationMs, analysis.speech, size!, { motion: framing.motion })
