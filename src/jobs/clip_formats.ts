@@ -16,7 +16,7 @@
 //      the view nearest them widens to take them in for that moment, cutting out and back (user, 2026-11-01).
 
 import { trackFaces, stabilise, FRAME_INTERVAL_MS, type FrameDetection, type CropBox, type SpokenWord } from './ai_edit.js'
-import { findAngles, whoIs, withoutPictures, FRAME_SHOWS_MS, type Brief } from './track_subjects.js'
+import { findAngles, whoIs, withoutPictures, faceCuts, FRAME_SHOWS_MS, type Brief } from './track_subjects.js'
 import { decideFormat, keepsAll, AUTO_FORMAT, type AutoLayout } from './auto_format.js'
 
 interface Kf { t_ms: number; x: number; y: number; w: number; h: number }
@@ -53,6 +53,8 @@ export function formatClip(
   // (the close looks only find brief appearances: the rest — pictures, who is who, Follow — reads the 4-a-second frames)
   const close = frames.filter(f => f.close)
   frames = withoutPictures(frames.filter(f => !f.close), cuts)
+  // (with the camera cuts FFmpeg missed: wipes, soft cuts — none when the caller added them already)
+  cuts = [...cuts, ...faceCuts(frames, cuts)].sort((x, y) => x - y)
   const angles = findAngles([...frames, ...close], cuts, durationMs, speech)
   // Who each face is: a scene's people are where it was first seen, and someone can sit elsewhere in a
   // place it comes back (another take of the same angle): Follow finds them by who they are
@@ -61,8 +63,11 @@ export function formatClip(
   const decided: Decided[] = angles.filter(g => g.people > 0).flatMap(g => g.spans.flatMap(([s, e], i): Decided[] => {
     const a = Math.max(0, Math.round(s)), b = Math.min(durationMs, Math.round(e))
     if (b - a < MIN_PLACE_MS) return []
-    const faces = g.faces as CropBox[]
-    const plan = decideFormat(faces, g.talk?.[i] ?? null, ar, size.height)
+    // (the people in this place: a scene's places can show fewer of them — 2026-11-03)
+    const here = g.present?.[i] ?? g.faces.map((_, k) => k)
+    const faces = here.map(k => g.faces[k]) as CropBox[]
+    const talk = g.talk?.[i] ? here.map(k => g.talk![i][k] ?? 0) : null
+    const plan = decideFormat(faces, talk, ar, size.height)
     return plan ? [{ a, b, faces, plan }] : []
   })).sort((p, q) => p.a - q.a)
   // A very short place takes the format of the place right before it (no flicker on fast cutting), when
