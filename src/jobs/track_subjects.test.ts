@@ -8,7 +8,7 @@ process.env.R2_ENDPOINT ??= 'http://127.0.0.1:1'
 process.env.R2_ACCESS_KEY_ID ??= 'test'
 process.env.R2_SECRET_ACCESS_KEY ??= 'test'
 process.env.R2_BUCKET ??= 'test'
-const { shotSpans, settleGroups, whoIs, followSubjects, findAngles, findPeople, withoutPictures } = await import('./track_subjects.js')
+const { shotSpans, settleGroups, whoIs, followSubjects, findAngles, findPeople, withoutPictures, faceCuts } = await import('./track_subjects.js')
 
 // ── A made-up clip, 4 frames a second ──
 // A colour signature (24 numbers summing to 1) `d` away (L1) from person A's
@@ -240,4 +240,51 @@ test('scenes: a 0.76 s shot of people seen nowhere else is a scene of its own (n
   assert.equal(short.people, 2)
   assert.ok(angles.find(a => a.spans.some(([s, e]) => s === 10483 && e === 10700))!.people === 0, 'a 0.2 s flash goes with the other shots')
   assert.deepEqual(angles.filter(a => a.people).map(a => a.spans[0][0]), [0, 9723, 10700], 'scenes in the order they come up')
+})
+
+// ── Cuts FFmpeg misses (animated wipes, soft cuts), found from the faces; each place's own people (2026-11-03:
+// an audition show's clapperboard wipe put the judges' panel into the man's stage shot — his places got a Split for six) ──
+/** The man on stage (0–9.5 s, 10–20 s); between, a wipe to a panel of four (9.5–10.5 s) with no cut FFmpeg saw */
+const stage = made(20000, (t, n) => t >= 8500 && t < 9500 ? [0.2, 0.39, 0.61, 0.77].map((x, k) => person(4 + k, x, 0.3 + k * 0.1, n, 0.035))
+  : [person(0, 0.5 + 0.04 * Math.sin(t / 700), 0.05, n, 0.055)])
+
+test('faceCuts: a wipe from one man to a panel of four and back are cuts; the man moving about is not', () => {
+  const found = faceCuts(stage, [])
+  assert.equal(found.length, 2, JSON.stringify(found))
+  assert.ok(Math.abs(found[0] - 8475) <= 130 && Math.abs(found[1] - 9475) <= 130, JSON.stringify(found))
+})
+
+test('faceCuts: one man turning side-on (his track lost, read as someone else) in the same place is not a cut', () => {
+  // A new identity every second (side-on reads), always in about the same place
+  const turning = made(10000, (t, n) => [person(Math.floor(t / 1000) % 2 ? 1 : 0, 0.5 + 0.07 * Math.sin(t / 300), 0.05, n, 0.06)])
+  assert.deepEqual(faceCuts(turning, []), [])
+})
+
+test('each place has its own people: the man\'s places show only him, though the scene took in a panel', () => {
+  // The panel stretch sits inside the man's shot (no cut at all): the scene has five people, his places one
+  const angles = findAngles(stage, [], 20000)
+  const all = [...faceCuts(stage, [])]
+  const split = findAngles(stage, all, 20000)
+  const man = split.find(a => a.spans.some(([s]) => s === 0))!
+  assert.equal(man.people, 1, 'with the faces\' cuts, the man is a scene of one')
+  assert.ok(angles[0].people >= 1)
+})
+
+test('two people sitting close together are two people (one face a place in a frame)', () => {
+  const close = made(8000, (t, n) => [person(0, 0.12, 0.05, n, 0.03), person(1, 0.165, 0.6, n, 0.03), person(2, 0.6, 0.9, n, 0.05)])
+  assert.equal(findAngles(close, [], 8000)[0].people, 3)
+})
+
+test('present: a scene\'s place shows only the people seen there (even with a cut missed elsewhere)', () => {
+  // The man (0–5 s); someone else (5–7 s); the man again (7–12 s) with a panel of four wiped in at 8.5–9.5 s —
+  // that cut not found (only FFmpeg's): the scene takes the panel in, its first place shows only him
+  const man = (n: number) => person(0, 0.5, 0.05, n, 0.055)
+  const fw = made(12000, (t, n) => t < 5000 ? [man(n)] : t < 7000 ? [person(9, 0.3, 0.8, n, 0.12)]
+    : t >= 8500 && t < 9500 ? [0.2, 0.39, 0.61, 0.77].map((x, k) => person(4 + k, x, 0.3 + k * 0.1, n, 0.035)) : [man(n)])
+  const scene = findAngles(fw, [5000, 7000], 12000).find(a => a.spans.some(([s]) => s === 0))!
+  assert.equal(scene.spans.length, 2, JSON.stringify(scene.spans))
+  assert.equal(scene.people, 5)
+  const m = scene.faces.findIndex(f => Math.abs(f.x + f.w / 2 - 0.5) < 0.02)
+  assert.deepEqual(scene.present?.[0], [m], 'the first place: only the man')
+  assert.equal(scene.present?.[1].length, 5, 'the second place: the man and the panel')
 })
