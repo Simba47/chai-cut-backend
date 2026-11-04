@@ -701,15 +701,56 @@ def detect_subjects(frames_dir: str, lips: bool = False, all_faces: bool = False
     return {"face_count": max_person_count, "face_boxes": face_boxes, "frames": per_frame}
 
 
+def identities_of(spec_path: str) -> list:
+    """Faces too small to read who they are in the scan's 640-wide frames, read again in the original
+    picture (track_subjects.ts readSmallIdentities; 2026-11-04: in a wide shot of six, faces of 16–19 px
+    had none and a person's track went to the man beside them — at 1920 wide, 45–75 px, they read right).
+    `spec_path`: JSON [{file, faces: [[x, y, w, h], ...]}] (fractions of the picture) → for each face its
+    identity, or None when YuNet can't find it there or it is still too small."""
+    import cv2
+    with open(spec_path, encoding="utf-8") as f:
+        spec = json.load(f)
+    yunet, identity = _YuNet(), _Identity()
+    out = []
+    for item in spec:
+        img = cv2.imread(item["file"])
+        row = []
+        for x, y, w, h in item["faces"]:
+            emb = None
+            if img is not None:
+                found = yunet.detect_near(img, {"x": x, "y": y, "w": w, "h": h})
+                # (the face asked for: about where it was in the small frame)
+                if found is not None and abs(found["x"] + found["w"] / 2 - (x + w / 2)) <= max(w, 0.02) \
+                        and abs(found["y"] + found["h"] / 2 - (y + h / 2)) <= max(h, 0.03):
+                    try:
+                        emb = identity.of(img, found)
+                    except Exception as e:
+                        print(f"[identities] SFace failed: {e}", file=sys.stderr)
+            row.append(emb)
+        out.append(row)
+    print(f"[identities] {sum(len(r) for r in out)} faces in {len(out)} frames, {sum(e is not None for r in out for e in r)} read", file=sys.stderr)
+    return out
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--frames-dir", required=True)
+    parser.add_argument("--identities", help="read who small faces are in bigger frames (identities_of): a JSON spec file")
+    parser.add_argument("--frames-dir")
     parser.add_argument("--lips", action="store_true", help="also measure mouth opening (speaker tracking)")
     parser.add_argument("--people", action="store_true",
                         help="following marked people: people sitting close together aren't merged into one")
     parser.add_argument("--all-faces", action="store_true",
                         help="every face seen, with none of the crop filters (still faces, a close-up's bystanders, faces too close to split)")
     args = parser.parse_args()
+    if args.identities:
+        try:
+            print(json.dumps({"identities": identities_of(args.identities)}))
+        except Exception as e:
+            print(f"[face_detect] Error: {e}", file=sys.stderr)
+            print(json.dumps({"identities": []}))
+        sys.exit(0)
+    if not args.frames_dir:
+        parser.error("--frames-dir is needed")
     try:
         result = detect_subjects(args.frames_dir, lips=args.lips, all_faces=args.all_faces, people=args.people)
     except Exception as e:
