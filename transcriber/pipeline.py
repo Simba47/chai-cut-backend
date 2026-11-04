@@ -31,6 +31,9 @@ TEXT_SKIP = ["nemo/*", "*.png"]
 TIME_MODELS = {"te": ("anuragshas/wav2vec2-large-xlsr-53-telugu", "102b87629072c9e8562f43a1864fb3ede8df11fa")}
 FRAME_S = 0.02
 TEXT_BATCH = 16   # pieces decoded together on the GPU (one at a time leaves it mostly idle)
+# Spoken Hindi and Urdu sound alike: a Hindi dub came back as "ur", in Urdu letters (4 Nov).
+# The app has no Urdu, so it is read as Hindi (Devanagari).
+SAME_AS = {"ur": "hi"}
 
 
 def load_audio(source: str) -> np.ndarray:
@@ -56,6 +59,12 @@ def pieces(audio: np.ndarray, vad) -> list[tuple[float, float]]:
                 segs.append([s, s + MAX_PIECE_S]); s += MAX_PIECE_S
             segs.append([s, e])
     return [(a, b) for a, b in segs]
+
+
+def video_language(votes: list[str]) -> str:
+    """The language most of the sampled pieces were heard as (Telugu when none were)"""
+    counts = Counter(SAME_AS.get(v, v) for v in votes)
+    return counts.most_common(1)[0][0] if counts else "te"
 
 
 def text_batches(lengths: list[float], size: int) -> list[list[int]]:
@@ -111,11 +120,11 @@ class Transcriber:
     def _language(self, audio: np.ndarray, segs: list[tuple[float, float]]) -> str:
         """The video's language, decided once from a few of its longest pieces"""
         longest = sorted(segs, key=lambda s: s[1] - s[0], reverse=True)[:3]
-        votes = Counter()
+        votes = []
         for a, b in longest:
             _, lid = self.text.transcribe(audio[int(a * SR):int(b * SR)], lang=None, return_lid=True)
-            votes[lid["lang"]] += 1
-        return votes.most_common(1)[0][0] if votes else "te"
+            votes.append(lid["lang"])
+        return video_language(votes)
 
     @torch.inference_mode()
     def _texts(self, chunks: list[np.ndarray], lang: str) -> list[str]:

@@ -3,7 +3,20 @@ import unittest
 
 import numpy as np
 
-from transcriber.pipeline import pad_pieces, text_batches
+from transcriber.pipeline import pad_pieces, text_batches, video_language
+
+
+class VideoLanguage(unittest.TestCase):
+    def test_most_votes_wins(self):
+        self.assertEqual(video_language(["ta", "ta", "kn"]), "ta")
+
+    def test_urdu_is_read_as_hindi(self):
+        # 4 Nov: a Hindi dub came back as "ur" and was written in Urdu letters; the app has no Urdu
+        self.assertEqual(video_language(["ur", "ur", "hi"]), "hi")
+        self.assertEqual(video_language(["ur", "hi", "ta"]), "hi")
+
+    def test_no_votes_telugu(self):
+        self.assertEqual(video_language([]), "te")
 
 
 class TextBatches(unittest.TestCase):
