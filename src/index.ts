@@ -287,6 +287,9 @@ async function runMigrations() {
   // Where the captions are centred left to right (0–1 of the frame's width, dragged in the editor's
   // preview like text); null = the middle
   await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS position_x REAL`
+  // The case caption words are written in (the editor's Aa buttons: title, upper, lower); NULL on
+  // styles saved before it: UPPER when uppercase, else Title (render.py _caption_case)
+  await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS text_case TEXT`
   // A brand kit shared with other accounts (its owner's team): they can use it on their clips, not
   // change it; with the kit's brand lock on, their editor offers only its colours and fonts
   await db`

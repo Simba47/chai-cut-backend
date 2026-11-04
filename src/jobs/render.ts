@@ -439,15 +439,7 @@ async function condenseClip(clipId: string, spec: Spec, videoUrl: string, tmp: s
     // Words in a part the user removed are gone already: a pause is measured between the words that stay
     const words = (spec.words as Row[] as Parameters<typeof computeCutRanges>[0])
       .filter(w => !trims.some(([a, b]) => (w.start_ms + w.end_ms) / 2 >= a && (w.start_ms + w.end_ms) / 2 < b))
-    // Reaction parts (splits, trios) are never cut, and neither is a "pause" that isn't silent: a
-    // laugh, a gasp, applause between the words is a reaction, not dead air
-    const reactions = reactionRanges((spec.segments ?? []) as unknown as Array<{ start_ms: number; end_ms: number; layout: string }>, start)
-    pauses = computeCutRanges(words, start, end, reactions)
-    const loud = await loudPauses(pauses, words, videoUrl, start, end, signal)
-    if (loud.length) {
-      console.log(`[render] Keeping ${loud.length} pause(s) with sound in them (laughs/reactions): ${loud.map(([a, b]) => `${((a - start) / 1000).toFixed(1)}-${((b - start) / 1000).toFixed(1)}s`).join(', ')}`)
-      pauses = computeCutRanges(words, start, end, [...reactions, ...loud])
-    }
+    pauses = await findPauses(words, start, end, (spec.segments ?? []) as unknown as Array<{ start_ms: number; end_ms: number; layout: string }>, videoUrl, signal)
     await db`UPDATE clips SET cut_ranges = ${db.json(pauses)} WHERE id = ${clipId}`
   }
   const cuts = joinRanges([...pauses, ...trims])
@@ -489,6 +481,26 @@ async function condenseClip(clipId: string, spec: Spec, videoUrl: string, tmp: s
  * there — found with FFmpeg's silencedetect over the clip's audio. A pause counts as silent when
  * at least 80% of it is below -35 dB. On any error nothing is protected (pauses are cut as before).
  */
+/**
+ * "Remove pauses and filler words": what goes — long pauses shortened, filler words, the first
+ * saying of a repeat (lib/cuts.ts computeCutRanges) — never inside a reaction part (splits, trios),
+ * and never a "pause" that isn't silent: a laugh, a gasp, applause between the words is a reaction,
+ * not dead air. Source ms. Make my clips saves these as removed parts the editor shows
+ * (ai_edit.ts saveClip); an older clip with the switch on still has them cut here at export.
+ * `segments`: clip-relative ms; `videoUrl`: a link or a file of the source video.
+ */
+export async function findPauses(
+  words: Parameters<typeof computeCutRanges>[0], start: number, end: number,
+  segments: Array<{ start_ms: number; end_ms: number; layout: string }>, videoUrl: string, signal?: AbortSignal,
+): Promise<Range[]> {
+  const reactions = reactionRanges(segments, start)
+  const pauses = computeCutRanges(words, start, end, reactions)
+  const loud = await loudPauses(pauses, words, videoUrl, start, end, signal)
+  if (!loud.length) return pauses
+  console.log(`[pauses] Keeping ${loud.length} pause(s) with sound in them (laughs/reactions): ${loud.map(([a, b]) => `${((a - start) / 1000).toFixed(1)}-${((b - start) / 1000).toFixed(1)}s`).join(', ')}`)
+  return computeCutRanges(words, start, end, [...reactions, ...loud])
+}
+
 async function loudPauses(cuts: Range[], words: Array<{ start_ms: number; end_ms: number }>, videoUrl: string, start: number, end: number, signal?: AbortSignal): Promise<Range[]> {
   const pauses = cuts.filter(([a, b]) => b - a >= 300 && !words.some(w => w.end_ms > a && w.start_ms < b))
   if (!pauses.length) return []
