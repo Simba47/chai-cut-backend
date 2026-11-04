@@ -1,3 +1,4 @@
+import { TRANSITION_KINDS } from './lib/transitionKinds.js'
 import 'dotenv/config' // reload env
 
 // Gemini is the only AI vendor. With GOOGLE_CLOUD_PROJECT set, captions and every other AI call
@@ -178,7 +179,9 @@ async function runMigrations() {
   // Transitions between sections (the editor's Transitions tool): the kinds render.py draws with
   // ffmpeg's xfade, besides the first three. ('fade' = a dissolve, 'wipe' = wipeleft.)
   await db`ALTER TABLE transitions DROP CONSTRAINT IF EXISTS transitions_type_check`
-  await db`ALTER TABLE transitions ADD CONSTRAINT transitions_type_check CHECK (type IN ('cut', 'fade', 'wipe', 'fadeblack', 'fadewhite', 'slideleft', 'slideup', 'zoomin', 'circleopen', 'slideright', 'slidedown', 'smoothleft', 'hblur', 'radial', 'pixelize'))`
+  // (every kind the export draws: lib/transitionKinds.ts)
+  // (written into the statement: a constraint takes no parameters; the kinds are fixed names)
+  await db.unsafe(`ALTER TABLE transitions ADD CONSTRAINT transitions_type_check CHECK (type IN (${TRANSITION_KINDS.map(k => `'${k}'`).join(', ')}))`)
   await db`ALTER TABLE ai_edit_jobs ADD COLUMN IF NOT EXISTS found JSONB`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_score INTEGER`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_reason TEXT`
