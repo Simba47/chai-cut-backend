@@ -12,9 +12,11 @@
 //      section before it (a centred view there showed the wall between two people: 2026-10-31).
 //   4. Follow (the editor's Cuts mode): a view on one person keeps on them as they move, inside its strip
 //      of the picture (never over a neighbour's view); a view on two or more holds. Motion off: all hold.
+//   5. Brief appearances (findAngles from the close looks: someone on screen ~0.5 s): the format stays and
+//      the view nearest them widens to take them in for that moment, cutting out and back (user, 2026-11-01).
 
 import { trackFaces, stabilise, FRAME_INTERVAL_MS, type FrameDetection, type CropBox, type SpokenWord } from './ai_edit.js'
-import { findAngles, whoIs, withoutPictures, FRAME_SHOWS_MS } from './track_subjects.js'
+import { findAngles, whoIs, withoutPictures, faceCuts, FRAME_SHOWS_MS, type Brief } from './track_subjects.js'
 import { decideFormat, keepsAll, AUTO_FORMAT, type AutoLayout } from './auto_format.js'
 
 interface Kf { t_ms: number; x: number; y: number; w: number; h: number }
@@ -48,8 +50,12 @@ export function formatClip(
   size: { width: number; height: number }, opts: { motion?: boolean } = {},
 ): FormattedPart[] {
   const ar = size.width / size.height
-  frames = withoutPictures(frames, cuts)
-  const angles = findAngles(frames, cuts, durationMs, speech)
+  // (the close looks only find brief appearances: the rest — pictures, who is who, Follow — reads the 4-a-second frames)
+  const close = frames.filter(f => f.close)
+  frames = withoutPictures(frames.filter(f => !f.close), cuts)
+  // (with the camera cuts FFmpeg missed: wipes, soft cuts — none when the caller added them already)
+  cuts = [...cuts, ...faceCuts(frames, cuts)].sort((x, y) => x - y)
+  const angles = findAngles([...frames, ...close], cuts, durationMs, speech)
   // Who each face is: a scene's people are where it was first seen, and someone can sit elsewhere in a
   // place it comes back (another take of the same angle): Follow finds them by who they are
   const who = opts.motion === false ? new Map<CropBox, number>() : whoIs(frames, cuts)
@@ -57,8 +63,11 @@ export function formatClip(
   const decided: Decided[] = angles.filter(g => g.people > 0).flatMap(g => g.spans.flatMap(([s, e], i): Decided[] => {
     const a = Math.max(0, Math.round(s)), b = Math.min(durationMs, Math.round(e))
     if (b - a < MIN_PLACE_MS) return []
-    const faces = g.faces as CropBox[]
-    const plan = decideFormat(faces, g.talk?.[i] ?? null, ar, size.height)
+    // (the people in this place: a scene's places can show fewer of them — 2026-11-03)
+    const here = g.present?.[i] ?? g.faces.map((_, k) => k)
+    const faces = here.map(k => g.faces[k]) as CropBox[]
+    const talk = g.talk?.[i] ? here.map(k => g.talk![i][k] ?? 0) : null
+    const plan = decideFormat(faces, talk, ar, size.height)
     return plan ? [{ a, b, faces, plan }] : []
   })).sort((p, q) => p.a - q.a)
   // A very short place takes the format of the place right before it (no flicker on fast cutting), when
@@ -101,7 +110,93 @@ export function formatClip(
   if (durationMs - at >= 50) between(at, durationMs)
   else if (out.length) out[out.length - 1].end_ms = durationMs
   if (!out.length) out.push(cutaway(0, durationMs))
+  // Someone on screen briefly: the section keeps its format, the view nearest them takes them in
+  for (const g of angles) for (const b of g.brief ?? []) {
+    const part = out.find(p => p.why !== 'cutaway' && p.layout !== 'frame_blur_fill' && p.start_ms < b.to && p.end_ms > b.from)
+    if (part) widenFor(part, b, g.faces as CropBox[])
+  }
   return out
+}
+
+/** Room kept around a newcomer's face when a view widens to take them in (face heights above and below, face widths beside) */
+const WIDEN_ROOM_TOP = 0.5
+const WIDEN_ROOM_BOTTOM = 0.6
+const WIDEN_ROOM_SIDE = 0.25
+/** A brief moment shorter than this (once inside its section) isn't widened for */
+const WIDEN_MIN_MS = 150
+
+/** Where a view is at `t`: the renderer glides between keyframes (before the first: the first) */
+export function viewAt(kfs: readonly Kf[], t: number): Omit<Kf, 't_ms'> {
+  const pick = ({ x, y, w, h }: Kf) => ({ x, y, w, h })
+  if (t <= kfs[0].t_ms) return pick(kfs[0])
+  for (let i = 1; i < kfs.length; i++) {
+    if (t > kfs[i].t_ms) continue
+    const p = kfs[i - 1], q = kfs[i], f = q.t_ms === p.t_ms ? 1 : (t - p.t_ms) / (q.t_ms - p.t_ms)
+    return { x: p.x + (q.x - p.x) * f, y: p.y + (q.y - p.y) * f, w: p.w + (q.w - p.w) * f, h: p.h + (q.h - p.h) * f }
+  }
+  return pick(kfs[kfs.length - 1])
+}
+
+/**
+ * A view taking in `face` as well as the people it shows (`keep`): the same shape, never smaller, about
+ * the middle of them all, inside the picture and its strip (lo..hi across — never over a neighbour's
+ * view); everyone in it whole. With the room around the faces if that fits, else the faces alone; null
+ * when even that can't be done (the view stays as it was).
+ */
+export function widened(view: Omit<Kf, 't_ms'>, keep: readonly CropBox[], face: CropBox, lo = 0, hi = 1): Omit<Kf, 't_ms'> | null {
+  const shape = view.w / view.h
+  const all = [...keep, face]
+  for (const room of [true, false]) {
+    const x0 = Math.min(...all.map(f => f.x - (room ? WIDEN_ROOM_SIDE * f.w : 0)))
+    const x1 = Math.max(...all.map(f => f.x + f.w + (room ? WIDEN_ROOM_SIDE * f.w : 0)))
+    const y0 = Math.max(0, Math.min(...all.map(f => f.y - (room ? WIDEN_ROOM_TOP * f.h : 0))))
+    const y1 = Math.min(1, Math.max(...all.map(f => f.y + f.h + (room ? WIDEN_ROOM_BOTTOM * f.h : 0))))
+    let h = Math.min(1, Math.max(view.h, y1 - y0, (x1 - x0) / shape))
+    let w = shape * h
+    if (w > hi - lo) { w = hi - lo; h = w / shape }
+    if (w < view.w - 1e-6) return null
+    const v = { x: clamp((x0 + x1) / 2 - w / 2, lo, hi - w), y: clamp((y0 + y1) / 2 - h / 2, 0, 1 - h), w, h }
+    if (all.every(f => within(f, v))) return v
+  }
+  return null
+}
+
+/**
+ * A brief appearance in a section: the view whose strip holds them (else the nearest) widens to take
+ * them in with the scene's people it shows (`people`) over [from, to) — cut out and back, as the editor
+ * cuts (a keyframe 1 ms before each change); its moves within that moment give way. The section's format
+ * and other views stay as they are.
+ */
+function widenFor(part: FormattedPart, b: Brief, people: readonly CropBox[]) {
+  const from = Math.max(part.start_ms, b.from), to = Math.min(part.end_ms, b.to)
+  if (to - from < WIDEN_MIN_MS) return
+  const face: CropBox = { x: b.x, y: b.y, w: b.w, h: b.h }
+  const views = part.slotKfs.map(kfs => viewAt(kfs, from))
+  const cx = b.x + b.w / 2
+  const strip = (s: number) => {
+    const mid = views[s].x + views[s].w / 2
+    const others = views.filter((_, k) => k !== s)
+    return [Math.max(0, ...others.filter(o => o.x + o.w / 2 < mid).map(o => o.x + o.w)), Math.min(1, ...others.filter(o => o.x + o.w / 2 >= mid).map(o => o.x))]
+  }
+  // (a view that already shows them whole needs nothing)
+  if (views.some(v => within(face, v))) return
+  const order = views.map((v, s) => ({ s, inStrip: cx >= strip(s)[0] && cx <= strip(s)[1], d: Math.abs(v.x + v.w / 2 - cx) }))
+    .sort((p, q) => Number(q.inStrip) - Number(p.inStrip) || p.d - q.d)
+  for (const { s } of order) {
+    const [lo, hi] = strip(s)
+    const v = widened(views[s], people.filter(f => within(f, views[s])), face, lo, hi)
+    if (!v) continue
+    const kfs = part.slotKfs[s]
+    const back = viewAt(kfs, to)
+    const held = from > part.start_ms ? [{ t_ms: from - 1, ...viewAt(kfs, from - 1) }] : []
+    const next: Kf[] = [
+      ...kfs.filter(k => k.t_ms < from - 1 || k.t_ms >= to + 1),
+      ...held, { t_ms: from, ...v }, { t_ms: to - 1, ...v },
+      ...(to < part.end_ms ? [{ t_ms: to, ...back }] : []),
+    ].sort((p, q) => p.t_ms - q.t_ms)
+    part.slotKfs[s] = next.filter((k, i) => i === next.length - 1 || next[i + 1].t_ms !== k.t_ms)
+    return
+  }
 }
 
 /**

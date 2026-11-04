@@ -17,6 +17,7 @@ import { brandCaptionWords, brandClipText, brandVoice } from '../lib/brandWords.
 import { brollEnabled, pickBrollMoments, searchCandidates, chooseBroll, brollWindow, downloadStock, withBroll, type BrollShot } from '../lib/broll.js'
 import { findVisuals, describeVisuals, pickVisualMoments, detectPanels, refinePanels, type Visual, type VisualMoment, type Panel } from '../lib/visuals.js'
 import { formatClip } from './clip_formats.js'
+import { closeLookWindows, readCloseLooks, faceCuts, withoutPictures } from './track_subjects.js'
 import { personView } from './auto_format.js'
 import { r2UploadFile } from '../r2.js'
 import { fileURLToPath } from 'node:url'
@@ -35,7 +36,12 @@ export interface CropBox {
   /** People mode: the face changes less than its surroundings, as a picture on the wall does (track_subjects.ts withoutPictures) */
   still?: boolean
 }
-export interface FrameDetection { frame_index: number; person_count: number; faces: CropBox[] }
+/**
+ * `close`: read in a close look (track_subjects.ts readCloseLooks: 10 a second over a short piece), its
+ * frame_index fractional — the time it shows, on the 4-a-second scale. Only the scan's brief-appearance
+ * finding reads these; everything else takes the 4-a-second frames alone.
+ */
+export interface FrameDetection { frame_index: number; person_count: number; faces: CropBox[]; close?: boolean }
 export interface FaceInfo { face_count: number; face_boxes: CropBox[]; frames: FrameDetection[] }
 interface SlotKf { t_ms: number; x: number; y: number; w: number; h: number }
 interface ClipSegment {
@@ -173,14 +179,15 @@ export async function probeSize(videoPath: string): Promise<{ width: number; hei
   }
 }
 
-async function extractFrames(videoPath: string, startMs: number, endMs: number, outDir: string, signal?: AbortSignal): Promise<void> {
+/** Frames of [startMs, endMs) as JPEGs in `outDir`, `fps` a second, named `<prefix>_0001.jpg`… */
+export async function extractFrames(videoPath: string, startMs: number, endMs: number, outDir: string, signal?: AbortSignal, fps = DETECT_FPS, prefix = 'frame'): Promise<void> {
   await execFileAsync('ffmpeg', [
     '-ss', String(startMs / 1000),
     '-t', String((endMs - startMs) / 1000),
     '-i', videoPath,
-    '-an', '-vf', `fps=${DETECT_FPS},scale=640:-1`,
+    '-an', '-vf', `fps=${fps},scale=640:-1`,
     '-q:v', '3',
-    join(outDir, 'frame_%04d.jpg'),
+    join(outDir, `${prefix}_%04d.jpg`),
   ], { signal })
 }
 
@@ -215,7 +222,14 @@ export async function detectFaces(tmp: string, videoPath: string, startMs: numbe
   } catch {
     return EMPTY
   }
+  return readFramesDir(framesDir, signal, lips, allFaces, people)
+}
 
+/**
+ * The faces in a folder of frames (face_detect.py; frame_index = the frames' order by name), the
+ * folder removed after. Empty when the reader fails.
+ */
+export async function readFramesDir(framesDir: string, signal?: AbortSignal, lips = false, allFaces = false, people = false): Promise<FaceInfo> {
   const result = await new Promise<FaceInfo>((resolve) => {
     const script = join(__dirname, '../../src/python/face_detect.py')
     const proc = spawn('python3', [script, '--frames-dir', framesDir, ...(lips ? ['--lips'] : []), ...(allFaces ? ['--all-faces'] : []), ...(people ? ['--people'] : [])], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', MPLBACKEND: 'Agg' } })
@@ -1806,7 +1820,11 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         // people, the views following them), its graphic panels over one-person parts; else frame by frame
         let segments: ClipSegment[]
         if (rulebook && analysis.info.frames.length) {
-          const parts = formatClip(analysis.info.frames, analysis.cuts, clipDurationMs, analysis.speech, size!, { motion: framing.motion })
+          // The camera cuts FFmpeg missed (wipes, soft cuts), found from the faces — posters left out
+          analysis.cuts.push(...faceCuts(withoutPictures(analysis.info.frames, analysis.cuts), analysis.cuts)); analysis.cuts.sort((x, y) => x - y)
+          // The short pieces read again 10 times a second (someone on screen half a second: the view takes them in)
+          const close = await readCloseLooks(tmp, videoPath, highlight.start_ms, closeLookWindows(analysis.info.frames, analysis.cuts, clipDurationMs), signal)
+          const parts = formatClip([...analysis.info.frames, ...close], analysis.cuts, clipDurationMs, analysis.speech, size!, { motion: framing.motion })
           const counts = parts.reduce<Record<string, number>>((n, p) => ({ ...n, [p.why]: (n[p.why] ?? 0) + 1 }), {})
           console.log(`[ai_edit] Rulebook formats: ${parts.length} part(s) — ${Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(', ')}`)
           segments = parts.map(({ why: _why, ...p }) => p)
