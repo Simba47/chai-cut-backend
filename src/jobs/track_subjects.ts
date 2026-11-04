@@ -1,5 +1,6 @@
-import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { tmpdir } from 'node:os'
@@ -73,7 +74,7 @@ const pstdev = (v: number[]) => {
  */
 export function speakingTurns(
   frameCount: number, timeOf: (fi: number) => number, subjects: string[],
-  faceOf: (s: string, fi: number) => CropBox | undefined, speech: SpokenWord[],
+  faceOf: (s: string, fi: number) => CropBox | undefined, speech: SpokenWord[], cuts: readonly number[] = [],
 ): Map<string, Turn[]> {
   const out = new Map<string, Turn[]>(subjects.map(s => [s, []]))
   if (!speech.length || !subjects.length || !frameCount) return out
@@ -110,7 +111,43 @@ export function speakingTurns(
     const best = [...votes].sort((a, b) => b[1] - a[1])[0]
     if (best && best[1] >= LABEL_MIN_WORDS && best[1] >= LABEL_MIN_SHARE * list.length) labelTo.set(label, best[0])
   }
-  const whos = words.map(x => (x.w.speaker_id ? labelTo.get(x.w.speaker_id) : undefined) ?? x.lead ?? (x.seen.length === 1 ? x.seen[0] : null))
+  // …and each stretch of a label's talk (its words with pauses under TURN_GAP_MS, in one camera shot:
+  // `cuts`) the person whose lips lead on most of its words: the transcript can put two people under one
+  // label (2026-11-04: two men's 50 s as one label, all given to one of them, so the view sought him while
+  // the other talked; a 20-s stretch over three shots went to whoever led in two of them). A stretch the
+  // lips can't tell takes the label's person
+  // (someone whose own voice is another label doesn't take this label's stretch on lips alone: a label is
+  // a voice — 2026-11-04: in a wide shot, B's lips "led" on D's words while D, small and side-on, talked)
+  const ownsOther = (who: string, label: string) => labelTo.get(label) !== who && [...labelTo].some(([l, w]) => l !== label && w === who)
+  // One unbroken piece of a label's talk is one person: a shot of it the lips can't tell (a wide shot, a
+  // face side-on) takes the person of its nearest shot that can (2026-11-04: D talked on over three
+  // shots; only his close-up showed his lips), and only then the label's person
+  const runPerson = new Map<number, string>()
+  for (let i = 0; i < words.length;) {
+    const label = words[i].w.speaker_id
+    let j = i + 1
+    while (label && j < words.length && words[j].w.speaker_id === label && words[j].w.start_ms - words[j - 1].w.end_ms < TURN_GAP_MS) j++
+    if (label) {
+      // Its shots (split on the camera cuts), each with the person its lips say, if they do
+      const shots: Array<{ a: number; b: number; who?: string }> = []
+      for (let k = i; k < j; k++) {
+        if (k === i || cuts.some(c => c > words[k - 1].w.start_ms && c <= words[k].w.start_ms)) shots.push({ a: k, b: k + 1 })
+        else shots[shots.length - 1].b = k + 1
+      }
+      for (const sh of shots) {
+        const votes = new Map<string, number>()
+        for (let k = sh.a; k < sh.b; k++) { const lead = words[k].lead; if (lead && !ownsOther(lead, label)) votes.set(lead, (votes.get(lead) ?? 0) + 1) }
+        const best = [...votes].sort((a, b) => b[1] - a[1])[0]
+        if (best && best[1] >= LABEL_MIN_WORDS && best[1] >= LABEL_MIN_SHARE * (sh.b - sh.a)) sh.who = best[0]
+      }
+      shots.forEach((sh, n) => {
+        const near = sh.who ?? shots.map((o, m) => ({ o, d: Math.abs(m - n) })).filter(x => x.o.who).sort((p, q) => p.d - q.d)[0]?.o.who ?? labelTo.get(label)
+        if (near) for (let k = sh.a; k < sh.b; k++) runPerson.set(k, near)
+      })
+    }
+    i = j
+  }
+  const whos = words.map((x, i) => runPerson.get(i) ?? x.lead ?? (x.seen.length === 1 ? x.seen[0] : null))
   // A word with no clear talker right before someone's words is theirs: at a hand-over both mouths
   // move within the lip readings' half second, so a turn's first word is often unclear by lips alone
   for (let i = whos.length - 2; i >= 0; i--) {
@@ -452,7 +489,7 @@ export function followSubjects(frames: FrameDetection[], cuts: number[], marks: 
   }
   // Who is talking when, to the word (durationMs: kept for the callers; the words carry the times)
   void durationMs
-  const turns = speakingTurns(fr.length, timeOf, subjects, (s, fi) => faces.get(s)?.get(fi), speech)
+  const turns = speakingTurns(fr.length, timeOf, subjects, (s, fi) => faces.get(s)?.get(fi), speech, cuts)
   const talksAt = (s: string, t: number) => (turns.get(s) ?? []).some(([a, b]) => t >= a && t <= b)
 
   return marks.map(mk => {
@@ -890,6 +927,100 @@ export async function readCloseLooks(tmp: string, videoPath: string, startMs: nu
   }
 }
 
+/** Faces narrower than this share of the scan's 640-wide frames have no identity there (face_detect.py ID_MIN_PX, 24 px) */
+const SMALL_ID_W = 24 / 640
+/** Each camera shot with such faces gets this many of its frames read again from the original (identities need ID_MIN_FACES)… */
+const SMALL_ID_FRAMES = 4
+/** …at most this many frames in all (a clip of wide shots), grabbed this many at once */
+const SMALL_ID_MAX = 60
+const SMALL_ID_AT_ONCE = 8
+/** A grab taking longer than this is left out; past the budget no more are started (an uploaded original
+ *  can be slow to jump into: one took over 90 s — the editing copy, made by us, takes about 1 s) */
+const SMALL_ID_GRAB_MS = 20_000
+const SMALL_ID_BUDGET_MS = 45_000
+/** Only faces the detector is this sure of are worth it */
+const SMALL_ID_SURE = 0.6
+
+/**
+ * Who the small faces are (2026-11-04: in a wide shot of six, faces of 16–19 px had no identity; a
+ * person's track, joined by colours, went to the man beside them, and Follow the speaker showed him): a
+ * few frames of each camera shot with them are grabbed at the video's own size (`videoUrl`: what the scan
+ * reads — the editing copy, 1280 wide, doubles them to 28–35 px; the original, 1920, made them 45–75 px)
+ * and read there by face_detect.py --identities; the identity goes on the face in `frames` (changed in
+ * place). `startMs`: the scan's start in the video. How many faces got one; none when there's nothing to
+ * read or it fails. A grab that fails or is slow is left out.
+ */
+export async function readSmallIdentities(tmp: string, videoUrl: string, startMs: number, frames: FrameDetection[], cuts: number[], signal?: AbortSignal): Promise<number> {
+  const fr = [...frames].filter(f => !f.close).sort((a, b) => a.frame_index - b.frame_index)
+    .map(f => ({ f, faces: f.faces.filter(face => (face.score ?? 0) > 0) }))
+  if (!fr.length) return 0
+  const ids = trackFaces(fr.map(x => ({ ...x.f, faces: x.faces })), cuts.map(c => c - FRAME_SHOWS_MS))
+  const tracks = new Map<number, Array<{ fi: number; face: CropBox }>>()
+  fr.forEach((x, fi) => ids[fi].forEach((id, k) => tracks.set(id, [...(tracks.get(id) ?? []), { fi, face: x.faces[k] }])))
+  const small = (face: CropBox) => !face.emb?.length && face.w < SMALL_ID_W && (face.score ?? 0) >= SMALL_ID_SURE
+  // The faces wanting it: tracks with too few faces read who they are, and small ones to read
+  const wanting = new Set<CropBox>()
+  for (const list of tracks.values()) {
+    if (list.filter(x => x.face.emb?.length).length >= ID_MIN_FACES || list.filter(x => small(x.face)).length < 2) continue
+    for (const x of list) if (small(x.face)) wanting.add(x.face)
+  }
+  // The frames to read: in each camera shot, a few spread over it, those showing the most of them — one
+  // frame of a wide shot holds all its small faces (2026-11-04: 38 frames a track at a time took 72 s)
+  const timeOf = (fi: number) => fr[fi].f.frame_index * FRAME_INTERVAL_MS + FRAME_SHOWS_MS
+  const shots = new Map<number, number[]>()
+  fr.forEach((x, fi) => {
+    if (!x.faces.some(face => wanting.has(face))) return
+    const shot = cuts.filter(c => c <= timeOf(fi)).length
+    shots.set(shot, [...(shots.get(shot) ?? []), fi])
+  })
+  const picks = new Set<number>()
+  for (const fis of [...shots.values()].sort((a, b) => b.length - a.length)) {
+    const n = Math.min(SMALL_ID_FRAMES, fis.length)
+    // (the frames showing the most of them, then spread over the shot)
+    const most = Math.max(...fis.map(fi => fr[fi].faces.filter(face => wanting.has(face)).length))
+    const best = fis.filter(fi => fr[fi].faces.filter(face => wanting.has(face)).length >= most - 1)
+    const from = best.length >= n ? best : fis
+    const take = Array.from({ length: n }, (_, k) => from[Math.floor((k + 0.5) * from.length / n)])
+    if (picks.size + take.filter(fi => !picks.has(fi)).length > SMALL_ID_MAX) break
+    take.forEach(fi => picks.add(fi))
+  }
+  if (!picks.size) return 0
+  const dir = join(tmp, `ids-${startMs}`)
+  await mkdir(dir, { recursive: true })
+  try {
+    const order = [...picks].sort((a, b) => a - b)
+    const files = order.map(fi => join(dir, `id_${String(fi).padStart(5, '0')}.png`))
+    const grabbed: boolean[] = order.map(() => false)
+    const t0 = Date.now()
+    for (let k = 0; k < order.length && Date.now() - t0 < SMALL_ID_BUDGET_MS; k += SMALL_ID_AT_ONCE) {
+      await Promise.all(order.slice(k, k + SMALL_ID_AT_ONCE).map((fi, j) => promisify(execFile)('ffmpeg', [
+        '-v', 'error', '-ss', String((startMs + fr[fi].f.frame_index * FRAME_INTERVAL_MS + FRAME_SHOWS_MS) / 1000), '-i', videoUrl,
+        '-frames:v', '1', '-y', files[k + j],
+      ], { signal, timeout: SMALL_ID_GRAB_MS }).then(() => { grabbed[k + j] = true }, e => { if (signal?.aborted) throw e })))
+    }
+    // Every face of each grabbed frame without an identity (one read serves its neighbours too)
+    const asked = order.map((fi, k) => (grabbed[k] ? fr[fi].faces.filter(face => !face.emb?.length) : []))
+    if (!asked.some(list => list.length)) return 0
+    const spec = join(dir, 'spec.json')
+    await writeFile(spec, JSON.stringify(order.flatMap((_, k) => (grabbed[k] ? [{ file: files[k], faces: asked[k].map(f => [f.x, f.y, f.w, f.h]) }] : []))))
+    const script = join(dirname(fileURLToPath(import.meta.url)), '../../src/python/face_detect.py')
+    const { stdout } = await promisify(execFile)('python3', [script, '--identities', spec], {
+      signal, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8', MPLBACKEND: 'Agg' },
+    })
+    const got = (JSON.parse(stdout).identities ?? []) as Array<Array<number[] | null>>
+    let n = 0
+    asked.filter((_, k) => grabbed[k]).forEach((list, k) => list.forEach((face, j) => { const e = got[k]?.[j]; if (e?.length) { face.emb = e; n++ } }))
+    console.log(`[track_subjects] small faces: ${grabbed.filter(Boolean).length} of ${order.length} frame(s) read again (${((Date.now() - t0) / 1000).toFixed(1)} s), ${n} identities`)
+    return n
+  } catch (e) {
+    if (signal?.aborted) throw e
+    console.warn('[track_subjects] small faces not read:', e instanceof Error ? e.message : e)
+    return 0
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
 /**
  * Someone on screen too briefly to be one of a scene's people (seen in under PRESENCE_MIN_FRAMES of its
  * 4-a-second frames), whom the close looks show clearly: their face (the middle of their sightings) and
@@ -1099,7 +1230,7 @@ export function findAngles(frames: FrameDetection[], cuts: number[], durationMs:
   // Each person's talking turns (by who they are: the transcript's words, each to whose lips move on it)
   const everyone = [...new Set(personAt.values())]
   const turns = speech.length && everyone.length
-    ? speakingTurns(fr.length, timeOf, everyone.map(String), (s, fi) => fr[fi].faces.find(f => personAt.get(f) === Number(s)), speech)
+    ? speakingTurns(fr.length, timeOf, everyone.map(String), (s, fi) => fr[fi].faces.find(f => personAt.get(f) === Number(s)), speech, cuts)
     : null
   const talking = (p: number | undefined, [a, b]: Turn) => p === undefined || !turns ? 0
     : Math.round((turns.get(String(p)) ?? []).reduce((n, [x, y]) => n + Math.max(0, Math.min(b, y) - Math.max(a, x)), 0))
@@ -1373,6 +1504,8 @@ async function followMarked(clip_id: string, start_ms: number, end_ms: number, s
     ])
     signal?.throwIfAborted()
     await setSubjects(ids, { progress: 90 })
+    // Who the small faces (a wide shot's) are, read again at the video's own size (readSmallIdentities)
+    await readSmallIdentities(tmp, videoPath, from, info.frames, cuts, signal)
     info.frames = withoutPictures(info.frames, cuts, subjects.filter(s => !s.shot).map(s => ({ t: s.mark_ms - from, x: s.mark_x, y: s.mark_y })))
     // (and the camera cuts FFmpeg missed: wipes, soft cuts — faceCuts)
     cuts.push(...faceCuts(info.frames, cuts)); cuts.sort((x, y) => x - y)
@@ -1444,6 +1577,8 @@ async function scanAngles(clipId: string, from: number, to: number, signal?: Abo
       spokenWords(clip.video_id, from, to),
     ])
     signal?.throwIfAborted()
+    // Who the small faces (a wide shot's) are, read again at the video's own size (readSmallIdentities)
+    await readSmallIdentities(tmp, videoPath, from, info.frames, cuts, signal)
     info.frames = withoutPictures(info.frames, cuts)
     // (and the camera cuts FFmpeg missed: wipes, soft cuts — faceCuts)
     cuts.push(...faceCuts(info.frames, cuts)); cuts.sort((x, y) => x - y)
@@ -1577,6 +1712,8 @@ async function subEditSteps(clipId: string, signal: AbortSignal, onCreated: (ids
       probeSize(videoPath),
     ])
     signal?.throwIfAborted()
+    // Who the small faces (a wide shot's) are, read again at the video's own size (readSmallIdentities)
+    await readSmallIdentities(tmp, videoPath, from, info.frames, cuts, signal)
     info.frames = withoutPictures(info.frames, cuts)
     // (and the camera cuts FFmpeg missed: wipes, soft cuts — faceCuts)
     cuts.push(...faceCuts(info.frames, cuts)); cuts.sort((x, y) => x - y)

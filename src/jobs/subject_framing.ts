@@ -127,6 +127,18 @@ export function subjectTalksAt(path: readonly SubjectPoint[], sourceMs: number, 
   return !!near && near[5] === 1
 }
 
+/**
+ * Who of `seen` the view goes to when the one talking isn't in the picture (and the one it shows has left):
+ * whoever's mouth is moving, else the biggest face — not the first marked (2026-11-04: a voice off screen
+ * sent the view to whoever came first in the list)
+ */
+function likeliest<S extends { path: readonly SubjectPoint[] }>(seen: readonly S[], sourceMs: number, cuts?: Cuts): S | undefined {
+  const talking = seen.filter(s => subjectTalksAt(s.path, sourceMs, cuts))
+  const pool = talking.length ? talking : seen
+  const size = (s: S) => { const b = subjectBoxAt(s.path, sourceMs, cuts); return b ? b.w * b.h : 0 }
+  return [...pool].sort((a, b) => size(b) - size(a))[0]
+}
+
 /** A switch to someone else holds at least this long (unless they leave the picture) */
 const SWITCH_HOLD_MS = 1500
 /** A stretch shorter than this joins the one before it (no flicker) */
@@ -155,7 +167,7 @@ export function directStretches(
     const here = current !== null && seen.some(s => s.id === current)
     let want: string | null = current
     if (talking.length) want = talking.some(s => s.id === current) ? current : talking[0].id
-    else if (!here && seen.length) want = seen[0].id
+    else if (!here && seen.length) want = likeliest(seen, src, cuts)!.id
     if (want === current) { pending = null; picks.push({ t, id: current }); continue }
     // The one shown has left the picture (or nobody is shown yet): at once
     if (!here || current === null) { current = want; since = t; pending = null; picks.push({ t, id: current }); continue }
@@ -246,7 +258,7 @@ export function turnStretches(
     const seen = subjects.filter(s => seenAt(s, p))
     let next: string | null = current
     if (seen.some(s => s.id === want)) next = want
-    else if (current === null || !seen.some(s => s.id === current)) next = seen[0]?.id ?? current
+    else if (current === null || !seen.some(s => s.id === current)) next = likeliest(seen, toSource(p + 1), cuts)?.id ?? current
     if (next === null) continue
     if (next !== current) { out.push({ from: p, to, id: next }); current = next }
   }
