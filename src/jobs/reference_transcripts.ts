@@ -6,6 +6,7 @@
  *   - a background check (not a queue job: it holds no job slot) collects finished transcripts
  *   - when Make my clips picks moments, the same picker runs on the reference transcript in the
  *     background and both lists are saved for comparison. Users still get today's clips.
+ * On: the same, and Make my clips picks from the reference transcript (jobs/ai_edit.ts waitForWords).
  * Its own tables only: reference_transcripts and reference_compare.
  */
 import { HeadObjectCommand } from '@aws-sdk/client-s3'
@@ -77,6 +78,22 @@ export async function submitReferenceFor(videoId: string, storagePath: string): 
       ON CONFLICT (video_id) DO UPDATE SET status = 'failed', error = EXCLUDED.error`
     console.warn(`[reference] video ${videoId}: not sent: ${error}`)
   }
+}
+
+export type ReferenceTranscript =
+  | { state: 'none' | 'pending' | 'failed' }
+  | { state: 'done'; words: ReferenceWord[]; language: string | null }
+
+/** A video's reference transcript, for Make my clips (switch on) */
+export async function referenceTranscriptOf(videoId: string): Promise<ReferenceTranscript> {
+  const [row] = await db<{ status: string; words: ReferenceWord[] | null; language: string | null }[]>`
+    SELECT status, CASE WHEN status = 'done' THEN words END AS words, language
+    FROM reference_transcripts WHERE video_id = ${videoId}`
+  if (!row) return { state: 'none' }
+  if (row.status === 'submitted') return { state: 'pending' }
+  // a transcript with no words (music only) is no use for picking moments: today's way
+  if (row.status === 'done' && row.words?.length) return { state: 'done', words: row.words, language: row.language }
+  return { state: 'failed' }
 }
 
 /** One round of the background check: collect finished transcripts, give up on stuck ones */

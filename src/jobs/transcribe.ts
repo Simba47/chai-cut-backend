@@ -278,6 +278,9 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
           execFileAsync('ffmpeg', ['-i', audioPath, '-compression_level', '5', '-y', flacOut])
             .then(() => readFile(flacOut))
             .then(buf => r2Upload(cachePath, buf, 'audio/flac'))
+            // The reference transcript can start now rather than after the editing copy (jobs/proxy.ts
+            // also hands it over; a video already handed over is not sent again)
+            .then(() => import('./reference_transcripts.js').then(m => m.submitReferenceFor(payload.video_id, storagePath!)))
             .catch(e => console.warn('[transcribe] audio cache upload failed:', e))
         }
       }

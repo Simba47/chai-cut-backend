@@ -10,6 +10,8 @@ import { handleTranscribeJob, fillTranscriptGaps } from './transcribe.js'
 import { findClips, type FoundClip } from '../lib/clipFinder.js'
 import { askGemini } from '../lib/gemini.js'
 import { findLoops } from '../lib/transcriptGuard.js'
+import { referenceMode, referencePercent, inRollout, wordsSource, captionRanges, geminiLanguage } from '../lib/referenceTranscript.js'
+import { referenceTranscriptOf, type ReferenceTranscript } from './reference_transcripts.js'
 import { generateClipText, fontForText, type ClipText, type ClipTextLanguage } from '../lib/clipText.js'
 import { fitInRoom, minWidthFor, sideBySideRooms, steadyRoom } from '../lib/framingRoom.js'
 import { loadClipBrand, logoSpan, brandCaptionRow, type ClipBrand } from '../lib/brandKit.js'
@@ -1606,20 +1608,72 @@ async function loadWords(videoId: string): Promise<{ words: Word[]; whole: boole
   return { words, whole: row.whole_video === true }
 }
 
-/** Waits (up to 10 min) for the full-video captions started at upload, instead of paying for a second transcription */
-async function waitForFullTranscription(videoId: string, signal?: AbortSignal) {
+/**
+ * Waits (up to 10 min) for words to pick moments from, instead of paying for a second transcription:
+ * the full-video captions started at upload or, with REFERENCE_TRANSCRIBER=on and the video in the
+ * REFERENCE_PERCENT share, the reference transcript, whichever is ready first (lib/referenceTranscript.ts
+ * wordsSource). Returns the reference transcript when the moments are to be picked from it.
+ */
+async function waitForWords(videoId: string, durationMs: number | null, signal?: AbortSignal): Promise<Extract<ReferenceTranscript, { state: 'done' }> | null> {
+  const useReference = referenceMode() === 'on' && inRollout(videoId, referencePercent())
   const deadline = Date.now() + 10 * 60_000
-  while (Date.now() < deadline) {
+  for (;;) {
+    const { words, whole } = await loadWords(videoId)
+    const reference = useReference ? await referenceTranscriptOf(videoId) : { state: 'none' as const }
     const [running] = await db`
       SELECT id FROM jobs
       WHERE type = 'transcribe' AND payload->>'video_id' = ${videoId}
         AND payload->>'transcribe_full' = 'true' AND status IN ('queued', 'processing')
       LIMIT 1
     `
-    if (!running) return
+    const source = wordsSource({
+      savedComplete: whole || coversVideo(words, durationMs ?? (words.length ? words[words.length - 1].end_ms : 0)),
+      useReference, reference: reference.state, fullReadingRunning: !!running, timedOut: Date.now() >= deadline,
+    })
+    if (source === 'reference' && reference.state === 'done') return reference
+    if (source !== 'wait') return null
     signal?.throwIfAborted()
     await new Promise(r => setTimeout(r, 5000))
   }
+}
+
+/**
+ * Moments picked from the reference transcript: Gemini reads only those parts of the video, for the
+ * captions, titles and hooks people see (the reference words are never shown). Each part is read as a
+ * clip's captions are (jobs/transcribe.ts), into the video's transcript; a part that cannot be read
+ * leaves that clip without words, as a clip made in the editor before its captions are read. Returns
+ * the transcript's words.
+ */
+async function readChosenParts(
+  aiEditJobId: string, videoId: string, storagePath: string, clips: FoundClip[], durationMs: number,
+  languageCode: string | undefined, signal: AbortSignal, onPart: (done: number, total: number) => Promise<void>,
+): Promise<Word[]> {
+  const parts = captionRanges(clips, durationMs)
+  const t0 = Date.now()
+  let done = 0
+  const read = async ([start, end]: [number, number], i: number) => {
+    try {
+      await handleTranscribeJob({
+        id: `ai-edit-part-${aiEditJobId}-${i}`,
+        type: 'transcribe',
+        payload: { video_id: videoId, storage_path: storagePath, clip_id: `ai-edit-${aiEditJobId}-${i}`, clip_start_ms: start, clip_end_ms: end, language_code: languageCode } as Record<string, unknown>,
+        status: 'processing',
+        error: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }, signal)
+    } catch (e) {
+      if (signal.aborted) throw e
+      console.warn(`[ai_edit] could not read ${start}-${end} ms of ${videoId} for captions:`, e instanceof Error ? e.message : e)
+    }
+    await onPart(++done, parts.length)
+  }
+  // The first part on its own: with no transcript yet it starts the video's one transcript, which the
+  // others then add to (two at once would each start their own). Then three at a time.
+  if (parts.length) await read(parts[0], 0)
+  for (let k = 1; k < parts.length; k += 3) await Promise.all(parts.slice(k, k + 3).map((p, j) => read(p, k + j)))
+  console.log(`[ai_edit] Gemini read the ${parts.length} chosen part(s) of ${videoId} (${Math.round(parts.reduce((n, [a, b]) => n + b - a, 0) / 1000)} s of ${Math.round(durationMs / 1000)} s) in ${((Date.now() - t0) / 1000).toFixed(0)} s`)
+  return (await loadWords(videoId)).words
 }
 
 async function setProgress(aiEditJobId: string, progress: number) {
@@ -1682,15 +1736,22 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
     let { words, whole } = await loadWords(video_id)
     const durationFor = (w: Word[]) => video.duration_ms ?? (w.length ? w[w.length - 1].end_ms : 0)
     const complete = () => whole || coversVideo(words, durationFor(words))
+    // Set when the moments are picked from the reference transcript (switch on): Gemini then reads
+    // only the chosen clips, after they are picked
+    let fromReference: Extract<ReferenceTranscript, { state: 'done' }> | null = null
     if (!complete()) {
-      await waitForFullTranscription(video_id, signal)
+      fromReference = await waitForWords(video_id, video.duration_ms ?? null, signal)
       ;({ words, whole } = await loadWords(video_id))
+      if (complete()) fromReference = null
     }
     // A transcript saved before the runaway guard (lib/transcriptGuard.ts) can hold a stuck
     // reading: one phrase hundreds of times over, which clip finding reads instead of the video.
     // It is read again (that reading is guarded, so a video is only read again once)
     const loops = complete() ? findLoops(words) : []
-    if (complete() && !loops.length) {
+    if (fromReference) {
+      words = fromReference.words
+      console.log(`[ai_edit] Picking moments from the reference transcript of ${video_id} (${words.length} words, ${fromReference.language ?? 'language ?'}): Gemini reads only the chosen clips`)
+    } else if (complete() && !loops.length) {
       console.log(`[ai_edit] Using the saved transcript of ${video_id} (${words.length} words): nothing is sent for captions`)
       // Read before the skipped-speech re-read: the speech it skipped is read once now, so the clips
       // see every setup and answer (and their captions have every word). If that fails, the clips are
@@ -1757,6 +1818,12 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         if (asked.length) console.log(`[ai_edit] Job ${ai_edit_job_id}: only ${highlights.length} of ${clip_count} clips can be made — waiting for the user's yes`)
         return
       }
+    }
+    // Picked from the reference transcript: the words from here on (captions, titles, hooks, B-roll)
+    // are Gemini's reading of just these clips
+    if (fromReference) {
+      words = await readChosenParts(ai_edit_job_id, video_id, video.storage_path, highlights, durationMs,
+        geminiLanguage(fromReference.language), signal, (done, total) => setProgress(ai_edit_job_id, 20 + (10 * done) / Math.max(1, total)))
     }
     await setProgress(ai_edit_job_id, 30)
 

@@ -8,7 +8,9 @@
  * REFERENCE_TRANSCRIBER switches it (the same pattern as CREDITS_MODE):
  *   off     today's behaviour, nothing new runs (the default)
  *   shadow  reference transcripts are made and compared with today's picks, users still get today's
- *   on      the new flow (not wired yet: shadow first)
+ *   on      Make my clips picks moments from the reference transcript when it is ready before the
+ *           whole-video reading, and Gemini reads only the chosen clips. For REFERENCE_PERCENT of
+ *           videos (default all); the rest, and anything not clear-cut, go today's way.
  * TRANSCRIBER_URL and TRANSCRIBER_TOKEN point at the service (the token is a secret: set by a person).
  *
  * This file has no database or network imports so its rules are tested on their own.
@@ -76,6 +78,75 @@ export function momentAgreement(baseline: Span[], reference: Span[]) {
     baselineCount: baseline.length,
     referenceCount: reference.length,
   }
+}
+
+// ── Phase 2: Make my clips picks from the reference transcript (REFERENCE_TRANSCRIBER=on) ──
+//
+// Today Make my clips needs Gemini's reading of the whole video, which can take an hour (and fail
+// at the job limit) on long videos. With the switch on, the moments are picked from the reference
+// transcript as soon as it is done, and Gemini reads only the chosen clips, for the captions,
+// titles and hooks people see. Anything not clear-cut goes today's way.
+
+/** The share of videos (0-100) that use it while the switch is on: REFERENCE_PERCENT, all when not set */
+export function referencePercent(value: string | undefined = process.env.REFERENCE_PERCENT): number {
+  const n = Number((value ?? '').trim() || 100)
+  return Number.isFinite(n) ? Math.min(100, Math.max(0, Math.round(n))) : 100
+}
+
+/** Whether a video is in the share. Each video has a fixed place 0-99 (from its id), so raising
+ *  the share only adds videos and a video never moves between the two ways. */
+export function inRollout(videoId: string, percent: number): boolean {
+  let h = 0x811c9dc5   // FNV-1a
+  for (let i = 0; i < videoId.length; i++) h = Math.imul(h ^ videoId.charCodeAt(i), 0x01000193) >>> 0
+  return h % 100 < percent
+}
+
+export type ReferenceState = 'none' | 'pending' | 'done' | 'failed'
+
+/**
+ * Where Make my clips' words come from: a finished whole-video reading ('saved'), the reference
+ * transcript ('reference'), or today's way: wait for the upload's reading ('wait'), then read the
+ * video now ('read'). Asked again every few seconds while the answer is 'wait'.
+ */
+export function wordsSource(s: {
+  savedComplete: boolean
+  /** switch on and the video in the share */
+  useReference: boolean
+  reference: ReferenceState
+  /** the upload's whole-video reading is queued or running */
+  fullReadingRunning: boolean
+  timedOut: boolean
+}): 'saved' | 'reference' | 'wait' | 'read' {
+  if (s.savedComplete) return 'saved'
+  if (s.useReference && s.reference === 'done') return 'reference'
+  if (s.timedOut) return 'read'
+  if (s.useReference && s.reference === 'pending') return 'wait'
+  return s.fullReadingRunning ? 'wait' : 'read'
+}
+
+/** What Gemini reads for the chosen clips' captions: each clip and a second either side (words
+ *  that start just outside it), overlapping parts joined, within the video */
+export function captionRanges(clips: Span[], durationMs: number, padMs = 1000): Array<[number, number]> {
+  const parts = clips
+    .map(c => [Math.max(0, c.start_ms - padMs), Math.min(durationMs, c.end_ms + padMs)] as [number, number])
+    .sort((a, b) => a[0] - b[0])
+  const out: Array<[number, number]> = []
+  for (const p of parts) {
+    const last = out[out.length - 1]
+    if (last && p[0] <= last[1]) last[1] = Math.max(last[1], p[1])
+    else out.push([...p])
+  }
+  return out
+}
+
+/** Indian languages the app captions (transcribe.ts LANG_NAMES), as the transcriber names them */
+const CAPTIONED = new Set(['te', 'hi', 'ta', 'kn', 'ml', 'bn', 'gu', 'pa', 'mr', 'or'])
+
+/** The reference transcript's language as Gemini is told it, so the clips are not each detected
+ *  again; English and others are left to Gemini's own detection, as today */
+export function geminiLanguage(language: string | null): string | undefined {
+  if (!language || !CAPTIONED.has(language)) return undefined
+  return language === 'or' ? 'od-IN' : `${language}-IN`
 }
 
 // ── The service: submit, then collect ─────────────────────────────────────────
