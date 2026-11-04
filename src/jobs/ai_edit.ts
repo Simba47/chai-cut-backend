@@ -1614,11 +1614,13 @@ async function loadWords(videoId: string): Promise<{ words: Word[]; whole: boole
  * REFERENCE_PERCENT share, the reference transcript, whichever is ready first (lib/referenceTranscript.ts
  * wordsSource). Returns the reference transcript when the moments are to be picked from it.
  */
-async function waitForWords(videoId: string, durationMs: number | null, signal?: AbortSignal): Promise<Extract<ReferenceTranscript, { state: 'done' }> | null> {
+async function waitForWords(videoId: string, signal?: AbortSignal): Promise<Extract<ReferenceTranscript, { state: 'done' }> | null> {
   const useReference = referenceMode() === 'on' && inRollout(videoId, referencePercent())
   const deadline = Date.now() + 10 * 60_000
   for (;;) {
-    const { words, whole } = await loadWords(videoId)
+    // Called with the saved transcript incomplete: only the upload's whole-video reading completes it
+    // while this waits, and that reading is saved marked whole (a flag, not every word, each round)
+    const [latest] = await db`SELECT whole_video FROM transcripts WHERE video_id = ${videoId} ORDER BY created_at DESC LIMIT 1`
     const reference = useReference ? await referenceTranscriptOf(videoId) : { state: 'none' as const }
     const [running] = await db`
       SELECT id FROM jobs
@@ -1627,7 +1629,7 @@ async function waitForWords(videoId: string, durationMs: number | null, signal?:
       LIMIT 1
     `
     const source = wordsSource({
-      savedComplete: whole || coversVideo(words, durationMs ?? (words.length ? words[words.length - 1].end_ms : 0)),
+      savedComplete: latest?.whole_video === true,
       useReference, reference: reference.state, fullReadingRunning: !!running, timedOut: Date.now() >= deadline,
     })
     if (source === 'reference' && reference.state === 'done') return reference
@@ -1740,7 +1742,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
     // only the chosen clips, after they are picked
     let fromReference: Extract<ReferenceTranscript, { state: 'done' }> | null = null
     if (!complete()) {
-      fromReference = await waitForWords(video_id, video.duration_ms ?? null, signal)
+      fromReference = await waitForWords(video_id, signal)
       ;({ words, whole } = await loadWords(video_id))
       if (complete()) fromReference = null
     }
