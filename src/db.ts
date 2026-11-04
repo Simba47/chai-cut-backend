@@ -5,9 +5,11 @@ import postgres from 'postgres'
 // the job's writes are skipped (and logged) instead of failing the export
 const localExport = !!process.env.LOCAL_EXPORT_DIR
 
-// onnotice: startup migrations use IF NOT EXISTS, and Postgres reports every skipped one as a NOTICE
+// onnotice: startup migrations use IF NOT EXISTS, and Postgres reports every skipped one as a NOTICE.
+// DB_SSL=off: a database on this PC (the website's own switch; e.g. the preview-vs-export check's
+// throwaway copy, chai-cut-frontend scripts/export-parity)
 const sql = postgres(process.env.DATABASE_URL!, {
-  ssl: 'require', onnotice: () => {},
+  ssl: process.env.DB_SSL === 'off' ? false : 'require', onnotice: () => {},
   ...(localExport ? { connection: { default_transaction_read_only: true } } : {}),
 })
 const WRITE = /^\s*(update|insert|delete|alter|create|drop|truncate)\b/i
