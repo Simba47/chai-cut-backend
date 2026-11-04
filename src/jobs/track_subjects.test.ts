@@ -288,3 +288,46 @@ test('present: a scene\'s place shows only the people seen there (even with a cu
   assert.deepEqual(scene.present?.[0], [m], 'the first place: only the man')
   assert.equal(scene.present?.[1].length, 5, 'the second place: the man and the panel')
 })
+
+// ── Who talks: each stretch of a voice by the lips, one unbroken piece of talk one person, a voice that is
+// someone's own not given to them elsewhere on lip flicker (2026-11-04: Follow the speaker showed the wrong man) ──
+const { speakingTurns } = await import('./track_subjects.js')
+/** Frames 4 a second over `dur`; `at(t)` → the people seen then: [who, lip-gap moving?] */
+function talkScene(dur: number, at: (t: number) => Array<[string, boolean]>) {
+  const n = Math.ceil(dur / 250), timeOf = (fi: number) => fi * 250 + 100
+  const faceOf = (s: string, fi: number) => {
+    const here = at(timeOf(fi)).find(([w]) => w === s)
+    if (!here) return undefined
+    return { x: 0.4, y: 0.3, w: 0.1, h: 0.16, score: 0.95, lip: here[1] ? 0.02 + 0.03 * (fi % 2) : 0.02 } as CropBox
+  }
+  return { n, timeOf, faceOf }
+}
+const wordsOf = (a: number, b: number, label: string) => Array.from({ length: Math.floor((b - a) / 400) }, (_, k) => ({ start_ms: a + k * 400, end_ms: a + k * 400 + 300, speaker_id: label }))
+const turnsSummary = (m: Map<string, Array<[number, number]>>) => Object.fromEntries([...m].map(([s, ts]) => [s, ts.map(([a, b]) => [Math.round(a / 1000), Math.round(b / 1000)])]))
+
+test('who talks: one voice label over two men (the transcript merged them) — each close-up\'s talk goes to its own man', () => {
+  // P's close-up talking 0–5 s, Q's close-up talking 6–11 s; every word labelled spk1
+  const sc = talkScene(11000, t => (t < 5500 ? [['P', true]] : [['Q', true]]))
+  const turns = speakingTurns(sc.n, sc.timeOf, ['P', 'Q'], sc.faceOf, [...wordsOf(0, 5000, 'spk1'), ...wordsOf(6000, 11000, 'spk1')], [5500])
+  const sum = turnsSummary(turns)
+  assert.ok(sum.P.length && sum.P.every(([, b]) => b <= 6), JSON.stringify(sum))
+  assert.ok(sum.Q.length && sum.Q.every(([a]) => a >= 5), JSON.stringify(sum))
+})
+
+test('who talks: one unbroken piece of talk over a wide shot, his close-up and a wide shot is all his', () => {
+  // A wide shot (both small, lips unreadable) 0–3 s, Q's close-up talking 3–6 s, the wide shot again 6–9 s — Q talks on
+  const sc = talkScene(9000, t => (t >= 3000 && t < 6000 ? [['Q', true]] : [['P', false], ['Q', false]]))
+  const turns = speakingTurns(sc.n, sc.timeOf, ['P', 'Q'], sc.faceOf, wordsOf(0, 9000, 'spk1'), [3000, 6000])
+  assert.deepEqual(turnsSummary(turns).P, [])
+  assert.equal(turnsSummary(turns).Q.reduce((n, [a, b]) => n + b - a, 0) >= 8, true, JSON.stringify(turnsSummary(turns)))
+})
+
+test('who talks: a man whose own voice is another label doesn\'t take this voice on a flicker of his lips', () => {
+  // P talks (spk1) in his close-up 0–5 s; Q (spk2) talks in his close-up 6–10 s; then a wide shot 11–15 s where
+  // Q talks on (spk2) but only P's lips flicker
+  const sc = talkScene(15000, t => (t < 5500 ? [['P', true]] : t < 10500 ? [['Q', true]] : [['P', true], ['Q', false]]))
+  const turns = speakingTurns(sc.n, sc.timeOf, ['P', 'Q'], sc.faceOf, [...wordsOf(0, 5000, 'spk1'), ...wordsOf(6000, 10000, 'spk2'), ...wordsOf(11000, 15000, 'spk2')], [5500, 10500])
+  const sum = turnsSummary(turns)
+  assert.ok(sum.P.every(([, b]) => b <= 6), `P has no turn in the wide shot: ${JSON.stringify(sum)}`)
+  assert.ok(sum.Q.some(([a, b]) => a <= 11 && b >= 14), JSON.stringify(sum))
+})
