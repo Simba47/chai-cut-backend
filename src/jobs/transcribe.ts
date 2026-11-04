@@ -16,6 +16,7 @@ import { sttRank, sttTurn, waitForStt, wavSeconds, type SttSide } from '../lib/g
 import { runawayReason, trimRunaway } from '../lib/transcriptGuard.js'
 import { skippedGaps, rereadWindows, wordsInGaps, REREAD_MIN_SOUND_SEC, REREAD_ROUNDS, REREAD_ROUND_MIN_WORDS } from '../lib/skippedSpeech.js'
 import { convertWordForWord } from '../lib/wordConvert.js'
+import { detectSarvamLang } from '../lib/scriptLanguage.js'
 import db from '../db.js'
 import type { Job, TranscribeJobPayload } from '../types.js'
 import { audioKeyFor, queueProxy } from './proxy.js'
@@ -1561,18 +1562,6 @@ const LANG_NAMES: Record<string, string> = {
   'mr': 'Marathi','mr-IN': 'Marathi',
   'pa': 'Punjabi','pa-IN': 'Punjabi',
   'or': 'Odia',  'od-IN': 'Odia',
-}
-
-function detectSarvamLang(text: string): string | undefined {
-  if (/[ఀ-౿]/.test(text)) return 'te-IN'
-  if (/[ऀ-ॿ]/.test(text)) return 'hi-IN'
-  if (/[஀-௿]/.test(text)) return 'ta-IN'
-  if (/[ಀ-೿]/.test(text)) return 'kn-IN'
-  if (/[ഀ-ൿ]/.test(text)) return 'ml-IN'
-  if (/[ঀ-৿]/.test(text)) return 'bn-IN'
-  if (/[઀-૿]/.test(text)) return 'gu-IN'
-  if (/[਀-੿]/.test(text)) return 'pa-IN'
-  return undefined
 }
 
 /** Gemini's answer for the script conversions: one string per input word */
