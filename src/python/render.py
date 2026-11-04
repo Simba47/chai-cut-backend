@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_speech_ranges, heard_speech_ranges
 import emoji as emoji_art   # colour emoji (Twemoji 17), drawn locally
 import creator_captions     # the Creator caption styles (a template's `look`)
+import text_style           # a text's Text-tool look, drawn as the preview draws it
 from frames import is_frame, row_heights, row_order, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base, BLUR_SOURCE_SLOT, shown_main_slots, frame_background, bg_filter
 
 # ── Quality presets (identical to previous version) ───────────────────────────
@@ -2664,6 +2665,42 @@ def main(
             box_h = float(ov.get("h") or 0) if not centered else 0.0
             # Turned on the preview (its rotate handle): drawn as a picture below, turned round its middle
             rotation = float(ov.get("rotation") or 0) % 360 if not centered else 0.0
+
+            # ── A text with its Text-tool look (text_style.py): drawn as the preview draws it — its
+            # entrance frame by frame from when it comes in, then at rest until it goes ──
+            if text_style.is_styled(ov):
+                from PIL import ImageFont as _IF
+                shown = raw_text.upper() if ov.get("uppercase") else raw_text
+                # Its lines as the preview wraps them: measured with the preview's font file for the
+                # text (a bundled one, else Roboto), regular, no spacing (VideoPreview textOverlayLines)
+                if box_w > 0:
+                    wrap_path = _find_font_path(ov.get("font") if (ov.get("font") or "") in text_style.BUNDLED else "roboto")
+                    wrap_font = _IF.truetype(wrap_path, int(round(float(ov.get("size") or 72) * out_w / 1080)))
+                    def _ws(s: str, f=wrap_font) -> float:
+                        return sum(f.size * emoji_art.ADVANCE_EM if is_e else f.getlength(t) for is_e, t in emoji_art.split_emoji(s))
+                    st_lines = _wrap_text_lines(shown, box_w * out_w, _ws)
+                else:
+                    st_lines = shown.split("\n")
+                st_fps = _probe_fps(video_path)
+                seq, still, anim_s = text_style.frames(ov, st_lines, font_path, out_w, out_h, st_fps, tempfile.mkdtemp(prefix="txs_"), str(oi))
+                t_rest = min(t1, t0 + anim_s)
+                if seq and anim_s > 0:
+                    inputs += ["-framerate", f"{st_fps:.3f}", "-i", seq]
+                    src_lbl = f"[{next_input}:v]"
+                    next_input += 1
+                    fp.append(f"{src_lbl}format=rgba,setpts=PTS-STARTPTS+{t0:.3f}/TB[txa{oi}s]")
+                    fp.append(f"{cur}[txa{oi}s]overlay=0:0:eof_action=pass:enable='between(t,{t0:.3f},{t_rest:.3f})'[vtxa{oi}]")
+                    cur = f"[vtxa{oi}]"
+                if still and t_rest < t1:
+                    inputs += ["-i", still]
+                    src_lbl = f"[{next_input}:v]"
+                    next_input += 1
+                    fp.append(f"{src_lbl}format=rgba[txs{oi}s]")
+                    fp.append(f"{cur}[txs{oi}s]overlay=0:0:enable='between(t,{t_rest:.3f},{t1:.3f})'[vtxs{oi}]")
+                    cur = f"[vtxs{oi}]"
+                print(f"[render] text {oi} with its look: {ov.get('animation') or 'no'} entrance ({anim_s:.2f}s), {len(st_lines)} line(s)", flush=True)
+                continue
+
             if not emoji_art.has_emoji(raw_text) and "\n" not in raw_text and box_w <= 0 and box_h <= 0 and not rotation:
                 # ── One line, no emoji: a single drawtext call, exactly as before ──
                 sz_fit = _fit_font_size(raw_text, font_path, sz, int(out_w * 0.9)) if centered else sz

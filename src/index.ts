@@ -215,6 +215,10 @@ async function runMigrations() {
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS original_end_ms INTEGER`
   // Width of a text box (share of the frame's width) dragged in the editor: the text wraps inside it
   await db`ALTER TABLE text_overlays ADD COLUMN IF NOT EXISTS w REAL`
+  // A text's look from the Text tool (weight, italic, capitals, spacing, opacity, outline, box,
+  // shadow, entrance animation): one field, so a new setting needs no new column (python/text_style.py
+  // draws it). Before 2026-11-04 none of it was saved: gone on reload, never exported
+  await db`ALTER TABLE text_overlays ADD COLUMN IF NOT EXISTS style JSONB`
   // Height of a text box (share of the frame's height): the text sits in its middle
   await db`ALTER TABLE text_overlays ADD COLUMN IF NOT EXISTS h REAL`
   // How far a text or a photo is turned (degrees, clockwise) with its rotate handle on the preview
