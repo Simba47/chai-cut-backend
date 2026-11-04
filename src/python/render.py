@@ -156,6 +156,24 @@ def _word_display(w: dict, roman: bool = False) -> str:
     return (w.get("word_roman") if roman else None) or w.get("word", "")
 
 
+def _caption_case(style: dict) -> str:
+    """The case caption words are written in, as the editor shows them (captions/store.ts captionCaseOf):
+    the one saved, else (a style saved before text_case) UPPER when uppercase, else Title."""
+    saved = style.get("text_case")
+    if saved in ("title", "upper", "lower"):
+        return saved
+    return "upper" if style.get("uppercase") else "title"
+
+
+def _apply_case(text: str, case: str) -> str:
+    """One word in that case (the editor's CaptionStyler applyCase): Title = first letter capital, the rest small."""
+    if case == "upper":
+        return text.upper()
+    if case == "lower":
+        return text.lower()
+    return text[:1].upper() + text[1:].lower()
+
+
 def _is_sentence_end(word: str) -> bool:
     stripped = word.rstrip()
     return bool(stripped) and stripped[-1] in ".!?।"
@@ -280,11 +298,14 @@ def _write_ass(
     rest_c = _ass_color(color_hex)
     live_c = _ass_color(_karaoke_live(color_hex, style.get("highlight_color") or "#FFE700"))
 
+    case = _caption_case(style)
     sentences = [s for s in _group_sentences(clip_words) if s]
     for i, (sentence, (start_ms, end_ms)) in enumerate(zip(sentences, _line_times(sentences))):
         if end_ms <= start_ms:
             continue
-        shown = [(w, _word_display(w, roman)) for w in sentence]
+        # (in the case the editor shows: before 2026-11-04 these went out as transcribed, while the
+        # editor showed them in Title case)
+        shown = [(w, _apply_case(_word_display(w, roman), case)) for w in sentence]
         shown = [(w, t) for w, t in shown if t]
         text     = " ".join(t for _, t in shown)
         if not text.strip():
@@ -1928,7 +1949,8 @@ def main(
                 ass_files.append((path, _write_ass(clip_words, caption_style, clip_start_ms, out_w, out_h, path, band_zones=zones)))
             else:
                 bounds = [None] + [int(p["start_ms"]) for p in parts] + [None]
-                looks = [caption_style] + [{**caption_style, **(p.get("style") or {})} for p in parts]
+                # (the case is the clip's, in every part: the editor has one for all of them)
+                looks = [caption_style] + [{**caption_style, **(p.get("style") or {}), "text_case": _caption_case(caption_style)} for p in parts]
                 for k, look in enumerate(looks):
                     a, b = bounds[k], bounds[k + 1]
                     own = [w for w in clip_words

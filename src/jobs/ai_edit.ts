@@ -20,6 +20,9 @@ import { formatClip } from './clip_formats.js'
 import { closeLookWindows, readCloseLooks, faceCuts, withoutPictures } from './track_subjects.js'
 import { personView } from './auto_format.js'
 import { r2UploadFile } from '../r2.js'
+import { findPauses } from './render.js'
+import { cleanTrims } from '../lib/trims.js'
+import type { Range } from '../lib/cuts.js'
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
 
@@ -1510,7 +1513,7 @@ export function buildSegments(analysis: ClipAnalysis, clipDurationMs: number, op
   return withShotReactions(built, windows, reelW)
 }
 
-type Word = { word: string; start_ms: number; end_ms: number; speaker_id?: string | null }
+type Word = { word: string; word_roman?: string | null; start_ms: number; end_ms: number; speaker_id?: string | null }
 
 // Gemini picks the clips: the numbered-line, windowed, scored method shared with the app's
 // "Best moments" (src/lib/clipFinder.ts)
@@ -1602,7 +1605,7 @@ function coversVideo(words: Word[], durationMs: number) {
 async function loadWords(videoId: string): Promise<{ words: Word[]; whole: boolean }> {
   const [row] = await db`SELECT id, whole_video FROM transcripts WHERE video_id = ${videoId} ORDER BY created_at DESC LIMIT 1`
   if (!row) return { words: [], whole: false }
-  const words = await db<Word[]>`SELECT word, start_ms, end_ms, speaker_id FROM transcript_words WHERE transcript_id = ${row.id} ORDER BY start_ms`
+  const words = await db<Word[]>`SELECT word, word_roman, start_ms, end_ms, speaker_id FROM transcript_words WHERE transcript_id = ${row.id} ORDER BY start_ms`
   return { words, whole: row.whole_video === true }
 }
 
@@ -1839,7 +1842,13 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         const clipWords = words.filter(w => w.start_ms >= highlight.start_ms && w.start_ms < highlight.end_ms)
         const caption = captionFontFor(clipWords, payload.caption_language)
 
-        const clip_id = await saveClip(video_id, ai_edit_job_id, highlight, segments, withCaptions ? caption : null, texts[hi], withTitle, brand)
+        // Its pauses and filler words, cut as removed parts the editor shows (and can bring back): the
+        // export cuts only what the editor shows (user, 2026-11-04: an export 2–3 s shorter than its
+        // preview — "remove pauses" used to be a switch the export applied unseen)
+        const pauses = await findPauses(words, highlight.start_ms, highlight.end_ms, segments, videoPath, signal)
+          .catch(e => { console.warn('[ai_edit] pauses not found:', e instanceof Error ? e.message : e); return [] })
+
+        const clip_id = await saveClip(video_id, ai_edit_job_id, highlight, segments, withCaptions ? caption : null, texts[hi], withTitle, brand, pauses)
 
         const layoutSummary = segments.map(s =>
           `${s.layout}(${s.start_ms / 1000}s–${s.end_ms / 1000}s,${s.slotKfs[0]?.length ?? 0}kf)`
@@ -1989,13 +1998,16 @@ async function saveClip(
   withTitle = true,
   /** The brand kit the clip gets (lib/brandKit.ts): its logo, its title style on the hook, its caption style */
   brand: ClipBrand | null = null,
+  /** Its pauses and filler words (render.ts findPauses), source ms: saved as removed parts (clips.trim_ranges) */
+  pauses: Range[] = [],
 ): Promise<string> {
+  const trims = cleanTrims(pauses, highlight.start_ms, highlight.end_ms)
   return db.begin(async tx => {
     const [clipRow] = await tx`
-      INSERT INTO clips (video_id, start_ms, end_ms, status, title, ai_edit_job_id, ai_score, ai_reason, remove_fillers,
+      INSERT INTO clips (video_id, start_ms, end_ms, status, title, ai_edit_job_id, ai_score, ai_reason, remove_fillers, trim_ranges,
         hook_text, post_caption, hashtags)
       VALUES (${videoId}, ${highlight.start_ms}, ${highlight.end_ms}, 'draft', ${(text?.title || highlight.title).slice(0, 120) || 'Highlight'},
-        ${aiEditJobId}, ${highlight.score}, ${highlight.reason || null}, true,
+        ${aiEditJobId}, ${highlight.score}, ${highlight.reason || null}, false, ${trims.length ? tx.json(trims) : null},
         ${text?.hook ?? null}, ${text?.post_caption ?? null}, ${text?.hashtags ?? null})
       RETURNING id
     `
