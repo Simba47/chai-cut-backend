@@ -18,6 +18,7 @@
 import { trackFaces, stabilise, FRAME_INTERVAL_MS, type FrameDetection, type CropBox, type SpokenWord } from './ai_edit.js'
 import { findAngles, whoIs, withoutPictures, faceCuts, FRAME_SHOWS_MS, type Brief } from './track_subjects.js'
 import { decideFormat, keepsAll, AUTO_FORMAT, type AutoLayout } from './auto_format.js'
+import { toPicture, fromPicture, pictureAR, WHOLE_FRAME, type PictureBox } from '../lib/pictureBox.js'
 
 interface Kf { t_ms: number; x: number; y: number; w: number; h: number }
 export interface FormattedPart {
@@ -43,13 +44,17 @@ const within = (f: CropBox, v: Omit<Kf, 't_ms'>) => f.x >= v.x - 1e-6 && f.x + f
 /**
  * The clip's sections in the Rulebook's formats. `frames`: faces 4× a second in people mode (detectFaces
  * with people = true); `cuts`: camera cuts (ms from the clip's
- * start); `speech`: the clip's words (clip ms); `size`: the source's pixels.
+ * start); `speech`: the clip's words (clip ms); `size`: the source's pixels; `opts.picture`: the picture
+ * inside the video's black bars (lib/pictureBox.ts) — the formats are decided in it (its own shape and
+ * height, the faces moved into it) and every view keeps inside it.
  */
 export function formatClip(
   frames: FrameDetection[], cuts: number[], durationMs: number, speech: SpokenWord[],
-  size: { width: number; height: number }, opts: { motion?: boolean } = {},
+  size: { width: number; height: number }, opts: { motion?: boolean; picture?: PictureBox } = {},
 ): FormattedPart[] {
-  const ar = size.width / size.height
+  const pic = opts.picture ?? WHOLE_FRAME
+  // (the picture's own shape and height: what the Rulebook frames)
+  const ar = pictureAR(size.width / size.height, pic), pxH = size.height * pic.h
   // (the close looks only find brief appearances: the rest — pictures, who is who, Follow — reads the 4-a-second frames)
   const close = frames.filter(f => f.close)
   frames = withoutPictures(frames.filter(f => !f.close), cuts)
@@ -59,7 +64,8 @@ export function formatClip(
   // Who each face is: a scene's people are where it was first seen, and someone can sit elsewhere in a
   // place it comes back (another take of the same angle): Follow finds them by who they are
   const who = opts.motion === false ? new Map<CropBox, number>() : whoIs(frames, cuts)
-  type Decided = { a: number; b: number; faces: CropBox[]; plan: AutoLayout }
+  // (plan: in the picture's space, as its faces — facesP; faces: in the frame, for Follow)
+  type Decided = { a: number; b: number; faces: CropBox[]; facesP: CropBox[]; plan: AutoLayout }
   const decided: Decided[] = angles.filter(g => g.people > 0).flatMap(g => g.spans.flatMap(([s, e], i): Decided[] => {
     const a = Math.max(0, Math.round(s)), b = Math.min(durationMs, Math.round(e))
     if (b - a < MIN_PLACE_MS) return []
@@ -67,22 +73,23 @@ export function formatClip(
     const here = g.present?.[i] ?? g.faces.map((_, k) => k)
     const faces = here.map(k => g.faces[k]) as CropBox[]
     const talk = g.talk?.[i] ? here.map(k => g.talk![i][k] ?? 0) : null
-    const plan = decideFormat(faces, talk, ar, size.height)
-    return plan ? [{ a, b, faces, plan }] : []
+    const facesP = faces.map(f => toPicture(f, pic))
+    const plan = decideFormat(facesP, talk, ar, pxH)
+    return plan ? [{ a, b, faces, facesP, plan }] : []
   })).sort((p, q) => p.a - q.a)
   // A very short place takes the format of the place right before it (no flicker on fast cutting), when
   // that format holds everyone here too
   const places = decided.map((x, i) => {
     const before = i > 0 ? decided[i - 1] : null
     const short = x.b - x.a < AUTO_FORMAT.SHORT_PLACE * 1000
-    return short && before && Math.abs(before.b - x.a) <= 150 && keepsAll(before.plan.layout, before.plan.framing, x.faces)
+    return short && before && Math.abs(before.b - x.a) <= 150 && keepsAll(before.plan.layout, before.plan.framing, x.facesP)
       ? { ...x, plan: before.plan } : x
   })
 
   const reelW = Math.min(1, (9 / 16) / ar)
   const cutaway = (a: number, b: number): FormattedPart => ({
     start_ms: a, end_ms: b, layout: 'vertical', people: 0, why: 'cutaway',
-    slotKfs: [[{ t_ms: a, x: (1 - reelW) / 2, y: 0, w: reelW, h: 1 }]],
+    slotKfs: [[{ t_ms: a, ...fromPicture({ x: (1 - reelW) / 2, y: 0, w: reelW, h: 1 }, pic) }]],
   })
   const out: FormattedPart[] = []
   /** No faces through [a, b): a cutaway — or, under SHORT_PLACE, the section before it goes on (its views hold) */
@@ -95,7 +102,8 @@ export function formatClip(
     const a = Math.max(p.a, at)
     if (a - at >= 50) between(at, a)
     if (p.b - a < 50) continue
-    const views = p.plan.layout === 'frame_blur_fill' ? [{ x: 0, y: 0, w: 1, h: 1 }] : p.plan.framing
+    // (the whole picture: inside the bars)
+    const views = p.plan.layout === 'frame_blur_fill' ? [{ ...pic }] : p.plan.framing.map(v => fromPicture(v, pic))
     const people = p.faces.length
     // (the first section starts the clip, a gap under 50 ms joins the section after it)
     const start = out.length ? a : 0
@@ -103,7 +111,7 @@ export function formatClip(
       start_ms: start, end_ms: p.b, layout: p.plan.layout, people, why: p.plan.why,
       slotKfs: views.map((v, slot) => opts.motion === false || p.plan.layout === 'frame_blur_fill'
         ? [{ t_ms: start, ...v }]
-        : follow(frames, who, p.faces, v, views.filter((_, k) => k !== slot), start, p.b)),
+        : follow(frames, who, p.faces, v, views.filter((_, k) => k !== slot), start, p.b, pic)),
     })
     at = p.b
   }
@@ -205,14 +213,14 @@ function widenFor(part: FormattedPart, b: Brief, people: readonly CropBox[]) {
  * two or more people, or nobody, it holds. The person is found by who they are (`who`), else — too small
  * to tell — as the face nearest where they were, of their size; alone in their scene, as its only face.
  */
-function follow(frames: FrameDetection[], who: Map<CropBox, number>, faces: CropBox[], view: Omit<Kf, 't_ms'>, others: Omit<Kf, 't_ms'>[], a: number, b: number): Kf[] {
+function follow(frames: FrameDetection[], who: Map<CropBox, number>, faces: CropBox[], view: Omit<Kf, 't_ms'>, others: Omit<Kf, 't_ms'>[], a: number, b: number, pic: PictureBox = WHOLE_FRAME): Kf[] {
   const held = [{ t_ms: a, ...view }]
   const mine = faces.filter(f => within(f, view))
   if (mine.length !== 1) return held
-  // Its strip: between the neighbours' views on either side (the views of a Split or Trio sit side by side in the picture)
+  // Its strip: between the neighbours' views on either side (the views of a Split or Trio sit side by side in the picture), within the picture's edges
   const mid = view.x + view.w / 2
-  const lo = Math.max(0, ...others.filter(o => o.x + o.w / 2 < mid).map(o => o.x + o.w))
-  const hi = Math.min(1, ...others.filter(o => o.x + o.w / 2 >= mid).map(o => o.x))
+  const lo = Math.max(pic.x, ...others.filter(o => o.x + o.w / 2 < mid).map(o => o.x + o.w))
+  const hi = Math.min(pic.x + pic.w, ...others.filter(o => o.x + o.w / 2 >= mid).map(o => o.x))
   const minX = Math.min(view.x, lo), maxX = Math.max(view.x, hi - view.w)
   const fr = [...frames].sort((p, q) => p.frame_index - q.frame_index)
     .filter(f => { const t = f.frame_index * FRAME_INTERVAL_MS + FRAME_SHOWS_MS; return t >= a && t < b })

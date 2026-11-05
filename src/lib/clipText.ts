@@ -19,7 +19,11 @@ const NATIVE_RULE = `Write the text in the speaker's own language and in that la
 /** What the hook, title and post caption are written in: English letters (Tenglish, Hinglish…), English, or the speaker's own script */
 export type ClipTextLanguage = 'roman' | 'english' | 'native'
 
-export interface ClipText { hook: string; title: string; post_caption: string; hashtags: string[] }
+export interface ClipText {
+  hook: string; title: string; post_caption: string; hashtags: string[]
+  /** The hook is the question the clip answers (asked before it starts): shown a little longer */
+  asks?: boolean
+}
 
 /**
  * A brand kit's voice (the editor's Brand kit tool): how the text should sound, words it never
@@ -78,7 +82,11 @@ const clean = (v: unknown, max: number) => (typeof v === 'string' ? v.replace(/\
 export type AskText = (prompt: string) => Promise<string>
 
 /** Hook, title, post caption and hashtags for a clip; throws if Gemini fails or answers badly */
-export async function generateClipText(words: TextWord[], videoTitle: string | null, ask: AskText, language: ClipTextLanguage = 'roman', voice: BrandVoice | null = null): Promise<ClipText> {
+export async function generateClipText(
+  words: TextWord[], videoTitle: string | null, ask: AskText, language: ClipTextLanguage = 'roman', voice: BrandVoice | null = null,
+  /** The question the clip answers, asked before it starts and not heard in it (clipFinder FoundClip.question): it becomes the hook */
+  question: string | null = null,
+): Promise<ClipText> {
   if (!words.length) throw new Error('This clip has no transcript yet')
 
   const prompt = `You write the text that goes with a short vertical video clip (Reels / Shorts) for an Indian creator. The speech can be Telugu, Hindi, Tamil or another Indian language, often mixed with English. Judge meaning in the original language.
@@ -89,7 +97,9 @@ ${clipLines(words)}
 Return ONLY JSON, keys in English:
 {"hook": "...", "title": "...", "post_caption": "...", "hashtags": ["...", ...]}
 ${language === 'english' ? ENGLISH_RULE : language === 'native' ? NATIVE_RULE : ROMAN_RULE} This applies to the hook, title and post caption.
-- hook: 3-7 words shown over the first 3 seconds that make someone stop scrolling. No clickbait lies: it must match what is actually said. No emoji, no hashtags.
+${question
+    ? `- hook: the clip starts right after this question was asked, which the viewer does not hear: "${question.replace(/"/g, "'")}". The hook IS that question, shown over the first seconds so the viewer knows what is being answered: keep exactly what is asked — only translate and shorten it, never swap in words or ideas from the answer — at most 10 words, ending with "?". No emoji, no hashtags.`
+    : '- hook: 3-7 words shown over the first 3 seconds that make someone stop scrolling. No clickbait lies: it must match what is actually said. No emoji, no hashtags.'}
 - title: at most 60 characters, about this clip's moment (never just the video's title).
 - post_caption: 1-2 sentences for the post.
 - hashtags: exactly 5, no # sign needed, no spaces inside a tag, a mix of language-specific and English tags.${voiceRules(voice)}`
@@ -98,7 +108,7 @@ ${language === 'english' ? ENGLISH_RULE : language === 'native' ? NATIVE_RULE : 
   const match = text.match(/\{[\s\S]*\}/)
   if (!match) throw new Error('Gemini did not return JSON')
   const raw = JSON.parse(match[0]) as Record<string, unknown>
-  const hook = clean(raw.hook, 80).split(' ').slice(0, 7).join(' ')
+  const hook = clean(raw.hook, 100).split(' ').slice(0, question ? 10 : 7).join(' ')
   const title = clean(raw.title, 60)
   const written = clean(raw.post_caption, 400)
   // The brand's closing line, added as it is (a prompt alone doesn't keep it word for word)
@@ -111,6 +121,7 @@ ${language === 'english' ? ENGLISH_RULE : language === 'native' ? NATIVE_RULE : 
   if (!hook || !title) throw new Error('Gemini left out the hook or title')
   // A title that is only the video's name says nothing about the clip: use the hook instead
   const sameAsVideo = !!videoTitle && title.toLowerCase().replace(/\W/g, '') === videoTitle.toLowerCase().replace(/\W/g, '')
-  if (sameAsVideo) return { hook, title: hook.slice(0, 60), post_caption, hashtags }
-  return { hook, title, post_caption, hashtags }
+  const asks = question ? { asks: true } : {}
+  if (sameAsVideo) return { hook, title: hook.slice(0, 60), post_caption, hashtags, ...asks }
+  return { hook, title, post_caption, hashtags, ...asks }
 }

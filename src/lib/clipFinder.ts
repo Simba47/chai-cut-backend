@@ -40,6 +40,12 @@ export interface FoundClip {
   subscores: Subscores
   /** Which window found it */
   window: number
+  /**
+   * The question it answers, when that was asked before its start and isn't heard in it (a question
+   * and its whole answer can run past the 2-minute cap): simple English, for a title over its first
+   * seconds (user, 2026-10-31). Set by refineEdges; none otherwise
+   */
+  question?: string | null
 }
 
 /** 'best' = the strongest moments in general; 'search' = only moments matching the user's request */
@@ -328,10 +334,11 @@ export async function refineEdges(clip: FoundClip, lines: TranscriptLine[], word
 - Start: on the line that opens this thought. Move it earlier only for what the clip needs to make sense — the question being answered, the setup of a story or joke, who or what "he", "she", "this" or "that" refers to — not for small talk or the end of the previous topic. Move it later if the first marked lines belong to the previous topic.
 - End: after the thought is complete — the whole answer, the punchline, the payoff of the story, the conclusion, or the reaction to it. Never end on "but…" or "because…", or in the middle of a sentence or a list. Move it earlier if the last marked lines start a new topic.
 - Questions: in interviews and panels someone often asks a question near the end. If the clip would end on a question (in any language, with or without a question mark — e.g. "enduku…?", "kya…?", "cheppandi", "tell me"), either go on to the end of its answer, or end before the question begins. Never end on the question itself.
-- Keep the clip between 15 and 120 seconds (use the mm:ss times).
+- Keep the clip between 15 and 120 seconds (use the mm:ss times). If a question and its whole answer don't fit, start at the answer.
+- Question shown on screen: if the clip, with the edges you choose, answers a question that someone actually asks in the phrases BEFORE its first phrase (not inside the clip), give the number of the phrase where it is asked as "question_phrase" and write that question in simple English, at most 12 words, as "question" — it will be shown as text over the clip's first seconds, so the viewer knows what is being answered. Only a question really asked there, never one you make up to sum up the topic. Otherwise both null.
 - If the edges are already right, return them unchanged.
 ${LANGUAGE_RULES.split('\n')[0]}
-Return ONLY a JSON object, no other text: {"start_phrase":number,"end_phrase":number,"why":"what changed and why, max 12 words, in English"}`
+Return ONLY a JSON object, no other text: {"start_phrase":number,"end_phrase":number,"question_phrase":number or null,"question":"…" or null,"why":"what changed and why, max 12 words, in English"}`
   const user = `Clip: "${clip.title}" — ${clip.summary}\n\nTranscript:\n${shown}`
   try {
     const text = await ask(system, user, { temperature: 0 })
@@ -341,11 +348,15 @@ Return ONLY a JSON object, no other text: {"start_phrase":number,"end_phrase":nu
     const s = Number(r.start_phrase), e = Number(r.end_phrase)
     if (!Number.isInteger(s) || !Number.isInteger(e) || s < 0 || e >= phrases.length || e < s) return { clip, why: null }
     const a = phrases[s], b = phrases[e]
-    if (a === was[0] && b === was[was.length - 1]) return { clip, why: null }
+    // (only a question really asked before the clip's start: the phrase it is in must come before it)
+    const qp = typeof r.question_phrase === 'number' ? r.question_phrase : NaN   // (Number(null) is 0: not a phrase)
+    const asked = Number.isInteger(qp) && qp >= 0 && qp < s
+    const question = asked && typeof r.question === 'string' && r.question.trim() ? r.question.trim().slice(0, 120) : null
+    if (a === was[0] && b === was[was.length - 1]) return { clip: question ? { ...clip, question } : clip, why: null }
     const length = b.end_ms - a.start_ms
     if (length < MIN_CLIP_MS || length > HARD_MAX_CLIP_MS) return { clip, why: null }
     return {
-      clip: { ...clip, start_line: a.line, end_line: b.line, start_ms: a.start_ms, end_ms: b.end_ms },
+      clip: { ...clip, start_line: a.line, end_line: b.line, start_ms: a.start_ms, end_ms: b.end_ms, question },
       why: typeof r.why === 'string' ? r.why.slice(0, 120) : '',
     }
   } catch {
