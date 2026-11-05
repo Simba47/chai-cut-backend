@@ -80,6 +80,8 @@ export function registerHandler(type: JobType, handler: JobHandler) {
 // from before heartbeats (none) keeps the old rule: stuck once it has been "processing" longer than
 // its timeout plus a minute (updated_at is set by the jobs_updated_at trigger on claim).
 const HEARTBEAT_MS = 30_000
+/** How often a running export looks whether its person cancelled it (the editor's Cancel) */
+const CANCEL_CHECK_MS = 2000
 const STUCK_AFTER_MS = 3 * 60 * 1000
 const STUCK_SWEEP_MS = 60 * 1000
 const NO_HEARTBEAT_STUCK_MS = JOB_TIMEOUT_MS + 60_000
@@ -352,12 +354,28 @@ async function run(job: Job) {
     fail(job.id, msg).catch(err => console.error(`[queue] Could not mark job ${job.id} failed:`, err))
   }, timeoutMs)
 
+  // An export its person cancelled (the website marks its job failed: services/export.ts
+  // cancelRender): stopped within a couple of seconds, its FFmpeg/Python with it, and the job and the
+  // clip left as the website set them. (A row no longer 'processing' for any other reason — put back
+  // by the stuck-job sweep — stops here too: it runs again elsewhere, never twice at once.)
+  let cancelled = false
+  const watch = job.type === 'render' ? setInterval(() => {
+    db`SELECT status FROM jobs WHERE id = ${job.id}`.then(([r]) => {
+      if (cancelled || timedOut || (r && r.status === 'processing')) return
+      cancelled = true
+      console.log(`[queue] Job ${job.id} was cancelled, stopping it`)
+      ctrl.abort(new Error('the export was cancelled'))
+    }).catch(() => {})
+  }, CANCEL_CHECK_MS) : null
+
   try {
     await handler(job, ctrl.signal)
+    if (cancelled) { console.log(`[queue] Job ${job.id} stopped: cancelled`); return }
     if (timedOut) { console.warn(`[queue] Job ${job.id} finished after its timeout (left as failed)`); return }
     await db`UPDATE jobs SET status = 'done' WHERE id = ${job.id}`
     console.log(`[queue] Job ${job.id} done`)
   } catch (err) {
+    if (cancelled) { console.log(`[queue] Job ${job.id} stopped: cancelled`); return }
     if (timedOut) { console.error(`[queue] Job ${job.id} stopped after its timeout`); return }
     const msg = err instanceof Error ? err.message : String(err)
     console.error(`[queue] Job ${job.id} failed:`, msg)
@@ -365,6 +383,7 @@ async function run(job: Job) {
   } finally {
     clearTimeout(timer)
     clearInterval(beat)
+    if (watch) clearInterval(watch)
     await db`DELETE FROM job_heartbeats WHERE job_id = ${job.id}`.catch(() => {})
   }
 }
