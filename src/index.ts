@@ -45,6 +45,9 @@ async function runMigrations() {
   // reading made since that re-read was part of reading (2026-10-31); NULL on older ones, filled the
   // first time Make my clips uses them
   await db`ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS gaps_filled_at timestamptz`
+  // The picture inside the video's black bars (jobs/picture.ts; fractions of the frame, the whole frame
+  // when it has none), found the first time a job frames the video: every framing keeps inside it
+  await db`ALTER TABLE videos ADD COLUMN IF NOT EXISTS picture_box JSONB`
   // Captions on/off per clip. Turning captions off used to delete the style, and the editor then
   // switched them back on for any clip whose video has a transcript. Existing styles count as on.
   await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT true`

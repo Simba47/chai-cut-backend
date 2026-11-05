@@ -11,6 +11,8 @@ import type { Job, TrackSubjectsJobPayload } from '../types.js'
 import { detectFaces, detectCuts, trackFaces, probeSize, extractFrames, readFramesDir, FRAME_INTERVAL_MS, type FrameDetection, type CropBox, type SpokenWord } from './ai_edit.js'
 import { autoDirectChanges, followChanges, buildKeyframes, type SubjectPoint } from './subject_framing.js'
 import { snapSectionBoundaries } from '../lib/snapSections.js'
+import { pictureOf } from './picture.js'
+import { insidePicture, WHOLE_FRAME, type PictureBox } from '../lib/pictureBox.js'
 
 // ── Subjects: people the user marked in a clip, followed through it ────────────
 // In the editor the user pauses on a person and clicks them (a "subject"). This job looks at the
@@ -1575,6 +1577,8 @@ async function scanAngles(clipId: string, from: number, to: number, signal?: Abo
       detectCuts(videoPath, from, to, signal),
       // (who talks in each scene: Auto format's speaker)
       spokenWords(clip.video_id, from, to),
+      // (the picture inside the video's black bars, kept on the video for the editor's framing)
+      pictureOf(clip.video_id, signal, videoPath),
     ])
     signal?.throwIfAborted()
     // Who the small faces (a wide shot's) are, read again at the video's own size (readSmallIdentities)
@@ -1711,6 +1715,8 @@ async function subEditSteps(clipId: string, signal: AbortSignal, onCreated: (ids
       spokenWords(clip.video_id, from, to),
       probeSize(videoPath),
     ])
+    // (the picture inside the video's black bars: every view keeps inside it)
+    const picture = await pictureOf(clip.video_id, signal, videoPath)
     signal?.throwIfAborted()
     // Who the small faces (a wide shot's) are, read again at the video's own size (readSmallIdentities)
     await readSmallIdentities(tmp, videoPath, from, info.frames, cuts, signal)
@@ -1760,7 +1766,7 @@ async function subEditSteps(clipId: string, signal: AbortSignal, onCreated: (ids
     if (!tracked.length) throw new Error('No one could be followed through this clip')
     // Last chance to stop before the clip itself changes
     signal.throwIfAborted()
-    const framed = await frameClip(clipId, from, to, tracked, sourceCuts, size)
+    const framed = await frameClip(clipId, from, to, tracked, sourceCuts, size, picture)
     console.log(`[track_subjects] sub-edit clip ${clipId}: ${found.length} people, ${framed} view(s) framed (${((Date.now() - t0) / 1000).toFixed(0)}s)`)
   } finally {
     await rm(tmp, { recursive: true, force: true })
@@ -1776,7 +1782,7 @@ async function subEditSteps(clipId: string, signal: AbortSignal, onCreated: (ids
  */
 async function frameClip(
   clipId: string, clipStart: number, clipEnd: number, people: Array<{ id: string; path: SubjectPoint[]; speaking: Array<[number, number]> }>,
-  cuts: number[], size: { width: number; height: number } | null,
+  cuts: number[], size: { width: number; height: number } | null, picture: PictureBox = WHOLE_FRAME,
 ): Promise<number> {
   // Sections and keyframes are kept in clip time (ms from the clip's start)
   const toSource = (t: number) => clipStart + t
@@ -1794,7 +1800,7 @@ async function frameClip(
       if (!changes) return 0
       const [seg] = await tx`INSERT INTO segments (clip_id, start_ms, end_ms, layout, sort_order) VALUES (${clipId}, 0, ${length}, 'vertical', 0) RETURNING id`
       const [box] = await tx`INSERT INTO crop_boxes (segment_id, slot_index, source_video_id, source_offset_ms, muted) VALUES (${seg.id}, 0, NULL, 0, false) RETURNING id`
-      await insertKeyframes(tx, box.id as string, changes, 0)
+      await insertKeyframes(tx, box.id as string, changes, 0, picture)
       await tx`UPDATE clips SET status = 'draft', output_url = NULL WHERE id = ${clipId}`
       return 1
     }
@@ -1839,7 +1845,7 @@ async function frameClip(
           : followChanges(people[i % people.length].path, start, end, toSource, view, 'smooth', cuts)
         if (!changes?.length) continue
         await tx`DELETE FROM box_keyframes WHERE box_id = ${box.id}`
-        await insertKeyframes(tx, box.id, changes, start)
+        await insertKeyframes(tx, box.id, changes, start, picture)
         framed++
       }
     }
@@ -1848,8 +1854,10 @@ async function frameClip(
   })
 }
 
-async function insertKeyframes(tx: TransactionSql, boxId: string, changes: ReturnType<typeof followChanges> & object, start: number) {
+async function insertKeyframes(tx: TransactionSql, boxId: string, changes: ReturnType<typeof followChanges> & object, start: number, picture: PictureBox = WHOLE_FRAME) {
+  // (inside the picture: never into the video's black bars)
   const kfs = buildKeyframes(changes.map((c, k) => (k === 0 ? { ...c, t_ms: start } : c)))
+    .map(k => insidePicture(k, picture))
     .map(k => ({ box_id: boxId, t_ms: Math.round(k.t_ms), x: round4(k.x), y: round4(k.y), w: round4(k.w), h: round4(k.h) }))
   for (let i = 0; i < kfs.length; i += 5000) await tx`INSERT INTO box_keyframes ${tx(kfs.slice(i, i + 5000))}`
 }
