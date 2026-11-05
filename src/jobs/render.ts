@@ -196,14 +196,17 @@ export async function handleRenderJob(job: Job, signal?: AbortSignal) {
     await runPython(pythonScript, pythonArgs, signal)
     console.log(`[render] Python done: ${((Date.now()-tPy)/1000).toFixed(1)}s`)
 
+    // (cancelled meanwhile: the last export stays as it was)
+    signal?.throwIfAborted()
     const outputStoragePath = `clips/${clip_id}/output.mp4`
     await r2UploadFile(outputStoragePath, outputPath, 'video/mp4')
 
     const output_url = await getSignedUrl(r2, new GetObjectCommand({ Bucket: R2_BUCKET, Key: outputStoragePath }), { expiresIn: 60 * 60 * 24 * 7 })
-    await db`UPDATE clips SET status = 'done', output_url = ${output_url}, output_storage_path = ${outputStoragePath} WHERE id = ${clip_id}`
+    // (only while it is still exporting: a cancelled export's clip is left as the editor put it back)
+    await db`UPDATE clips SET status = 'done', output_url = ${output_url}, output_storage_path = ${outputStoragePath} WHERE id = ${clip_id} AND status = 'rendering'`
 
   } catch (err) {
-    await db`UPDATE clips SET status = 'failed' WHERE id = ${clip_id}`
+    await db`UPDATE clips SET status = 'failed' WHERE id = ${clip_id} AND status = 'rendering'`
     throw err
   } finally {
     await rm(tmp, { recursive: true, force: true })
@@ -318,7 +321,8 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
     // part after the first, from its start (clip ms, the clip as it plays) in its own look over
     // caption_styles[0]
     caption_parts: captionPartsOf((clip as Row).layers),
-    text_overlays: (textOverlays as Row[]).filter(t => !t.hidden),
+    // (a text's look saved as one field, read as its own settings: python/text_style.py)
+    text_overlays: (textOverlays as Row[]).filter(t => !t.hidden).map(({ style, ...t }) => ({ ...(style && typeof style === 'object' ? style : {}), ...t })),
     // Music (uploaded from the editor) and detached original-sound bars, each placed where its bar
     // is (audio.py). Music saved before uploads existed has only a file name: it can't be mixed in
     // (the editor asks to re-add it)
