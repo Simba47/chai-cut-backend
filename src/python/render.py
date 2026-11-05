@@ -28,6 +28,7 @@ import emoji as emoji_art   # colour emoji (Twemoji 17), drawn locally
 import creator_captions     # the Creator caption styles (a template's `look`)
 import text_style           # a text's Text-tool look, drawn as the preview draws it
 from frames import is_frame, row_heights, row_order, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base, BLUR_SOURCE_SLOT, shown_main_slots, frame_background, bg_filter
+from picture_check import main_picture_probes, missing_main_picture, at
 
 # ── Quality presets (identical to previous version) ───────────────────────────
 _QUALITY: dict[int, dict] = {
@@ -725,6 +726,32 @@ def _probe(path: str) -> tuple[float, bool]:
             pass
     _probe_cache[path] = (dur, has_audio)
     return _probe_cache[path]
+
+
+def _reconnect_opts(path: str) -> list[str]:
+    """
+    FFmpeg input options for a video streamed over the internet: reconnect when the connection drops
+    (it otherwise takes the drop as the video's end and the export goes on without its picture).
+    """
+    if not path.startswith(("http://", "https://")):
+        return []
+    return ["-reconnect", "1", "-reconnect_on_network_error", "1", "-reconnect_delay_max", "5"]
+
+
+def _print_input_warnings(stderr: str) -> None:
+    """What FFmpeg said about reading its inputs (a dropped connection, a damaged stretch) into the log"""
+    keep = [ln for ln in (stderr or "").splitlines()
+            if re.search(r"reconnect|prematurely|connection|i/o error|invalid data|end of file|error", ln, re.I)]
+    if keep:
+        print("[render] FFmpeg said while reading:\n  " + "\n  ".join(ln[:300] for ln in keep[:20]), flush=True)
+
+
+def _shows_main(seg: dict, secondary_videos: dict[str, str], is_borrowed) -> bool:
+    """Whether a part shows the clip's own video (not a B-roll or another video in its place); as in the segment loop."""
+    boxes = sorted(seg.get("crop_boxes") or [], key=lambda b: b.get("slot_index", 0))
+    primary = next((b for b in boxes if not is_borrowed(b)), boxes[0] if boxes else None)
+    vid = primary.get("source_video_id") if primary else None
+    return not (vid and vid in secondary_videos) and not is_borrowed(primary)
 
 
 def _probe_fps(path: str) -> float:
@@ -2026,8 +2053,12 @@ def main(
         # its edge skips video — render.ts says how far, source_ms; a transition reads a little
         # past the last part's end)
         read_s = max(clip_dur_s, float(spec.get("source_ms") or 0) / 1000.0) + (4 * max(ext_tail) + 0.5 if any(ext_tail) else 0.0)
+        # (the main video streams from storage: if the connection drops, FFmpeg picks it up again
+        # where it was instead of ending the video there — a picture black to the end)
+        main_opts = _reconnect_opts(video_path)
         inputs = [
             "ffmpeg", "-y",
+            *main_opts,
             "-ss", f"{clip_start_s:.3f}",
             "-t",  f"{read_s:.3f}",
             "-i",  video_path,    # index 0
@@ -2103,7 +2134,8 @@ def main(
                     continue
                 off = max(0.0, int(box.get("source_offset_ms", 0)) / 1000.0)
                 dur = (int(seg["end_ms"]) - int(seg["start_ms"])) / 1000.0
-                inputs += ["-thread_queue_size", "1024", "-ss", f"{off:.3f}", "-t", f"{dur + 0.5:.3f}", "-i", secondary_videos[main_video_id]]
+                inputs += ["-thread_queue_size", "1024", *_reconnect_opts(secondary_videos[main_video_id]),
+                           "-ss", f"{off:.3f}", "-t", f"{dur + 0.5:.3f}", "-i", secondary_videos[main_video_id]]
                 borrowed_in[(si, int(box.get("slot_index", 0)))] = f"[{next_input}:v]"
                 next_input += 1
 
@@ -3030,11 +3062,24 @@ def main(
         ]
 
         print(f"[render] filter_complex ({len(fc_str)} chars): {fc_str[:800]}", flush=True)
-        print(f"[render] Running FFmpeg (crf={qs['crf']}, {out_w}x{out_h}, {len(segments)} seg(s)) ...", flush=True)
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"[render] FFmpeg stderr:\n{result.stderr[-4000:]}", flush=True)
-            raise RuntimeError(f"FFmpeg render failed (exit {result.returncode})")
+        # Where the finished video must show the main video: looked at after FFmpeg (picture_check)
+        probes = main_picture_probes(segments, out_w, out_h, blank_ranges, lambda s: _shows_main(s, secondary_videos, is_borrowed))
+        for attempt in (1, 2):
+            print(f"[render] Running FFmpeg (crf={qs['crf']}, {out_w}x{out_h}, {len(segments)} seg(s)) ...", flush=True)
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"[render] FFmpeg stderr:\n{result.stderr[-4000:]}", flush=True)
+                raise RuntimeError(f"FFmpeg render failed (exit {result.returncode})")
+            _print_input_warnings(result.stderr)
+            bad = missing_main_picture(rendered_path, probes, out_w, out_h, video_path, clip_start_s, main_opts)
+            if not bad:
+                print(f"[render] picture check: the video is there at all {len(probes)} look(s)", flush=True)
+                break
+            where = ", ".join(sorted({at(p["t"]) for p in bad}))
+            print(f"[render] picture check: the main video is missing in the export at {where}"
+                  + (" — exporting again" if attempt == 1 else ""), flush=True)
+            if attempt == 2:
+                raise RuntimeError(f"The export came out without the video at {where}, twice. Please export again.")
 
         if behind_subs:
             from person_mask import captions_behind

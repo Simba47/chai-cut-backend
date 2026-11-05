@@ -19,6 +19,8 @@ import { findVisuals, describeVisuals, pickVisualMoments, detectPanels, refinePa
 import { formatClip } from './clip_formats.js'
 import { closeLookWindows, readCloseLooks, faceCuts, withoutPictures } from './track_subjects.js'
 import { personView } from './auto_format.js'
+import { pictureOf } from './picture.js'
+import { insidePicture, toPicture, fromPicture, pictureAR, WHOLE_FRAME, type PictureBox } from '../lib/pictureBox.js'
 import { r2UploadFile } from '../r2.js'
 import { findPauses } from './render.js'
 import { cleanTrims } from '../lib/trims.js'
@@ -1762,7 +1764,8 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       try {
         // (the kit's words: names spelled its way, its tone, hashtags and closing line — lib/brandWords.ts)
         const said = brandCaptionWords(words.filter(w => w.start_ms >= h.start_ms && w.start_ms < h.end_ms), brand?.words)
-        return brandClipText(await generateClipText(said, video.title ?? null, prompt => askGemini(prompt), titleLanguageFor(payload.title_language, said), brandVoice(brand?.words)), brand?.words)
+        // (a clip that starts at an answer: its hook is the question, asked before it — h.question)
+        return brandClipText(await generateClipText(said, video.title ?? null, prompt => askGemini(prompt), titleLanguageFor(payload.title_language, said), brandVoice(brand?.words), h.question ?? null), brand?.words)
       } catch (e) {
         console.warn(`[ai_edit] clip text failed for ${h.start_ms}-${h.end_ms}:`, e instanceof Error ? e.message : e)
         return null
@@ -1778,6 +1781,8 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       console.log(`[ai_edit] Downloading video ${video.storage_path}`)
       await r2DownloadToFile(video.storage_path, videoPath, signal)
       const size = await probeSize(videoPath)
+      // The picture inside its black bars, if it has any (found once, kept on the video): the framing keeps inside it
+      const picture = await pictureOf(video_id, signal, videoPath)
       // The video's own visuals (screen recordings, product shots…), described once, to show
       // under the speaker when they talk about them
       let visuals: Visual[] = []
@@ -1820,7 +1825,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
           analysis.cuts.push(...faceCuts(withoutPictures(analysis.info.frames, analysis.cuts), analysis.cuts)); analysis.cuts.sort((x, y) => x - y)
           // The short pieces read again 10 times a second (someone on screen half a second: the view takes them in)
           const close = await readCloseLooks(tmp, videoPath, highlight.start_ms, closeLookWindows(analysis.info.frames, analysis.cuts, clipDurationMs), signal)
-          const parts = formatClip([...analysis.info.frames, ...close], analysis.cuts, clipDurationMs, analysis.speech, size!, { motion: framing.motion })
+          const parts = formatClip([...analysis.info.frames, ...close], analysis.cuts, clipDurationMs, analysis.speech, size!, { motion: framing.motion, picture })
           const counts = parts.reduce<Record<string, number>>((n, p) => ({ ...n, [p.why]: (n[p.why] ?? 0) + 1 }), {})
           console.log(`[ai_edit] Rulebook formats: ${parts.length} part(s) — ${Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(', ')}`)
           segments = parts.map(({ why: _why, ...p }) => p)
@@ -1838,7 +1843,10 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
             console.log(`[ai_edit] related visuals: ${moments.map(m => `${(m.start_ms / 1000).toFixed(1)}s "${m.visual.about}"`).join(', ')}`)
           }
         }
-        if (addBroll) segments = await addStockBroll(segments, words, highlight, video.user_id, tmp, analysis, size)
+        if (addBroll) segments = await addStockBroll(segments, words, highlight, video.user_id, tmp, analysis, size, picture)
+        // Every view inside the picture (the old framing and borrowed footage reach into a video's bars;
+        // the Rulebook's views are already inside it)
+        segments = segments.map(s => ({ ...s, slotKfs: s.slotKfs.map(kfs => kfs.map(k => insidePicture(k, picture))) }))
         const clipWords = words.filter(w => w.start_ms >= highlight.start_ms && w.start_ms < highlight.end_ms)
         const caption = captionFontFor(clipWords, payload.caption_language)
 
@@ -1905,7 +1913,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
  */
 async function addStockBroll(
   segments: ClipSegment[], words: Word[], highlight: FoundClip, userId: string, tmp: string,
-  analysis: ClipAnalysis, size: { width: number; height: number } | null,
+  analysis: ClipAnalysis, size: { width: number; height: number } | null, picture: PictureBox = WHOLE_FRAME,
 ): Promise<ClipSegment[]> {
   try {
     const moments = await pickBrollMoments(words, highlight.start_ms, highlight.end_ms)
@@ -1930,7 +1938,9 @@ async function addStockBroll(
       try {
         const videoId = await stockAsset(userId, c.ref, c.url, m.queries[0], tmp)
         if (!videoId) continue
-        const view = personView(face, size ? size.width / size.height : undefined, size?.height)
+        // (decided in the picture inside the video's bars, as the formats are)
+        const view = fromPicture(personView(toPicture(face, picture), size ? pictureAR(size.width / size.height, picture) : undefined,
+          size ? size.height * picture.h : undefined), picture)
         shots.push({ start_ms: m.start_ms, end_ms: m.end_ms, videoId, view, query: m.queries[0], alts: m.candidates, at: pick })
         console.log(`[ai_edit] B-roll "${m.queries[0]}" at ${(m.start_ms / 1000).toFixed(1)}s: ${c.ref} (${c.width}x${c.height}), ${pick + 1} of ${m.candidates.length}`)
       } catch (e) {
@@ -2021,7 +2031,7 @@ async function saveClip(
       const font = brand?.title.font && scriptFont === 'montserrat-bold' ? brand.title.font : scriptFont
       await tx`
         INSERT INTO text_overlays (clip_id, text, start_ms, end_ms, x, y, font, size, color)
-        VALUES (${clipId}, ${text.hook}, 0, ${Math.min(3000, highlight.end_ms - highlight.start_ms)}, NULL, 0.15,
+        VALUES (${clipId}, ${text.hook}, 0, ${Math.min(text.asks ? 4000 : 3000, highlight.end_ms - highlight.start_ms)}, NULL, 0.15,
           ${font}, ${brand ? brand.title.size : 76}, ${brand ? brand.title.color : '#FFFFFF'})
       `
     }

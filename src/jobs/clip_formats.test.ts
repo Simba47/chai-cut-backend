@@ -154,3 +154,22 @@ test('a place showing one of a scene\'s people is Vertical on them, though the s
   assert.equal(at(15000).layout, 'vertical')
   assert.equal(at(9000).people, 4)
 })
+
+test('a letterboxed video (bars 12% top and bottom): every view inside the picture, nobody lost', async () => {
+  const { pictureFromCrops } = await import('../lib/pictureBox.js')
+  const picture = pictureFromCrops([{ w: 1920, h: 816, x: 0, y: 132 }], 1920, 1080)
+  // the same clip, its faces moved into the picture's band (as they are in such a video)
+  const squeeze = (f: CropBox): CropBox => ({ ...f, y: picture.y + f.y * picture.h, h: f.h * picture.h })
+  const boxed = frames.map(f => ({ ...f, faces: f.faces.map(squeeze) }))
+  const parts = formatClip(boxed, cuts, DUR, [], SIZE, { picture })
+  for (const p of parts) for (const kfs of p.slotKfs) for (const k of kfs) {
+    assert.ok(k.y >= picture.y - 1e-6 && k.y + k.h <= picture.y + picture.h + 1e-6, `${p.layout} ${p.why} at ${k.t_ms}: y ${k.y.toFixed(3)}–${(k.y + k.h).toFixed(3)}`)
+    assert.ok(k.x >= -1e-6 && k.x + k.w <= 1 + 1e-6)
+  }
+  // the two people are still each whole in a view of the Split
+  const [two] = parts
+  for (const f of clip(1000).map(squeeze)) assert.ok(two.slotKfs.some(kfs => within(f, kfs[0])), JSON.stringify(two.slotKfs))
+  // the no-face cutaway: a Vertical as tall as the picture
+  const slide = parts.find(p => p.why === 'cutaway')!
+  assert.ok(Math.abs(slide.slotKfs[0][0].h - picture.h) < 1e-6)
+})

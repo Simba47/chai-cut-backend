@@ -93,3 +93,21 @@ test('findClips: picked by lines, edges to the phrase, room added', async () => 
   assert.equal(out[0].end_ms, words[3 * 30 + 11].end_ms + 540)
   assert.equal(out[0].start_ms, lines[1].start_ms - 350)
 })
+
+test('the edge check says which question the clip answers when it was asked before the clip; kept on the clip', async () => {
+  // edges unchanged, a question given
+  const same = await refineEdges(clip(1, 3), lines, words, async (system: string) => {
+    assert.match(system, /"question_phrase":number or null,"question":"…" or null/)
+    return '{"start_phrase": 2, "end_phrase": 7, "question_phrase": 1, "question": "What was your happiest moment this year?", "why": "fine"}'
+  })
+  assert.equal(same.clip.question, 'What was your happiest moment this year?')
+  assert.equal(same.clip.end_ms, lines[3].end_ms)
+  // a question not placed before the clip (made up, or inside it) is dropped
+  for (const qp of ['null', '2', '5']) {
+    const r = await refineEdges(clip(1, 3), lines, words, async () => `{"start_phrase": 2, "end_phrase": 7, "question_phrase": ${qp}, "question": "What did Balagam change?", "why": "w"}`)
+    assert.equal(r.clip.question ?? null, null, `question_phrase ${qp}`)
+  }
+  // edges moved, no question
+  const moved = await refineEdges(clip(1, 3), lines, words, async () => '{"start_phrase": 2, "end_phrase": 6, "question": null, "why": "w"}')
+  assert.equal(moved.clip.question, null)
+})

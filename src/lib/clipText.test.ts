@@ -23,3 +23,16 @@ test('without a brand voice the prompt and text are as before', async () => {
   assert.equal(text.post_caption, 'Clips in minutes.')
   assert.equal(text.hashtags.length, 5)
 })
+
+test('a clip that starts at an answer: the question it answers is the hook, up to 10 words, marked', async () => {
+  let prompt = ''
+  const q = JSON.stringify({ hook: 'Ee year meeku happiest moment enti, edi gurthundi chala special ga?', title: 'Happiest moment', post_caption: 'x', hashtags: ['a', 'b', 'c', 'd', 'e'] })
+  const text = await generateClipText(words, 'Demo', async p => { prompt = p; return q }, 'roman', null, 'What was your happiest moment this year?')
+  assert.match(prompt, /The hook IS that question/)
+  assert.match(prompt, /"What was your happiest moment this year\?"/)
+  assert.equal(text.asks, true)
+  assert.equal(text.hook.split(' ').length, 10, 'cut to 10 words')
+  // and without one: the usual hook, not marked
+  const plain = await generateClipText(words, 'Demo', async () => answer, 'english')
+  assert.equal(plain.asks, undefined)
+})
