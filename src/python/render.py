@@ -746,6 +746,18 @@ def _print_input_warnings(stderr: str) -> None:
         print("[render] FFmpeg said while reading:\n  " + "\n  ".join(ln[:300] for ln in keep[:20]), flush=True)
 
 
+def _print_read_summary(stderr: str, expected_frames: float) -> None:
+    """
+    From FFmpeg's detailed (verbose) output, into the log: what it read from each input and where
+    reading ended, and how many frames of the main video were expected (its read length × frame rate).
+    """
+    keep = [ln for ln in (stderr or "").splitlines()
+            if re.search(r"Input stream #|Total: .*demuxed|Output stream #|EOF while reading|in#0/|vist#0:0|"
+                         r"error|warn|prematurely|reconnect|Seek|http", ln, re.I)]
+    print(f"[render] FFmpeg read (main video: about {expected_frames:.0f} frames expected):\n  "
+          + "\n  ".join(ln[:300] for ln in keep[-60:]), flush=True)
+
+
 def _shows_main(seg: dict, secondary_videos: dict[str, str], is_borrowed) -> bool:
     """Whether a part shows the clip's own video (not a B-roll or another video in its place); as in the segment loop."""
     boxes = sorted(seg.get("crop_boxes") or [], key=lambda b: b.get("slot_index", 0))
@@ -3066,7 +3078,9 @@ def main(
         probes = main_picture_probes(segments, out_w, out_h, blank_ranges, lambda s: _shows_main(s, secondary_videos, is_borrowed))
         for attempt in (1, 2):
             print(f"[render] Running FFmpeg (crf={qs['crf']}, {out_w}x{out_h}, {len(segments)} seg(s)) ...", flush=True)
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            # (the second time, FFmpeg says in detail what it read: how many frames of each input — to
+            # tell a video that stopped arriving from one lost inside the export)
+            result = subprocess.run(cmd if attempt == 1 else [cmd[0], "-v", "verbose", *cmd[1:]], capture_output=True, text=True)
             if result.returncode != 0:
                 print(f"[render] FFmpeg stderr:\n{result.stderr[-4000:]}", flush=True)
                 raise RuntimeError(f"FFmpeg render failed (exit {result.returncode})")
@@ -3079,6 +3093,7 @@ def main(
             print(f"[render] picture check: the main video is missing in the export at {where}"
                   + (" — exporting again" if attempt == 1 else ""), flush=True)
             if attempt == 2:
+                _print_read_summary(result.stderr, read_s * _probe_fps(video_path))
                 raise RuntimeError(f"The export came out without the video at {where}, twice. Please export again.")
 
         if behind_subs:
