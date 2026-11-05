@@ -384,7 +384,12 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
     await rm(tmp, { recursive: true, force: true })
     // Re-render requested: queue the render now that captions are updated. Also on
     // failure, so the clip renders with its previous captions instead of staying stuck.
-    if (payload.render_after) {
+    // (not when the export was cancelled meanwhile: the clip is no longer exporting)
+    const exporting = payload.render_after
+      ? await db`SELECT 1 FROM clips WHERE id = ${payload.render_after.clip_id} AND status = 'rendering'`.then(r => r.length > 0, () => true)
+      : false
+    if (payload.render_after && !exporting) console.log(`[transcribe] export of clip ${payload.render_after.clip_id} was cancelled: no render`)
+    if (payload.render_after && exporting) {
       const render = payload.render_after
       await db`INSERT INTO jobs (type, payload, status) VALUES ('render', ${db.json(render as never)}, 'queued')`
         .then(() => console.log(`[transcribe] queued render for clip ${render.clip_id}`))
