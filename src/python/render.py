@@ -738,10 +738,23 @@ def _reconnect_opts(path: str) -> list[str]:
     return ["-reconnect", "1", "-reconnect_on_network_error", "1", "-reconnect_delay_max", "5"]
 
 
+# Threads each filter of the export may use. Left to itself FFmpeg gives every resize its own set,
+# one per CPU the machine reports, and a clip with frames has many resizes, each starting its threads
+# when the export reaches its part. On a big Railway host that ran the worker out of threads part-way
+# through (2026-11-05): "Failed initializing scaling graph (Resource temporarily unavailable)", the
+# parts from there on black, the sound fine and FFmpeg reporting success. Reproduced by hitting the
+# thread limit on a Mac; on a Mac the same clip exported fine because it has few cores.
+FILTER_THREADS = 4
+
+
 def _print_input_warnings(stderr: str) -> None:
-    """What FFmpeg said about reading its inputs (a dropped connection, a damaged stretch) into the log"""
+    """
+    What FFmpeg said about reading its inputs (a dropped connection, a damaged stretch) and about
+    running short of threads into the log
+    """
     keep = [ln for ln in (stderr or "").splitlines()
-            if re.search(r"reconnect|prematurely|connection|i/o error|invalid data|end of file|error", ln, re.I)]
+            if re.search(r"reconnect|prematurely|connection|i/o error|invalid data|end of file|error|"
+                         r"failed initializing|temporarily unavailable", ln, re.I)]
     if keep:
         print("[render] FFmpeg said while reading:\n  " + "\n  ".join(ln[:300] for ln in keep[:20]), flush=True)
 
@@ -2070,6 +2083,7 @@ def main(
         main_opts = _reconnect_opts(video_path)
         inputs = [
             "ffmpeg", "-y",
+            "-filter_complex_threads", str(FILTER_THREADS),
             *main_opts,
             "-ss", f"{clip_start_s:.3f}",
             "-t",  f"{read_s:.3f}",
