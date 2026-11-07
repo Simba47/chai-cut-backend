@@ -12,9 +12,10 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { computeCutRanges, keptRanges, makeTimeMap, reactionRanges, removedMs, type Range } from '../lib/cuts.js'
 import { cleanTrims } from '../lib/trims.js'
-import { cleanProgressBar, clipBrandWords } from '../lib/brandKit.js'
+import { clipBrandWords } from '../lib/brandKit.js'
 import { brandCaptionWords } from '../lib/brandWords.js'
 import { aiProvider, askGemini } from '../lib/gemini.js'
+import { pickKeyWords, type KeyWordPicks } from '../lib/keyWords.js'
 
 const execFileAsync = promisify(execFile)
 import { fileURLToPath } from 'node:url'
@@ -259,11 +260,14 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
   // (a caption style — style.template — is a preset in its own look: it shows emphasis too)
   if (style && (PRESETS.has(style.animation) || style.template) && style.emphasis == null && words.length) {
     const clipWords = words.filter(w => w.start_ms >= clip.start_ms && w.start_ms < clip.end_ms)
-    const emphasis = await pickEmphasis(clipWords.map(w => ({ word: w.word as string, start_ms: w.start_ms as number, end_ms: w.end_ms as number })))
-    if (emphasis) {
-      await db`UPDATE caption_styles SET emphasis = ${db.json(emphasis)} WHERE id = ${style.id}`
+    const [video] = await db`SELECT title FROM videos WHERE id = ${clip.video_id}`
+    const picked = await pickEmphasis(clipWords.map(w => ({ word: w.word as string, start_ms: w.start_ms as number, end_ms: w.end_ms as number })), (video?.title as string | null)?.trim() || null)
+    if (picked) {
+      // (and the line words: what a Creator line makes big with no key word)
+      await db`UPDATE caption_styles SET emphasis = ${db.json(picked.emphasis)}, line_keys = ${db.json(picked.line_keys)} WHERE id = ${style.id}`
         .catch(e => console.warn('[render] could not save caption emphasis:', e))
-      style.emphasis = emphasis
+      style.emphasis = picked.emphasis
+      style.line_keys = picked.line_keys
     }
   }
 
@@ -335,8 +339,6 @@ async function buildRenderSpec(clipId: string, videoStoragePath: string, quality
     // the music keeps playing
     mute_ranges: muteRanges(placedSegments, clip.video_id),
     transitions, overlays: (overlays as Row[]).filter(o => !o.hidden), words: placedWords,
-    // A bar filling up along the top or bottom edge as the clip plays (a brand kit's); null = none
-    progress_bar: cleanProgressBar(clip.progress_bar),
     output_width: dims.w, output_height: dims.h,
   }
 }
@@ -365,36 +367,14 @@ function runPython(script: string, args: string[], signal?: AbortSignal): Promis
 const PRESETS = new Set(['pop', 'highlight', 'bounce', 'word', 'hormozi', 'box', 'glow'])
 
 /**
- * The 1–2 most important words in each caption line, as { "<word start_ms>": true } (the key
- * render.py and the editor look words up by). Gemini reads the clip's lines once; null when it
- * fails, so the clip renders without emphasis.
+ * The clip's key words and line words, each as { "<word start_ms>": true } (the key render.py and
+ * the editor look words up by): Gemini reads the clip once (lib/keyWords.ts, the same file as the
+ * editor's); null when it fails, so the clip renders without them.
  */
-const EMPHASIS_SCHEMA = { type: 'OBJECT', properties: { words: { type: 'ARRAY', items: { type: 'INTEGER' } } }, required: ['words'] }
-
-export async function pickEmphasis(words: Array<{ word: string; start_ms: number; end_ms: number }>): Promise<Record<string, true> | null> {
+export async function pickEmphasis(words: Array<{ word: string; start_ms: number; end_ms: number }>, title: string | null = null): Promise<KeyWordPicks | null> {
   if (!words.length || !aiProvider()) return null
-  // Lines as the captions break them: a pause over 300 ms or 5 words
-  const lines: number[][] = []
-  words.forEach((w, i) => {
-    const line = lines[lines.length - 1]
-    if (!line || line.length >= 5 || w.start_ms - words[i - 1].end_ms > 300) lines.push([i])
-    else line.push(i)
-  })
-  const text = lines.map((l, li) => `${li}: ` + l.map(i => `${i}=${words[i].word}`).join(' ')).join('\n')
-  const prompt = `These are caption lines from a short video (any language, often Telugu, Hindi or Tamil mixed with English). Each word is written as index=word.
-For each line pick the 1 or 2 words that carry the meaning or emotion (a key noun, number, strong verb or punchline word) — never filler words. Skip a line if nothing stands out.
-Return ONLY JSON: {"words": [index, ...]}
-
-${text}`
   try {
-    // A fixed answer shape: without it the model sometimes nests the indices per line
-    const out = await askGemini(prompt, { schema: EMPHASIS_SCHEMA, temperature: 0, thinkingBudget: 0 })
-    const match = out.match(/\{[\s\S]*\}/)
-    const idx: unknown = match ? JSON.parse(match[0]).words : null
-    if (!Array.isArray(idx)) return null
-    const picked: Record<string, true> = {}
-    for (const i of idx) if (Number.isInteger(i) && words[i]) picked[String(words[i].start_ms)] = true
-    return picked
+    return await pickKeyWords(words, title, (prompt, o) => askGemini(prompt, o))
   } catch (e) {
     console.warn('[render] caption emphasis failed, rendering without it:', e instanceof Error ? e.message : e)
     return null

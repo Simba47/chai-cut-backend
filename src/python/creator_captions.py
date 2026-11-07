@@ -22,7 +22,8 @@ Every size is px at 1080 wide (k = out_w / 1080). A font of size N is drawn so i
   scribble    a handwritten line; key words get a hand-drawn wavy underline in the highlight colour
 
 The key word of a line is the first emphasised one (caption_styles.emphasis, picked by AI and
-changed in the editor), else its longest word ("build": its middle one).
+changed in the editor), else its line word (caption_styles.line_keys: the word AI says carries
+it), else its longest word ("build": its middle one).
 """
 import json
 import math
@@ -156,11 +157,19 @@ def _letters(t: str) -> int:
     return sum(ch.isalnum() for ch in t)
 
 
-def key_index(texts: list[str], emph: list[bool], look: str) -> int:
-    """The line's key word: the first emphasised, else the longest (build: the middle one)"""
+def key_index(texts: list[str], emph: list[bool], look: str, line: list[bool] | None = None) -> int:
+    """The line's key word: the first emphasised, else its line word (`line`: the longest if AI
+    marked more than one), else the longest (build: the middle one) — the editor's creatorKeyIndex"""
     for j, e in enumerate(emph):
         if e:
             return j
+    marked = [j for j, on in enumerate(line or []) if on and j < len(texts)]
+    if marked:
+        best = marked[0]
+        for j in marked:
+            if _letters(texts[j]) > _letters(texts[best]):
+                best = j
+        return best
     if look == "build":
         return min(1, len(texts) - 1)
     best = 0
@@ -170,11 +179,11 @@ def key_index(texts: list[str], emph: list[bool], look: str) -> int:
     return best
 
 
-def _keys(texts: list[str], emph: list[bool], any_emphasis: bool) -> set[int]:
-    """scribble: every emphasised word; with no AI picks at all, each line's longest"""
+def _keys(texts: list[str], emph: list[bool], any_emphasis: bool, line: list[bool] | None = None) -> set[int]:
+    """scribble: every emphasised word; with no AI picks at all, each line's key word"""
     if any(emph):
         return {j for j, e in enumerate(emph) if e}
-    return set() if any_emphasis else {key_index(texts, emph, "scribble")}
+    return set() if any_emphasis else {key_index(texts, emph, "scribble", line)}
 
 
 def _wave_path(x0: float, x1: float, yc: float, amp: float, lam: float, th: float) -> str:
@@ -190,7 +199,7 @@ def _wave_path(x0: float, x1: float, yc: float, amp: float, lam: float, th: floa
 # ── the events ────────────────────────────────────────────────────────────────
 
 def events(lines: list[tuple[list[tuple[dict, str]], int, int]], style: dict, tpl: dict,
-           emphasis: dict, out_w: int, out_h: int, pos_x: int) -> tuple[list[str], list[str], bool]:
+           emphasis: dict, out_w: int, out_h: int, pos_x: int, line_keys: dict | None = None) -> tuple[list[str], list[str], bool]:
     """
     ASS events for a Creator style. `lines`: each caption line's words (word, the text shown) and
     when it is on screen (clip ms). Returns (events, difference events, behind): the difference
@@ -233,9 +242,11 @@ def events(lines: list[tuple[list[tuple[dict, str]], int, int]], style: dict, tp
         script = script_font(" ".join(texts))
         font, key_font = _scripted(base_font, script), _scripted(base_key_font, script)
         emph = [bool(emphasis.get(str(w.get("_src_start", w["start_ms"])))) for w, _ in shown]
+        # (the line words: what the line makes big when it has no key word, caption_styles.line_keys)
+        line_word = [bool((line_keys or {}).get(str(w.get("_src_start", w["start_ms"])))) for w, _ in shown]
         ons = [w["start_ms"] - a for w, _ in shown]
         offs = [(shown[j + 1][0]["start_ms"] if j + 1 < len(shown) else b) - a for j in range(len(shown))]
-        kk = key_index(texts, emph, look)
+        kk = key_index(texts, emph, look, line_word)
 
         if look == "behind":
             # One word: as big as the size asks, narrowed to fit 88% of the width
@@ -330,7 +341,7 @@ def events(lines: list[tuple[list[tuple[dict, str]], int, int]], style: dict, tp
 
         elif look == "scribble":
             n = fitted(S, texts)
-            keys = _keys(texts, emph, any_emphasis)
+            keys = _keys(texts, emph, any_emphasis, line_word)
             runs = " ".join(f"{{{_reveal(ons[j])}}}{_esc(t)}" for j, t in enumerate(texts))
             out.append(dialogue(a, b, f"{{\\an5\\pos({pos_x},{cy:.0f}){_fn(font, n)}\\1c{_color(color)}{shad}}}{runs}"))
             # The underlines, under each key word (laid out as libass lays the line: measured)

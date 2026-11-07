@@ -360,7 +360,15 @@ def _creator_events(words: list[dict], style: dict, tpl: dict, out_w: int, out_h
         shown = [(w, t.upper() if upper else t) for w, t in shown if t]
         if shown:
             lines.append((shown, start_ms, end_ms))
-    return creator_captions.events(lines, style, tpl, emphasis if isinstance(emphasis, dict) else {}, out_w, out_h, _caption_x(style, out_w))
+    # (the line words: what a line makes big when it has no key word — lib/keyWords.ts)
+    line_keys = style.get("line_keys") or {}
+    if isinstance(line_keys, str):
+        try:
+            line_keys = json.loads(line_keys)
+        except ValueError:
+            line_keys = {}
+    return creator_captions.events(lines, style, tpl, emphasis if isinstance(emphasis, dict) else {}, out_w, out_h, _caption_x(style, out_w),
+                                   line_keys if isinstance(line_keys, dict) else {})
 
 
 def _line_times(sentences: list[list[dict]]) -> list[tuple[int, int]]:
@@ -1765,6 +1773,27 @@ def _scale_cover(w: int, h: int) -> str:
     )
 
 
+def _scale_cover_at(w: int, h: int, pan) -> str:
+    """
+    Cover w×h showing the part of the picture picked in the editor (a frame photo's `pan`: x / y as
+    shares of the room to spare each way, zoom ≥ 1). Matches the editor's coverSource with a pan.
+    Absent: the middle, as _scale_cover.
+    """
+    if not isinstance(pan, dict):
+        return _scale_cover(w, h)
+    def share(v, lo, hi, d):
+        try:
+            return max(lo, min(hi, float(v)))
+        except (TypeError, ValueError):
+            return d
+    x, y, z = share(pan.get("x"), 0, 1, 0.5), share(pan.get("y"), 0, 1, 0.5), share(pan.get("zoom"), 1, 4, 1)
+    zw, zh = max(w, int(round(w * z / 2)) * 2), max(h, int(round(h * z / 2)) * 2)
+    return (
+        f"scale=w={zw}:h={zh}:flags=lanczos:force_original_aspect_ratio=increase,"
+        f"crop={w}:{h}:x='(iw-{w})*{x:.4f}':y='(ih-{h})*{y:.4f}'"
+    )
+
+
 def _scale_fit(w: int, h: int) -> str:
     """Scale to fit inside w×h (letterbox — preserves AR, pads with black)."""
     return (
@@ -1994,12 +2023,13 @@ def main(
         ass_files: list[tuple[str, dict]] = []
         # enabled False = the user turned captions off (styles saved before that field count as on)
         if clip_words and caption_style and caption_style.get("enabled") is not False:
-            zones = caption_band_zones(segments, out_h)
-            parts = [p for p in (spec.get("caption_parts") or []) if int(p.get("start_ms") or 0) > 0]
+            # (a frame's caption strip holds the captions until they're moved: position_y set)
+            zones_of = lambda look: caption_band_zones(segments, out_h, strips=look.get("position_y") is None)
+            parts =[p for p in (spec.get("caption_parts") or []) if int(p.get("start_ms") or 0) > 0]
             parts.sort(key=lambda p: int(p["start_ms"]))
             if not parts:
                 path = os.path.join(tmp, "captions.ass")
-                ass_files.append((path, _write_ass(clip_words, caption_style, clip_start_ms, out_w, out_h, path, band_zones=zones)))
+                ass_files.append((path, _write_ass(clip_words, caption_style, clip_start_ms, out_w, out_h, path, band_zones=zones_of(caption_style))))
             else:
                 bounds = [None] + [int(p["start_ms"]) for p in parts] + [None]
                 # (the case is the clip's, in every part: the editor has one for all of them)
@@ -2011,7 +2041,7 @@ def main(
                     if not own:
                         continue
                     path = os.path.join(tmp, f"captions-{k}.ass")
-                    ass_files.append((path, _write_ass(own, look, clip_start_ms, out_w, out_h, path, band_zones=zones)))
+                    ass_files.append((path, _write_ass(own, look, clip_start_ms, out_w, out_h, path, band_zones=zones_of(look))))
                 print(f"[render] captions in {len(looks)} parts: {[(bounds[k] or 0, l.get('template') or l.get('animation')) for k, l in enumerate(looks)]}", flush=True)
 
         # ── Count how many times each source video is needed ───────────────────
@@ -2119,6 +2149,8 @@ def main(
         next_input = vid_base + len(valid_vid)
         frame_item_in: dict[tuple[int, str], str] = {}
         frame_item_dims: dict[tuple[int, str], tuple[int, int] | None] = {}
+        # Frozen video items: how long their one picture is held (s)
+        frame_item_frozen: dict[tuple[int, str], float] = {}
         for si, seg in enumerate(segments):
             if not is_frame(seg.get("layout")):
                 continue
@@ -2129,7 +2161,17 @@ def main(
                 for it in lane_items(seg, st, area["slot"]):
                     if it.get("hidden"):
                         continue  # kept only for its sound (the mix reads it on its own)
-                    if it.get("kind") == "video" and it.get("source_video_id") in secondary_videos:
+                    if it.get("kind") == "video" and it.get("source_video_id") in secondary_videos and it.get("freeze"):
+                        # Frozen (user, 2026-11-06): one picture — the one at its own start, where the
+                        # piece after it starts playing — held for its whole time (the editor's frameMedia)
+                        path = secondary_videos[it["source_video_id"]]
+                        off = int(it.get("source_offset_ms") or 0) / 1000.0
+                        length, _ = _probe(path)
+                        if length > 0:
+                            off = max(0.0, min(off % length, length - 0.1))
+                        inputs += ["-thread_queue_size", "1024", "-ss", f"{off:.3f}", "-t", "1", "-i", path]
+                        frame_item_frozen[(si, it["id"])] = it["dur_s"]
+                    elif it.get("kind") == "video" and it.get("source_video_id") in secondary_videos:
                         path = secondary_videos[it["source_video_id"]]
                         off = it["off_ms"] / 1000.0
                         length, _ = _probe(path)
@@ -2167,6 +2209,11 @@ def main(
 
         # ── Build filter_complex ───────────────────────────────────────────────
         fp: list[str] = []
+        # A frozen video item: its first picture, held (cloned) for its whole time, then used as any video item
+        for (fsi, fid), held in frame_item_frozen.items():
+            flbl = f"[fz{fsi}_{len(fp)}]"
+            fp.append(f"{frame_item_in[(fsi, fid)]}trim=end_frame=1,setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={held + 1:.3f}{flbl}")
+            frame_item_in[(fsi, fid)] = flbl
 
         # Pre-allocate split pools so each slot gets its own named stream copy.
         # Primary video always gets setpts to normalise PTS after the -ss seek.
@@ -2326,6 +2373,8 @@ def main(
                 else:
                     canvas(band_bg if base_kind == "band" and band_bg != "none" else "000000", out_w, out_h, frame_lbl)
                 cur_frame = frame_lbl
+                # Frame texts' words, drawn after every area (see below)
+                words_later: list[tuple[dict, dict, str, int, float, float]] = []
 
                 for ri, area in enumerate(frame_areas(layout, out_w, out_h, frame_band_shown(seg), row_heights(seg), row_order(seg), seg.get("frame"))):
                     kind, aw, rh = area["kind"], area["w"], area["h"]
@@ -2399,15 +2448,21 @@ def main(
                             own = area.get("bg") if kind == "band" else None
                             fallback = (own if own == "none" else _hex6(own, band_bg)) if own else (band_bg if kind == "band" else "000000")
                             card_bg = "none" if it.get("bg") == "none" else _hex6(it.get("bg"), fallback) if it.get("bg") else fallback
+                            ticker = bool(area.get("ticker"))
+                            # A ticker runs inside its band. Any other frame text can be dragged anywhere
+                            # in the frame (user, 2026-11-06): only its area's colour is drawn here; its
+                            # words go on top of every area, not cut at its edge (the editor's paintFrameText)
+                            if not ticker:
+                                words_later.append((it, area, key, ii, rel, d))
                             text_lbl, next_input = _frame_text_chain(
                                 fp, inputs, next_input, f"{key}i{ii}txt",
-                                it.get("text") or "", card_bg,
+                                "" if not ticker else it.get("text") or "", card_bg,
                                 _hex6(it.get("color"), "ffffff"), int(it.get("size") or 64), aw, rh, d,
                                 float(it["x"]) if it.get("x") is not None else 0.5,
                                 float(it["y"]) if it.get("y") is not None else 0.5,
                                 float(it["w"]) if it.get("w") else None,
                                 float(it.get("rotation") or 0),
-                                frame_w=out_w, default_w=0.88 * aw / out_w, ticker=bool(area.get("ticker")),
+                                frame_w=out_w, default_w=0.88 * aw / out_w, ticker=ticker,
                                 font_family=it.get("font") or None)
                             chain = f"{text_lbl}null"  # passthrough: the shared epilogue below appends setpts
                         elif ik == "photo" and (si, it["id"]) in frame_item_in:
@@ -2423,17 +2478,20 @@ def main(
                                          f"{zp},setsar=1,format=yuv420p,trim=duration={d:.3f},setpts=PTS-STARTPTS")
                                 chain = placed(chain, aw, rh, iw, ih, px, py, rr, boxed, f"{key}i{ii}c")
                             else:
-                                chain = f"{src}{_scale_cover(iw, ih)},setsar=1,format=yuv420p,trim=duration={d:.3f},setpts=PTS-STARTPTS"
+                                chain = f"{src}{_scale_cover_at(iw, ih, it.get('pan'))},setsar=1,format=yuv420p,trim=duration={d:.3f},setpts=PTS-STARTPTS"
                                 chain = placed(chain, aw, rh, iw, ih, px, py, rr, boxed, f"{key}i{ii}c")
                         elif ik == "video" and (si, it["id"]) in frame_item_in:
                             src = frame_item_in[(si, it["id"])]
                             iw, ih, px, py, rr, boxed = media_box(it.get("corners"), it.get("rect"), aw, rh)
+                            # Frozen and dimmed: its picture at 55% brightness (black at 45% over it — in
+                            # YUV the same as the editor's canvas brightness(0.55))
+                            dim = "format=yuv420p,drawbox=x=0:y=0:w=iw:h=ih:color=black@0.45:t=fill," if it.get("freeze") and it.get("dim") else ""
                             if contain:
-                                chain = shown_whole(f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},", frame_item_dims.get((si, it["id"])), iw, ih, rr, f"{key}i{ii}")
+                                chain = shown_whole(f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{dim}", frame_item_dims.get((si, it["id"])), iw, ih, rr, f"{key}i{ii}")
                                 if boxed:
                                     chain = f"{chain},pad={aw}:{rh}:{px}:{py}:color=black@0"
                             else:
-                                chain = f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{_scale_cover(iw, ih)},setsar=1,format=yuv420p"
+                                chain = f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{dim}{_scale_cover(iw, ih)},setsar=1,format=yuv420p"
                                 chain = placed(chain, aw, rh, iw, ih, px, py, rr, boxed, f"{key}i{ii}c")
                         else:
                             print(f"[render] frame item skipped (media missing): {ik} {it.get('id')}", flush=True)
@@ -2475,6 +2533,23 @@ def main(
                     # Laid on the frame at its place
                     nxt = f"[fr{si}c{ri}]"
                     fp.append(f"{cur_frame}{lbl}overlay={area['x']}:{area['y']}:eof_action=pass{nxt}")
+                    cur_frame = nxt
+                # The frame texts' words on top of everything, each centred where it was put — its
+                # place is a share of its area, beyond 0–1 when moved out of it — on a see-through
+                # card the frame's size, only during its own time
+                for it, area, key, ii, rel, d in words_later:
+                    aw, rh = area["w"], area["h"]
+                    cx = (area["x"] + aw * (float(it["x"]) if it.get("x") is not None else 0.5)) / out_w
+                    cy = (area["y"] + rh * (float(it["y"]) if it.get("y") is not None else 0.5)) / out_h
+                    text_lbl, next_input = _frame_text_chain(
+                        fp, inputs, next_input, f"{key}i{ii}w",
+                        it.get("text") or "", "none",
+                        _hex6(it.get("color"), "ffffff"), int(it.get("size") or 64), out_w, out_h, d,
+                        cx, cy, float(it["w"]) if it.get("w") else None, float(it.get("rotation") or 0),
+                        frame_w=out_w, default_w=0.88 * aw / out_w, font_family=it.get("font") or None)
+                    il, nxt = f"[{key}i{ii}wl]", f"[{key}i{ii}wo]"
+                    fp.append(f"{text_lbl}setpts=PTS+{rel:.3f}/TB{il}")
+                    fp.append(f"{cur_frame}{il}overlay=0:0:eof_action=pass:enable='between(t,{rel:.3f},{rel + d:.3f})'{nxt}")
                     cur_frame = nxt
                 fp.append(f"{cur_frame}format=yuv420p,setsar=1{out_lbl}")
                 seg_labels.append(out_lbl)
@@ -2914,23 +2989,6 @@ def main(
                 f":enable='between(t,{t0:.3f},{t1:.3f})'{olbl}"
             )
             cur = olbl
-
-        # ── Progress bar (a brand kit's) ───────────────────────────────────────
-        # A strip along the top or bottom edge that fills from the left as the clip plays: a full-width
-        # strip of the colour slid in from off the left edge (x = -W + W·t/length; drawbox can't change
-        # its width over time). Its thickness is px on a 1080 × 1920 frame, scaled to the export's size.
-        # The editor draws the same (components/editor/VideoPreview.tsx ProgressBar).
-        pb = spec.get("progress_bar")
-        if isinstance(pb, dict) and clip_dur_ms > 0:
-            pb_color = str(pb.get("color", "#ffffff"))
-            if not re.fullmatch(r"#[0-9a-fA-F]{6}", pb_color):
-                pb_color = "#ffffff"
-            pb_h = max(2, int(round(min(40, max(4, float(pb.get("height", 12)))) * out_h / 1920)))
-            pb_y = 0 if pb.get("position") == "top" else out_h - pb_h
-            dur_s = clip_dur_ms / 1000.0
-            fp.append(f"color=c=0x{pb_color[1:]}:s={out_w}x{pb_h}:r=30:d={dur_s + 1:.3f}[vpbs]")
-            fp.append(f"{cur}[vpbs]overlay=x='-W+W*t/{dur_s:.3f}':y={pb_y}:eval=frame:shortest=1[vpb]")
-            cur = "[vpb]"
 
         # ── Watermark (free plan only) ─────────────────────────────────────────
         # The Shortcut badge (assets/watermark.png), over everything else. Its size and place are

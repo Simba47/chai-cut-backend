@@ -201,6 +201,8 @@ async function runMigrations() {
   await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS template TEXT`
   // Words the AI marked as important ({ "<word start_ms>": true }), made once per clip at export
   await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS emphasis JSONB`
+  // The word a Creator style makes big on a line with no key word ({ "<word start_ms>": true }, lib/keyWords.ts)
+  await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS line_keys JSONB`
   await db`ALTER TABLE caption_styles ADD COLUMN IF NOT EXISTS emoji BOOLEAN NOT NULL DEFAULT false`
   // Remove pauses and filler words: the switch per clip, and the source-time ranges it cut
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS remove_fillers BOOLEAN NOT NULL DEFAULT false`
@@ -291,8 +293,8 @@ async function runMigrations() {
   // The brand kit on a clip (the editor's Brand kit switch): { kit_id, before } — what the brand
   // changed, so switching it off puts it back; null = off
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS brand JSONB`
-  // A bar along the top or bottom edge filling up as the clip plays (a brand kit's progress bar):
-  // { color, height (px on a 1080 × 1920 frame), position: 'top' | 'bottom' }; null = none
+  // A brand kit's progress bar (a bar filling up as the clip plays): taken out 2026-11-05 (user) —
+  // nothing reads or writes it now; the column stays so an older build still running doesn't break
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS progress_bar JSONB`
   // Where the captions are centred left to right (0–1 of the frame's width, dragged in the editor's
   // preview like text); null = the middle
