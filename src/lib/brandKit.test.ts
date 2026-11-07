@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 
 // brandKit.ts reads the database only in loadClipBrand; the functions tested here don't
 process.env.DATABASE_URL ??= 'postgres://test:test@127.0.0.1:1/test'
-const { clipBrand, cleanProgressBar, logoSpan, brandCaptionRow } = await import('./brandKit.js')
+const { clipBrand, logoSpan, brandCaptionRow } = await import('./brandKit.js')
 
 const U = '11111111-1111-1111-1111-111111111111'
 const kit = (over: Record<string, unknown> = {}) => ({
@@ -66,18 +66,13 @@ test('a kit saved before these settings existed still works (defaults fill the r
   assert.ok(b.logo && b.logo.x < 0.1 && b.logo.y > 0.7 && b.logo.y + b.logo.h <= 0.87 + 1e-3, 'bottom left, above the apps caption')
 })
 
-test("a clip's progress bar made safe; a kit's progress bar and voice aren't used", () => {
-  const b = clipBrand({ progress: { on: true, color: '#FF3366' }, voice: { tone: 'fun' } }, U) as Record<string, unknown>
-  assert.equal(b.progress, undefined); assert.equal(b.voice, undefined)
-  assert.deepEqual(cleanProgressBar({ color: 'red', height: 999, position: 'left' }), { color: '#ffffff', height: 40, position: 'bottom' })
-  assert.equal(cleanProgressBar(null), null)
+test("a kit's progress bar and voice aren't used", () => {
+  const b = clipBrand({ progress: { on: true, color: '#FF3366' }, progress_bar: { on: true }, voice: { tone: 'fun' } }, U) as Record<string, unknown>
+  assert.equal(b.progress, undefined); assert.equal(b.progress_bar, undefined); assert.equal(b.voice, undefined)
 })
 
-test("the kit's progress bar and end card are saved as not put on yet (the frontend's engine adds it)", async () => {
+test("the kit's end card is saved as not put on yet (the frontend's engine adds it)", async () => {
   const { appliedHere } = await import('./brandKit.js')
-  const kit = { colors: { main: '#111111' }, progress_bar: { on: true, color: 'accent', height: 12, position: 'bottom' } }
-  assert.deepEqual(appliedHere(kit), { ...kit, progress_bar: { ...kit.progress_bar, on: false } })
   assert.deepEqual(appliedHere({ colors: {} }), { colors: {} })
-  // (and its end card)
   assert.deepEqual(appliedHere({ ends: { card: true, seconds: 4, intro: { id: 'x', ms: 3000 } } }), { ends: { card: false, seconds: 4, intro: null, outro: null } })
 })

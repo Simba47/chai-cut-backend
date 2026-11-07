@@ -92,14 +92,15 @@ async function fillMissingDuration(videoId: string, storagePath: string, signal?
 /** How far a reading has got: `done` of `total` chunks (Make my clips shows it while it reads a video) */
 export type ReadProgress = (done: number, total: number) => void | Promise<void>
 
-/** What the clip board's Stop writes on a whole-video reading (the frontend's stopVideoTranscript) */
+/** What Stop writes on a reading's job: the clip board's on a whole-video reading (the frontend's stopVideoTranscript), the editor's on a clip's Regenerate (stopClipCaptions) */
 export const READING_STOPPED = 'Stopped by the user'
 
 /**
  * A transcription job. A whole-video reading (the transcript the edit tools need) can be stopped
  * from the clip board: its job row says so, checked every 2 s, and everything running (FFmpeg, the
  * AI calls) is stopped. The parts already read are kept (the reading store), so a later Unlock
- * carries on from there.
+ * carries on from there. A clip's Regenerate can be stopped the same way from the editor (user,
+ * 2026-11-06): nothing of it is written, the clip keeps the words it had.
  */
 export async function handleTranscribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgress) {
   const raw = job.payload
@@ -111,20 +112,30 @@ export async function handleTranscribeJob(job: Job, signal?: AbortSignal, onRead
 }
 
 async function runTranscribeJob(job: Job, p: TranscribeJobPayload, signal?: AbortSignal, onRead?: ReadProgress) {
-  const stoppable = !!p.transcribe_full && !p.clip_id && !p.is_retranscribe && /^[0-9a-f-]{36}$/i.test(job.id)
+  const reading = !!p.transcribe_full && !p.clip_id && !p.is_retranscribe
+  const regenerate = !!p.is_retranscribe && !!p.clip_id
+  const stoppable = (reading || regenerate) && /^[0-9a-f-]{36}$/i.test(job.id)
   if (!stoppable) return transcribeJob(job, signal, onRead)
   const stop = new AbortController()
-  const watch = setInterval(async () => {
+  const check = async () => {
     try {
       const [row] = await db<{ status: string; error: string | null }[]>`SELECT status, error FROM jobs WHERE id = ${job.id}`
       if (row && row.status === 'failed' && row.error === READING_STOPPED) stop.abort(new Error(READING_STOPPED))
     } catch { /* the next check */ }
-  }, 2000)
+  }
+  // (once at once: stopped while it waited in the shared Google line, it doesn't start at all)
+  await check()
+  if (stop.signal.aborted) {
+    console.log(`[transcribe] ${regenerate ? `clip ${p.clip_id}'s captions` : `reading of video ${p.video_id}`} stopped by the user before it started`)
+    throw new Error(READING_STOPPED)
+  }
+  const watch = setInterval(check, 2000)
   try {
     return await transcribeJob(job, signal ? AbortSignal.any([signal, stop.signal]) : stop.signal, onRead)
   } catch (e) {
     if (stop.signal.aborted) {
-      console.log(`[transcribe] reading of video ${p.video_id} stopped by the user (the parts read are kept)`)
+      console.log(regenerate ? `[transcribe] clip ${p.clip_id}'s captions stopped by the user (its words are as they were)`
+        : `[transcribe] reading of video ${p.video_id} stopped by the user (the parts read are kept)`)
       throw new Error(READING_STOPPED)
     }
     throw e
@@ -200,9 +211,9 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
     let audioCached = false
     if ((isRetranscribe || isFullJob) && audioStoragePath) {
       try {
-        const cachedBuf = await r2Download(audioStoragePath)
         const flacPath = join(tmp, 'cached.flac')
-        await writeFile(flacPath, cachedBuf)
+        // (straight to the file, and stopped with the job: Stop on Regenerate didn't wait it out)
+        await r2DownloadToFile(audioStoragePath, flacPath, signal)
         // The cache holds the full video's audio — for clip jobs cut out just the clip's
         // range, since word times are offset by clip_start_ms below
         const clipRange = isClipJob
