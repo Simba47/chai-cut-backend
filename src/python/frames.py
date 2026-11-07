@@ -400,7 +400,9 @@ def row_heights(seg: dict) -> list[float] | None:
         hs = [float(h) for h in custom]
     except (TypeError, ValueError):
         return None
-    return hs if all(h >= 0.03 for h in hs) else None
+    # A caption strip can be closed (0: dragged down to nothing — user, 2026-11-06, Title's bottom bar)
+    ok = all(h >= 0.03 or (h == 0 and kind == "caption") for (kind, _, _), h in zip(tpl, hs))
+    return hs if ok and sum(hs) > 0 else None
 
 
 def row_order(seg: dict) -> list[int] | None:
@@ -430,7 +432,8 @@ def frame_rows(layout: str, out_h: int, show_band: bool = True, custom: list[flo
         tpl = [(kind, slot, h) for (kind, slot, _), h in zip(tpl, custom)]
     if order and sorted(order) == list(range(len(tpl))):
         tpl = [tpl[i] for i in order]
-    rows = [r for r in tpl if show_band or r[0] != "band"]
+    # (a closed caption strip, 0 high, isn't there at all: no strip, the captions where they usually are)
+    rows = [r for r in tpl if (show_band or r[0] != "band") and r[2] > 0]
     total = sum(share for _, _, share in rows) or 1.0
     heights: list[int] = []
     used = 0
@@ -542,9 +545,12 @@ def frame_band_shown(seg: dict) -> bool:
     return is_frame(layout) and any(a["kind"] == "band" for a in frame_areas(layout, 1080, 1920))
 
 
-def caption_band_zones(segments: list[dict], out_h: int) -> list[tuple[int, int, int]]:
+def caption_band_zones(segments: list[dict], out_h: int, strips: bool = True) -> list[tuple[int, int, int]]:
     """
     Where captions move into a frame's text band: (start ms, end ms, centre y px), in clip time.
+    strips False: captions the user has moved stay where they were put in a frame with a caption
+    strip too (user, 2026-11-06: moving them works in every frame); captions put in a text band
+    still sit there. Mirrors captionBandAt() in the editor.
     """
     zones: list[tuple[int, int, int]] = []
     for seg in segments:
@@ -565,7 +571,7 @@ def caption_band_zones(segments: list[dict], out_h: int) -> list[tuple[int, int,
                     a = s0 + int(round(it["rel_s"] * 1000))
                     zones.append((a, a + int(round(it["dur_s"] * 1000)), centre))
         # A frame with a caption strip: the captions sit there for the whole frame
-        if strip is not None:
+        if strip is not None and strips:
             zones.append((s0, int(seg["end_ms"]), strip))
     return zones
 
@@ -622,7 +628,8 @@ def frame_audio_plan(seg: dict, secondary_videos: dict[str, str]) -> list[tuple[
     lanes = sorted({it.get("lane") for it in state.get("items") or [] if isinstance(it.get("lane"), int)})
     for lane in lanes:
         for it in lane_items(seg, state, lane):
-            if it.get("kind") != "video" or it.get("muted"):
+            # (a frozen piece is a still picture: no sound)
+            if it.get("kind") != "video" or it.get("muted") or it.get("freeze"):
                 continue
             v = float(it.get("volume") if it.get("volume") is not None else 1.0)
             vid = it.get("source_video_id")

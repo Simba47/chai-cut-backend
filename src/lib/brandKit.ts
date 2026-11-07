@@ -8,7 +8,7 @@ import { cleanBrandWords, type BrandWords } from './brandWords.js'
  * one. What it puts on each clip mirrors what the frontend puts on a clip made by hand
  * (services/brandKits.ts brandNewClips): its logo where and when the kit says, its caption style
  * when its captions are on, and here also its title style on the hook. Keep the two in step.
- * The rest of a kit (its progress bar, end card, intro and outro: brand kit Phase 4) the clip gets from the frontend's brand
+ * The rest of a kit (its end card, intro and outro: brand kit Phase 4) the clip gets from the frontend's brand
  * engine the first time it catches up with its kit — when it's opened in the editor or exported —
  * because the version saved with the clip (`applied`) has it off (appliedHere).
  */
@@ -32,9 +32,6 @@ export interface ClipBrand {
   /** Its words (brand kit Phase 5, lib/brandWords.ts): its spellings and tone in the post text the job writes */
   words: BrandWords
 }
-
-/** A clip's progress bar (clips.progress_bar): its colour, thickness in px on a 1080 × 1920 frame, and edge */
-export interface ProgressBar { color: string; height: number; position: 'top' | 'bottom' }
 
 const HEX = /^#[0-9a-f]{6}$/i
 /** The plans whose kits can be shared with a team (the frontend's lib/shared/brandTeam.ts TEAM_SEATS): a kit shared by someone on another plan waits */
@@ -90,13 +87,6 @@ export function clipBrand(raw: unknown, userId: string): ClipBrand {
   }
 }
 
-/** A saved progress bar (clips.progress_bar, or a kit's) made safe; null when it is not one */
-export function cleanProgressBar(raw: unknown): ProgressBar | null {
-  if (!raw || typeof raw !== 'object') return null
-  const p = raw as Record<string, unknown>
-  return { color: color(p.color, '#ffffff'), height: Math.round(num(p.height, 4, 40, 12)), position: p.position === 'top' ? 'top' : 'bottom' }
-}
-
 /**
  * The kit a job's clips get: 'none' → none; a kit's id → that kit (the user's own, or one shared with
  * them: brand_kit_shares); else the user's default kit, if any. A shared kit's logo is its owner's.
@@ -141,16 +131,15 @@ export async function clipBrandWords(clipId: string): Promise<BrandWords | null>
 }
 
 /**
- * A kit's settings as this job puts them on: what it doesn't put on (the kit's progress bar, end card, intro and outro) off.
+ * A kit's settings as this job puts them on: what it doesn't put on (the kit's end card, intro and outro) off.
  * Saved with the clip as the version it got, so the frontend's brand engine adds the rest later as it
- * would a kit's newly switched-on progress bar.
+ * would a kit's newly switched-on end card.
  */
 export function appliedHere(data: unknown): unknown {
   if (!data || typeof data !== 'object') return data
   const d = data as Record<string, unknown>
-  const bar = d.progress_bar && typeof d.progress_bar === 'object' ? d.progress_bar as Record<string, unknown> : null
   const ends = d.ends && typeof d.ends === 'object' ? d.ends as Record<string, unknown> : null
-  return { ...d, ...(bar ? { progress_bar: { ...bar, on: false } } : {}), ...(ends ? { ends: { ...ends, card: false, intro: null, outro: null } } : {}) }
+  return { ...d, ...(ends ? { ends: { ...ends, card: false, intro: null, outro: null } } : {}) }
 }
 
 /** When the logo shows on a clip `lengthMs` long: [start, end] ms (the frontend's logoSpan) */
