@@ -27,7 +27,7 @@ from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_spe
 import emoji as emoji_art   # colour emoji (Twemoji 17), drawn locally
 import creator_captions     # the Creator caption styles (a template's `look`)
 import text_style           # a text's Text-tool look, drawn as the preview draws it
-from frames import is_frame, row_heights, row_order, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base, BLUR_SOURCE_SLOT, shown_main_slots, frame_background, bg_filter
+from frames import is_frame, row_heights, row_order, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base, BLUR_SOURCE_SLOT, shown_main_slots, frame_background, bg_filter, item_held_runs
 from picture_check import main_picture_probes, missing_main_picture, at
 
 # ── Quality presets (identical to previous version) ───────────────────────────
@@ -2151,6 +2151,8 @@ def main(
         frame_item_dims: dict[tuple[int, str], tuple[int, int] | None] = {}
         # Frozen video items: how long their one picture is held (s)
         frame_item_frozen: dict[tuple[int, str], float] = {}
+        # Video items with freeze stretches inside: their own frame rate (the held picture fills the stretch at it)
+        frame_item_fps: dict[tuple[int, str], float] = {}
         for si, seg in enumerate(segments):
             if not is_frame(seg.get("layout")):
                 continue
@@ -2181,6 +2183,8 @@ def main(
                         # alongside other inputs can overflow ffmpeg's default demuxer->filter queue
                         # ("Failed to inject frame into filter network: Resource temporarily unavailable")
                         inputs += ["-thread_queue_size", "1024", "-stream_loop", "-1", "-ss", f"{off:.3f}", "-i", path]
+                        if it.get("holds"):
+                            frame_item_fps[(si, it["id"])] = _probe_fps(path)
                     elif it.get("kind") == "photo" and os.path.exists(frame_images.get(it.get("image_path") or "", "")):
                         path = frame_images[it["image_path"]]
                         inputs += ["-thread_queue_size", "1024", "-loop", "1", "-framerate", "30", "-t", f"{it['dur_s']:.3f}", "-i", path]
@@ -2486,6 +2490,23 @@ def main(
                             # Frozen and dimmed: its picture at 55% brightness (black at 45% over it — in
                             # YUV the same as the editor's canvas brightness(0.55))
                             dim = "format=yuv420p,drawbox=x=0:y=0:w=iw:h=ih:color=black@0.45:t=fill," if it.get("freeze") and it.get("dim") else ""
+                            # Its freeze stretches (user, 2026-11-09: it stays one piece; the editor's
+                            # itemSourceAt): the frames after each held picture pushed later by the
+                            # stretch's length, fps filling the gap with that picture — dimmed there with Dim
+                            a_ms = int(seg["start_ms"]) + round(rel * 1000)
+                            held = item_held_runs(it, a_ms, a_ms + round(d * 1000)) if (si, it["id"]) in frame_item_fps else []
+                            if held:
+                                ifps = frame_item_fps[(si, it["id"])]
+                                shift, played = [], 0.0
+                                for ha, hb in held:
+                                    # (where the video is when it stops: its playing time before this stretch)
+                                    played = (ha - a_ms) / 1000.0 - sum(n for _, n in shift)
+                                    shift.append((played + 0.5 / ifps, (hb - ha) / 1000.0))
+                                expr = "+".join(f"gte(T,{x:.4f})*{n:.4f}" for x, n in shift)
+                                dim += f"setpts='PTS+({expr})/TB',fps={ifps:.3f}:start_time=0,"
+                                if it.get("dim"):
+                                    on = "+".join(f"gte(t,{(ha - a_ms) / 1000.0:.4f})*lt(t,{(hb - a_ms) / 1000.0:.4f})" for ha, hb in held)
+                                    dim += f"format=yuv420p,drawbox=x=0:y=0:w=iw:h=ih:color=black@0.45:t=fill:enable='{on}',"
                             if contain:
                                 chain = shown_whole(f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{dim}", frame_item_dims.get((si, it["id"])), iw, ih, rr, f"{key}i{ii}")
                                 if boxed:

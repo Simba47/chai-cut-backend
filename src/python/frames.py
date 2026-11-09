@@ -520,6 +520,60 @@ def frame_state(seg: dict) -> dict:
             "main_muted": main_muted, "items": items}
 
 
+def item_holds(it: dict) -> list[tuple[int, int]]:
+    """
+    A video item's freeze stretches (FrameItem.holds; user, 2026-11-09: the media stays one piece):
+    (at ms from its start, length ms), in order, inside it, not overlapping. None while the whole
+    item is frozen.
+    """
+    if it.get("kind") != "video" or it.get("freeze"):
+        return []
+    length = int(it.get("end_ms") or 0) - int(it.get("start_ms") or 0)
+    holds: list[tuple[int, int]] = []
+    for h in it.get("holds") or []:
+        try:
+            holds.append((round(float(h["at_ms"])), round(float(h["len_ms"]))))
+        except (TypeError, ValueError, KeyError):
+            continue
+    out: list[tuple[int, int]] = []
+    for at, n in sorted(holds):
+        a = max(0, at, out[-1][0] + out[-1][1] if out else 0)
+        b = min(length, at + n)
+        if b - a >= 1:
+            out.append((a, b - a))
+    return out
+
+
+def item_source_at(it: dict, t: int) -> tuple[int, bool]:
+    """Where in its video (ms) a video item is at clip time t, and whether it's held still then (editor: itemSourceAt)."""
+    off = int(it.get("source_offset_ms") or 0)
+    if it.get("freeze"):
+        return off, True
+    rel = max(0, t - int(it.get("start_ms") or 0))
+    before, held = 0, False
+    for at, n in item_holds(it):
+        before += max(0, min(rel - at, n))
+        held = held or at <= rel < at + n
+    return off + rel - before, held
+
+
+def item_held_runs(it: dict, a: int, b: int) -> list[tuple[int, int]]:
+    """A video item's freeze stretches inside clip time [a, b): (from, to) clip ms."""
+    s = int(it.get("start_ms") or 0)
+    return [(max(a, s + at), min(b, s + at + n)) for at, n in item_holds(it) if min(b, s + at + n) > max(a, s + at)]
+
+
+def item_play_runs(it: dict, a: int, b: int) -> list[tuple[int, int, int]]:
+    """Where a video item plays inside clip time [a, b) (not in a freeze stretch): (from, to, its video's ms at from)."""
+    out: list[tuple[int, int, int]] = []
+    t = a
+    for ha, hb in item_held_runs(it, a, b) + [(b, b)]:
+        if ha > t:
+            out.append((t, ha, item_source_at(it, t)[0]))
+        t = max(t, hb)
+    return out
+
+
 def lane_items(seg: dict, state: dict, lane) -> list[dict]:
     """
     One lane's items in time order, cut to the format's range. Each gets rel_s (seconds from the
@@ -533,7 +587,7 @@ def lane_items(seg: dict, state: dict, lane) -> list[dict]:
         a, b = max(int(it.get("start_ms") or 0), s0), min(int(it.get("end_ms") or 0), s1)
         if b - a < 50:
             continue
-        off = int(it.get("source_offset_ms") or 0) + (a - int(it.get("start_ms") or 0))
+        off = item_source_at(it, a)[0] if it.get("kind") == "video" else int(it.get("source_offset_ms") or 0) + (a - int(it.get("start_ms") or 0))
         out.append({**it, "rel_s": (a - s0) / 1000.0, "dur_s": (b - a) / 1000.0, "off_ms": max(0, off)})
     out.sort(key=lambda x: x["rel_s"])
     return out
@@ -628,12 +682,15 @@ def frame_audio_plan(seg: dict, secondary_videos: dict[str, str]) -> list[tuple[
     lanes = sorted({it.get("lane") for it in state.get("items") or [] if isinstance(it.get("lane"), int)})
     for lane in lanes:
         for it in lane_items(seg, state, lane):
-            # (a frozen piece is a still picture: no sound)
+            # (a frozen piece is a still picture: no sound; nor are its freeze stretches)
             if it.get("kind") != "video" or it.get("muted") or it.get("freeze"):
                 continue
             v = float(it.get("volume") if it.get("volume") is not None else 1.0)
             vid = it.get("source_video_id")
             if v <= 0 or vid not in secondary_videos:
                 continue
-            out.append((vid, it["off_ms"] / 1000.0, v, it["rel_s"], it["dur_s"]))
+            a = int(seg["start_ms"]) + round(it["rel_s"] * 1000)
+            b = a + round(it["dur_s"] * 1000)
+            for ra, rb, src in item_play_runs(it, a, b):
+                out.append((vid, src / 1000.0, v, (ra - int(seg["start_ms"])) / 1000.0, (rb - ra) / 1000.0))
     return out
