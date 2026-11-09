@@ -16,6 +16,7 @@ import { sttRank, sttTurn, waitForStt, wavSeconds, type SttSide } from '../lib/g
 import { runawayReason, trimRunaway } from '../lib/transcriptGuard.js'
 import { skippedGaps, rereadWindows, wordsInGaps, REREAD_MIN_SOUND_SEC, REREAD_ROUNDS, REREAD_ROUND_MIN_WORDS } from '../lib/skippedSpeech.js'
 import { convertWordForWord } from '../lib/wordConvert.js'
+import { filenameFromDisposition, titleFromFilename } from '../lib/fileName.js'
 import db from '../db.js'
 import type { Job, TranscribeJobPayload } from '../types.js'
 import { audioKeyFor, queueProxy } from './proxy.js'
@@ -436,13 +437,6 @@ function directDownloadUrl(shareUrl: string, source: 'gdrive' | 'dropbox'): stri
   return `https://drive.usercontent.google.com/download?id=${encodeURIComponent(id)}&export=download&confirm=t`
 }
 
-function filenameFromDisposition(header: string | null): string | null {
-  if (!header) return null
-  const star = header.match(/filename\*\s*=\s*(?:UTF-8'')?([^;]+)/i)?.[1]
-  if (star) { try { return decodeURIComponent(star.trim().replace(/^"|"$/g, '')) } catch { /* fall through */ } }
-  return header.match(/filename\s*=\s*"?([^";]+)"?/i)?.[1]?.trim() ?? null
-}
-
 async function downloadDirectLink(
   videoId: string, source: 'gdrive' | 'dropbox', tmp: string, maxBytes: number | undefined, signal?: AbortSignal,
 ): Promise<{ localPath: string; storagePath: string }> {
@@ -517,7 +511,7 @@ async function downloadDirectLink(
   const storagePath = `raw/${video.user_id}/${videoId}${ext}`
   await r2UploadFile(storagePath, localPath, VIDEO_TYPE_BY_EXT[ext])
   // The file's own name becomes the video's title (unless the user already named it)
-  const title = filename?.replace(/\.[^.]+$/, '').trim().slice(0, 120)
+  const title = titleFromFilename(filename)
   if (title) await db`UPDATE videos SET title = COALESCE(title, ${title}) WHERE id = ${videoId}`
   await setProgress(videoId, 58)
   return { localPath, storagePath }
