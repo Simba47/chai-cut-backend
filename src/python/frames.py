@@ -483,6 +483,29 @@ def photo_motion_filter(motion: str | None, w: int, h: int, dur_s: float) -> str
     return f"zoompan=z='{z}':x='{x}':y='ih/2-(ih/zoom/2)':d=1:s={w}x{h}:fps=30"
 
 
+def _items_frozen(seg: dict, f: dict) -> list[dict]:
+    """A frame's items with its freezes (frame.freeze: every video waits) among each video's own stretches (editor: withFrameFreeze)."""
+    items = f.get("items") or []
+    fz = f.get("freeze")
+    if not isinstance(fz, dict) or not fz.get("holds"):
+        return items
+    out = []
+    for it in items:
+        if it.get("kind") != "video" or it.get("freeze"):
+            out.append(it)
+            continue
+        off = int(seg.get("start_ms") or 0) - int(it.get("start_ms") or 0)
+        mine = []
+        for h in fz["holds"]:
+            try:
+                at = round(float(h["at_ms"])) + off
+                mine.append({"at_ms": max(0, at), "len_ms": at + round(float(h["len_ms"])) - max(0, at)})
+            except (TypeError, ValueError, KeyError):
+                continue
+        out.append({**it, "holds": [*(it.get("holds") or []), *mine], "dim": it.get("dim") or fz.get("dim")})
+    return out
+
+
 def frame_state(seg: dict) -> dict:
     """
     A frame's settings with lane items. Frames saved before lanes existed kept one photo or other
@@ -491,7 +514,7 @@ def frame_state(seg: dict) -> dict:
     """
     f = seg.get("frame") or {}
     if f.get("items") is not None:
-        return {**f, "main_slots": f.get("main_slots") if f.get("main_slots") is not None else [0]}
+        return {**f, "items": _items_frozen(seg, f), "main_slots": f.get("main_slots") if f.get("main_slots") is not None else [0]}
     s0, s1 = int(seg.get("start_ms") or 0), int(seg.get("end_ms") or 0)
     items: list[dict] = []
     main: list[int] = []
@@ -660,9 +683,9 @@ def main_audio_volume(state: dict) -> float:
     return total
 
 
-def main_freeze_item(seg: dict, state: dict, slot: int, off_ms: int) -> dict | None:
-    """The main video in a slot as a video item, when it's frozen for stretches there (frame.main_freeze; editor: mainFreezeItem)."""
-    f = (state.get("main_freeze") or {}).get(str(slot))
+def main_freeze_item(seg: dict, state: dict, off_ms: int) -> dict | None:
+    """The main video of a frame with freezes (frame.freeze) as a video item, so it holds as one would."""
+    f = state.get("freeze")
     if not isinstance(f, dict) or not f.get("holds"):
         return None
     return {"kind": "video", "start_ms": int(seg["start_ms"]), "end_ms": int(seg["end_ms"]), "source_offset_ms": off_ms, "holds": f["holds"], "dim": f.get("dim")}
@@ -678,25 +701,22 @@ def frame_audio_plan(seg: dict, secondary_videos: dict[str, str]) -> list[tuple[
     dur_s = (int(seg["end_ms"]) - int(seg["start_ms"])) / 1000.0
     out: list[tuple[str | None, float, float, float, float]] = []
     # Every slot showing the main video adds its own sound (the same audio, so volumes add up)
-    frozen = [s for s in state.get("main_slots") or [] if main_freeze_item(seg, state, int(s), 0)]
-    vol = main_audio_volume({**state, "main_slots": [s for s in state.get("main_slots") or [] if s not in frozen]}) if frozen else main_audio_volume(state)
-    if vol > 0 or frozen:
+    vol = main_audio_volume(state)
+    if vol > 0:
         if seg.get("video_offset_ms") is not None:
             off_ms = int(seg["video_offset_ms"])
         else:
             boxes = sorted(seg.get("crop_boxes") or [], key=lambda b: b.get("slot_index", 0))
             main_box = next((b for b in boxes if not b.get("source_video_id") and not b.get("image_path")), None)
             off_ms = int(main_box["source_offset_ms"]) if main_box and main_box.get("source_offset_ms") is not None else int(seg["start_ms"])
-        if vol > 0:
+        # With freezes: silent while it's still, then on from the same moment
+        frozen = main_freeze_item(seg, state, off_ms)
+        if frozen:
+            s0 = int(seg["start_ms"])
+            for ra, rb, src in item_play_runs(frozen, s0, int(seg["end_ms"])):
+                out.append((None, src / 1000.0, vol, (ra - s0) / 1000.0, (rb - ra) / 1000.0))
+        else:
             out.append((None, off_ms / 1000.0, vol, 0.0, dur_s))
-        # A slot frozen for stretches: silent while it's still, then on from the same moment
-        s0 = int(seg["start_ms"])
-        for slot in frozen:
-            v, muted = main_slot_sound(state, int(slot))
-            if muted or v <= 0:
-                continue
-            for ra, rb, src in item_play_runs(main_freeze_item(seg, state, int(slot), off_ms), s0, int(seg["end_ms"])):
-                out.append((None, src / 1000.0, v, (ra - s0) / 1000.0, (rb - ra) / 1000.0))
     lanes = sorted({it.get("lane") for it in state.get("items") or [] if isinstance(it.get("lane"), int)})
     for lane in lanes:
         for it in lane_items(seg, state, lane):

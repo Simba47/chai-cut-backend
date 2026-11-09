@@ -2426,8 +2426,8 @@ def main(
                         if off_ms is None:
                             off_ms = box.get("source_offset_ms") if box and box.get("source_offset_ms") is not None else smss
                         ts = int(off_ms) / 1000.0
-                        # Frozen for stretches in this slot (frame.main_freeze), as a video put there would be
-                        mf = main_freeze_item(seg, st, slot, int(off_ms))
+                        # The frame's freezes (frame.freeze): it waits, as a video put there would
+                        mf = main_freeze_item(seg, st, int(off_ms))
                         mheld = item_held_runs(mf, int(seg["start_ms"]), int(seg["end_ms"])) if mf else []
                         mhold = f"{_hold_filters(mheld, int(seg['start_ms']), _probe_fps(video_path), mf.get('dim'))}trim=duration={dur_s:.3f}," if mheld else ""
                         iw, ih, px, py, rr, boxed = media_box((st.get("main_corners") or {}).get(str(slot)),
