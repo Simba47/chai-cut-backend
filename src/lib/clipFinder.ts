@@ -451,13 +451,16 @@ export async function findClips(opts: {
   spread?: boolean
   /** Check each picked clip's start and end with the model (refineEdges; default on) */
   refine?: boolean
+  /** How far it is: 'read' as each window's answer comes in, then 'edges' as each clip's edges are checked */
+  onProgress?: (step: 'read' | 'edges', done: number, total: number) => void
 }): Promise<FoundClip[]> {
   const log = opts.log ?? (() => {})
   const lines = buildLines(opts.words)
   const windows = makeWindows(lines)
   if (windows.length === 0) return []
 
-  let failures = 0
+  let failures = 0, read = 0
+  opts.onProgress?.('read', 0, windows.length)
   const perWindow = await mapLimit(windows, MAX_PARALLEL, async (window, i) => {
     try {
       const { system, user } = buildPrompt(opts.mode, window, opts.durationMs, opts.perWindow, opts.exclude)
@@ -466,6 +469,8 @@ export async function findClips(opts: {
       failures++
       log(`window ${i + 1}/${windows.length} failed: ${e instanceof Error ? e.message : String(e)}`)
       return []
+    } finally {
+      opts.onProgress?.('read', ++read, windows.length)
     }
   })
   if (failures === windows.length) throw new Error(`All ${windows.length} clip-finder windows failed`)
@@ -487,9 +492,12 @@ export async function findClips(opts: {
     : opts.spread ? pickSpread(merged, limit, windows.length) : merged.slice(0, limit)
   const picked = search ? primary : [...primary, ...merged.filter(c => !primary.includes(c)).slice(0, 2)]
   const toCheck = opts.refine === false ? [] : picked.slice(0, search ? REFINE_MAX : picked.length)
+  let edged = 0
+  if (toCheck.length) opts.onProgress?.('edges', 0, toCheck.length)
   const checked = await mapLimit(toCheck, MAX_PARALLEL, async c => {
     const r = await refineEdges(c, lines, opts.words, opts.ask)
     if (r.why !== null) log(`edges ${mmss(c.start_ms)}–${mmss(c.end_ms)} → ${mmss(r.clip.start_ms)}–${mmss(r.clip.end_ms)}: ${r.why}`)
+    opts.onProgress?.('edges', ++edged, toCheck.length)
     return r.clip
   })
   const all = [...checked, ...picked.slice(toCheck.length)]

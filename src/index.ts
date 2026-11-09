@@ -186,6 +186,8 @@ async function runMigrations() {
   // (written into the statement: a constraint takes no parameters; the kinds are fixed names)
   await db.unsafe(`ALTER TABLE transitions ADD CONSTRAINT transitions_type_check CHECK (type IN (${TRANSITION_KINDS.map(k => `'${k}'`).join(', ')}))`)
   await db`ALTER TABLE ai_edit_jobs ADD COLUMN IF NOT EXISTS found JSONB`
+  // What a Make my clips run is doing, for its progress bar: { text, to } (jobs/ai_edit.ts setProgress)
+  await db`ALTER TABLE ai_edit_jobs ADD COLUMN IF NOT EXISTS stage JSONB`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_score INTEGER`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_reason TEXT`
   // Animated caption presets (render.py _preset_events, editor drawPresetCaptions)
