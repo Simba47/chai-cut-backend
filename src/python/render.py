@@ -27,7 +27,7 @@ from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_spe
 import emoji as emoji_art   # colour emoji (Twemoji 17), drawn locally
 import creator_captions     # the Creator caption styles (a template's `look`)
 import text_style           # a text's Text-tool look, drawn as the preview draws it
-from frames import is_frame, row_heights, row_order, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base, BLUR_SOURCE_SLOT, shown_main_slots, frame_background, bg_filter, item_held_runs
+from frames import main_freeze_item, is_frame, row_heights, row_order, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base, BLUR_SOURCE_SLOT, shown_main_slots, frame_background, bg_filter, item_held_runs
 from picture_check import main_picture_probes, missing_main_picture, at
 
 # ── Quality presets (identical to previous version) ───────────────────────────
@@ -1773,6 +1773,30 @@ def _scale_cover(w: int, h: int) -> str:
     )
 
 
+def _dim_filter(enable: str = "") -> str:
+    """A frozen video's Dim: its picture at 55% brightness, colours kept (the editor's canvas brightness(0.55)). Ends with a comma."""
+    return f"format=yuv420p,lutyuv=y='16+(val-16)*0.55':u='128+(val-128)*0.55':v='128+(val-128)*0.55'{enable},"
+
+
+def _hold_filters(held: list[tuple[int, int]], a_ms: int, fps: float, dim) -> str:
+    """
+    Filters holding a video still over `held` (clip ms; it stays one piece): the frames after each held
+    picture pushed later by the stretch's length, fps filling the gap with that picture — darker there
+    with Dim. `a_ms`: the clip time its first frame is at. Ends with a comma.
+    """
+    shift = []
+    for ha, hb in held:
+        # (where the video is when it stops: its playing time before this stretch)
+        played = (ha - a_ms) / 1000.0 - sum(n for _, n in shift)
+        shift.append((played + 0.5 / fps, (hb - ha) / 1000.0))
+    expr = "+".join(f"gte(T,{x:.4f})*{n:.4f}" for x, n in shift)
+    out = f"setpts='PTS+({expr})/TB',fps={fps:.3f}:start_time=0,"
+    if dim:
+        on = "+".join(f"gte(t,{(ha - a_ms) / 1000.0:.4f})*lt(t,{(hb - a_ms) / 1000.0:.4f})" for ha, hb in held)
+        out += _dim_filter(f":enable='{on}'")
+    return out
+
+
 def _scale_cover_at(w: int, h: int, pan) -> str:
     """
     Cover w×h showing the part of the picture picked in the editor (a frame photo or video's `pan`: x / y as
@@ -2402,6 +2426,10 @@ def main(
                         if off_ms is None:
                             off_ms = box.get("source_offset_ms") if box and box.get("source_offset_ms") is not None else smss
                         ts = int(off_ms) / 1000.0
+                        # Frozen for stretches in this slot (frame.main_freeze), as a video put there would be
+                        mf = main_freeze_item(seg, st, slot, int(off_ms))
+                        mheld = item_held_runs(mf, int(seg["start_ms"]), int(seg["end_ms"])) if mf else []
+                        mhold = f"{_hold_filters(mheld, int(seg['start_ms']), _probe_fps(video_path), mf.get('dim'))}trim=duration={dur_s:.3f}," if mheld else ""
                         iw, ih, px, py, rr, boxed = media_box((st.get("main_corners") or {}).get(str(slot)),
                                                               (st.get("main_rects") or {}).get(str(slot)), aw, rh)
                         if contain and not area.get("main_crop"):
@@ -2409,7 +2437,7 @@ def main(
                             canvas(area.get("fill") or "000000", aw, rh, f"[{key}f]")
                             if main_dims is None:
                                 main_dims = _display_size(video_path) or (0, 0)
-                            chain = shown_whole(f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,",
+                            chain = shown_whole(f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,{mhold}",
                                                 main_dims if main_dims[0] else None, iw, ih, rr, f"{key}m")
                             if boxed:
                                 fp.append(f"{chain},pad={aw}:{rh}:{px}:{py}:color=black@0[{key}m]")
@@ -2424,7 +2452,7 @@ def main(
                         else:
                             # Its own view, cropped (a slot that shows other media whole crops the main
                             # video when it's put there: main_crop — Screen + face cam's Screen)
-                            chain = (f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,"
+                            chain = (f"{pop_src(None)}trim=start={ts:.3f}:end={ts + dur_s:.3f},setpts=PTS-STARTPTS,{mhold}"
                                      f"{_crop_filter(box, smss)},{_scale_cover(iw, ih)},setsar=1,format=yuv420p")
                             covered = [(it["rel_s"], it["rel_s"] + it["dur_s"]) for it in lane_items(seg, st, slot)
                                        if not it.get("hidden") and it.get("kind") in ("photo", "video") and (si, it["id"]) in frame_item_in] if contain else []
@@ -2487,26 +2515,15 @@ def main(
                         elif ik == "video" and (si, it["id"]) in frame_item_in:
                             src = frame_item_in[(si, it["id"])]
                             iw, ih, px, py, rr, boxed = media_box(it.get("corners"), it.get("rect"), aw, rh)
-                            # Frozen and dimmed: its picture at 55% brightness (black at 45% over it — in
-                            # YUV the same as the editor's canvas brightness(0.55))
-                            dim = "format=yuv420p,drawbox=x=0:y=0:w=iw:h=ih:color=black@0.45:t=fill," if it.get("freeze") and it.get("dim") else ""
+                            # Frozen and dimmed: its picture at 55% brightness
+                            dim = _dim_filter() if it.get("freeze") and it.get("dim") else ""
                             # Its freeze stretches (user, 2026-11-09: it stays one piece; the editor's
                             # itemSourceAt): the frames after each held picture pushed later by the
                             # stretch's length, fps filling the gap with that picture — dimmed there with Dim
                             a_ms = int(seg["start_ms"]) + round(rel * 1000)
                             held = item_held_runs(it, a_ms, a_ms + round(d * 1000)) if (si, it["id"]) in frame_item_fps else []
                             if held:
-                                ifps = frame_item_fps[(si, it["id"])]
-                                shift, played = [], 0.0
-                                for ha, hb in held:
-                                    # (where the video is when it stops: its playing time before this stretch)
-                                    played = (ha - a_ms) / 1000.0 - sum(n for _, n in shift)
-                                    shift.append((played + 0.5 / ifps, (hb - ha) / 1000.0))
-                                expr = "+".join(f"gte(T,{x:.4f})*{n:.4f}" for x, n in shift)
-                                dim += f"setpts='PTS+({expr})/TB',fps={ifps:.3f}:start_time=0,"
-                                if it.get("dim"):
-                                    on = "+".join(f"gte(t,{(ha - a_ms) / 1000.0:.4f})*lt(t,{(hb - a_ms) / 1000.0:.4f})" for ha, hb in held)
-                                    dim += f"format=yuv420p,drawbox=x=0:y=0:w=iw:h=ih:color=black@0.45:t=fill:enable='{on}',"
+                                dim += _hold_filters(held, a_ms, frame_item_fps[(si, it["id"])], it.get("dim"))
                             if contain:
                                 chain = shown_whole(f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{dim}", frame_item_dims.get((si, it["id"])), iw, ih, rr, f"{key}i{ii}")
                                 if boxed:
