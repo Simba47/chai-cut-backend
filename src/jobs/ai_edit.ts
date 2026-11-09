@@ -2133,6 +2133,38 @@ async function saveClip(
         VALUES (${clipId}, ${caption.font}, 52, '#FFFFFF', 'bottom-center', 'karaoke', ${caption.language})
       `
     }
+
+    // The clip as the AI made it, kept for the editor's "Reset everything" (user, 2026-11-09: it wiped the
+    // AI's work too; only the manual changes should go). The same rows the editor loads. In a savepoint:
+    // a copy that can't be kept never costs the clip (Reset then warns and goes back to a plain clip)
+    await tx.savepoint(async sp => {
+      const [row] = await sp`SELECT start_ms, end_ms, trim_ranges, brand FROM clips WHERE id = ${clipId}`
+      const [segs, styles, texts, pictures] = await Promise.all([
+        sp`
+          SELECT s.*, COALESCE(
+            json_agg(
+              jsonb_build_object(
+                'id', cb.id, 'segment_id', cb.segment_id, 'slot_index', cb.slot_index,
+                'source_video_id', cb.source_video_id, 'source_offset_ms', cb.source_offset_ms,
+                'image_path', cb.image_path, 'image_motion', cb.image_motion,
+                'volume', cb.volume, 'muted', cb.muted, 'hidden', (to_jsonb(cb)->>'hidden')::boolean,
+                'box_keyframes', COALESCE((SELECT json_agg(bk.* ORDER BY bk.t_ms) FROM box_keyframes bk WHERE bk.box_id = cb.id), '[]')
+              ) ORDER BY cb.slot_index
+            ) FILTER (WHERE cb.id IS NOT NULL),
+            '[]'
+          ) AS crop_boxes
+          FROM segments s LEFT JOIN crop_boxes cb ON cb.segment_id = s.id
+          WHERE s.clip_id = ${clipId} GROUP BY s.id ORDER BY s.sort_order`,
+        sp`SELECT * FROM caption_styles WHERE clip_id = ${clipId}`,
+        sp`SELECT * FROM text_overlays WHERE clip_id = ${clipId}`,
+        sp`SELECT * FROM overlays WHERE clip_id = ${clipId} ORDER BY z_index`,
+      ])
+      const made = {
+        start_ms: row.start_ms, end_ms: row.end_ms, trim_ranges: row.trim_ranges ?? null, brand: row.brand ?? null,
+        segments: [...segs], caption_style: styles[0] ?? null, text_overlays: [...texts], overlays: [...pictures],
+      }
+      await sp`INSERT INTO clip_ai_made (clip_id, made) VALUES (${clipId}, ${sp.json(made as never)})`
+    }).catch(e => console.warn('[ai_edit] the AI version for Reset was not kept:', e instanceof Error ? e.message : e))
     return clipId
   })
 }
