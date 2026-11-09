@@ -1775,7 +1775,7 @@ def _scale_cover(w: int, h: int) -> str:
 
 def _scale_cover_at(w: int, h: int, pan) -> str:
     """
-    Cover w×h showing the part of the picture picked in the editor (a frame photo's `pan`: x / y as
+    Cover w×h showing the part of the picture picked in the editor (a frame photo or video's `pan`: x / y as
     shares of the room to spare each way, zoom ≥ 1). Matches the editor's coverSource with a pan.
     Absent: the middle, as _scale_cover.
     """
@@ -2512,7 +2512,7 @@ def main(
                                 if boxed:
                                     chain = f"{chain},pad={aw}:{rh}:{px}:{py}:color=black@0"
                             else:
-                                chain = f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{dim}{_scale_cover(iw, ih)},setsar=1,format=yuv420p"
+                                chain = f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{dim}{_scale_cover_at(iw, ih, it.get('pan'))},setsar=1,format=yuv420p"
                                 chain = placed(chain, aw, rh, iw, ih, px, py, rr, boxed, f"{key}i{ii}c")
                         else:
                             print(f"[render] frame item skipped (media missing): {ik} {it.get('id')}", flush=True)
