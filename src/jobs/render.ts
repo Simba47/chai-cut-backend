@@ -622,20 +622,25 @@ export function piecesOfRows(rows: Row[], mainVideoId: string): Piece[] {
     if (s0 > cursor + 1) { out.push({ at: cursor, ms: s0 - cursor, from: videoNow }); videoNow += s0 - cursor }
     const at = Math.max(cursor, s0), ms = e0 - at
     if (ms <= 0) continue
-    const freezes = String(s.layout).startsWith('frame_') ? ((s.frame?.freeze?.holds ?? []) as Row[]) : []
+    const freezes = (s.frame?.freeze?.holds ?? []) as Row[]
     if (isInsertRow(s, mainVideoId)) out.push({ at, ms, hold: Number(s.video_offset_ms) })
     else if (freezes.length) {
-      // A frame with freezes (the editor's piecesOf): the main video stops for each and carries on
+      // A part with freezes (the editor's piecesOf): the main video stops for its own and carries on;
+      // another layer's add time the main video holds its last picture for
+      const isMain = (h: Row) => !h.on || String(h.on).startsWith('main:')
+      const added = freezes.filter(h => !isMain(h)).reduce((sum, h) => sum + Number(h.len_ms), 0)
+      const playEnd = Math.max(at, e0 - added)
       const main = ((s.crop_boxes ?? []) as Row[]).find(b => !b.source_video_id && !b.image_path)
       let t = at, v = main && main.source_offset_ms != null ? Number(main.source_offset_ms) : videoNow
-      for (const h of freezes) {
-        const a = Math.max(t, s0 + Number(h.at_ms)), b = Math.min(e0, s0 + Number(h.at_ms) + Number(h.len_ms))
+      for (const h of freezes.filter(isMain).sort((x, y) => Number(x.at_ms) - Number(y.at_ms))) {
+        const a = Math.max(t, s0 + Number(h.at_ms)), b = Math.min(playEnd, s0 + Number(h.at_ms) + Number(h.len_ms))
         if (b <= a) continue
         if (a > t) { out.push({ at: t, ms: a - t, from: v }); v += a - t }
         out.push({ at: a, ms: b - a, hold: v })
         t = b
       }
-      if (e0 > t) { out.push({ at: t, ms: e0 - t, from: v }); v += e0 - t }
+      if (playEnd > t) { out.push({ at: t, ms: playEnd - t, from: v }); v += playEnd - t }
+      if (e0 > playEnd) out.push({ at: playEnd, ms: e0 - playEnd, hold: v })
       videoNow = v
     } else {
       const main = String(s.layout).startsWith('frame_') || !addedVideo(s, mainVideoId)

@@ -66,6 +66,32 @@ test('a kit saved before these settings existed still works (defaults fill the r
   assert.ok(b.logo && b.logo.x < 0.1 && b.logo.y > 0.7 && b.logo.y + b.logo.h <= 0.87 + 1e-3, 'bottom left, above the apps caption')
 })
 
+test('the logo moves to the clearest corner, the kit’s own first (the frontend’s pickLogoCorner)', async () => {
+  const { placedLogo, logoAvoid } = await import('./brandKit.js')
+  const logo = clipBrand(kit(), U).logo!
+  const box = (l: typeof logo) => ({ x: l.x, y: l.y })
+  assert.deepEqual(box(placedLogo(logo, [])), { x: 0.76, y: 0.08 }, 'nothing to keep off: its own corner')
+  // a face right under it, top right: the next clear corner is top left
+  const moved = placedLogo(logo, [{ x: 0.7, y: 0.05, w: 0.3, h: 0.2 }])
+  assert.deepEqual(box(moved), { x: 0.04, y: 0.08 })
+  assert.equal(moved.w, 0.2); assert.equal(moved.h, 0.0563)
+  // switched off in the kit, or placed by hand: it stays
+  const off = clipBrand(kit({ logo: { ...kit().logo, smart: false } }), U).logo!
+  assert.deepEqual(box(placedLogo(off, [{ x: 0.7, y: 0.05, w: 0.3, h: 0.2 }])), { x: 0.76, y: 0.08 })
+  const hand = clipBrand(kit({ logo: { ...kit().logo, x: 0.7, y: 0.1 } }), U).logo!
+  assert.deepEqual(box(placedLogo(hand, [{ x: 0.7, y: 0.05, w: 0.3, h: 0.2 }])), { x: 0.7, y: 0.1 })
+  // the captions' band: a logo at the bottom goes to the top
+  const low = clipBrand(kit({ logo: { ...kit().logo, corner: 'bl' } }), U).logo!
+  assert.ok(placedLogo(low, logoAvoid([], [], true)).y < 0.5)
+
+  // faces seen through a full-frame part's view, in the frame's own shares; a split's aren't counted
+  const seg = { start_ms: 0, end_ms: 2000, layout: 'vertical', slotKfs: [[{ t_ms: 0, x: 0.25, y: 0, w: 0.5, h: 1 }]] }
+  const frames = [{ t_ms: 0, faces: [{ x: 0.5, y: 0.1, w: 0.2, h: 0.2 }] }, { t_ms: 1000, faces: [{ x: 0.5, y: 0.1, w: 0.2, h: 0.2 }] }]
+  assert.deepEqual(logoAvoid([seg], frames, false).map(b => [b.x, b.y, b.w, b.h]), [[0.5, 0.1, 0.4, 0.2], [0.5, 0.1, 0.4, 0.2]])
+  assert.deepEqual(logoAvoid([{ ...seg, layout: 'split' }], frames, false), [])
+  assert.equal(logoAvoid([seg], frames, true).length, 3, 'and the captions')
+})
+
 test("a kit's progress bar and voice aren't used", () => {
   const b = clipBrand({ progress: { on: true, color: '#FF3366' }, progress_bar: { on: true }, voice: { tone: 'fun' } }, U) as Record<string, unknown>
   assert.equal(b.progress, undefined); assert.equal(b.progress_bar, undefined); assert.equal(b.voice, undefined)

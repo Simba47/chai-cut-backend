@@ -12,7 +12,7 @@ import { askGemini } from '../lib/gemini.js'
 import { findLoops } from '../lib/transcriptGuard.js'
 import { generateClipText, fontForText, type ClipText, type ClipTextLanguage } from '../lib/clipText.js'
 import { fitInRoom, minWidthFor, sideBySideRooms, steadyRoom } from '../lib/framingRoom.js'
-import { loadClipBrand, logoSpan, brandCaptionRow, type ClipBrand } from '../lib/brandKit.js'
+import { loadClipBrand, logoSpan, brandCaptionRow, placedLogo, logoAvoid, type ClipBrand } from '../lib/brandKit.js'
 import { brandCaptionWords, brandClipText, brandVoice } from '../lib/brandWords.js'
 import { brollEnabled, pickBrollMoments, searchCandidates, chooseBroll, brollWindow, downloadStock, withBroll, type BrollShot } from '../lib/broll.js'
 import { findVisuals, describeVisuals, pickVisualMoments, detectPanels, refinePanels, type Visual, type VisualMoment, type Panel } from '../lib/visuals.js'
@@ -1905,7 +1905,10 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
           .catch(e => { console.warn('[ai_edit] pauses not found:', e instanceof Error ? e.message : e); return [] })
 
         framed(hi, 0.95, 1, 'saving it')
-        const clip_id = await saveClip(video_id, ai_edit_job_id, highlight, segments, withCaptions ? caption : null, texts[hi], withTitle, brand, pauses)
+        // The kit's logo off this clip's captions and faces (its "Move off faces and captions")
+        const faces = analysis.info.frames.map(f => ({ t_ms: f.frame_index * FRAME_INTERVAL_MS, faces: f.faces.filter(x => (x.score ?? 0) > 0) }))
+        const clipKit = brand?.logo ? { ...brand, logo: placedLogo(brand.logo, logoAvoid(segments, faces, withCaptions)) } : brand
+        const clip_id = await saveClip(video_id, ai_edit_job_id, highlight, segments, withCaptions ? caption : null, texts[hi], withTitle, clipKit, pauses)
 
         const layoutSummary = segments.map(s =>
           `${s.layout}(${s.start_ms / 1000}s–${s.end_ms / 1000}s,${s.slotKfs[0]?.length ?? 0}kf)`

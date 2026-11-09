@@ -484,24 +484,32 @@ def photo_motion_filter(motion: str | None, w: int, h: int, dur_s: float) -> str
 
 
 def _items_frozen(seg: dict, f: dict) -> list[dict]:
-    """A frame's items with its freezes (frame.freeze: every video waits) among each video's own stretches (editor: withFrameFreeze)."""
+    """A frame's items with its freezes among each video's own stretches: its layer's, and its last picture held for the time another layer's added (editor: withFrameFreeze)."""
     items = f.get("items") or []
     fz = f.get("freeze")
     if not isinstance(fz, dict) or not fz.get("holds"):
         return items
+    s0, s1 = int(seg.get("start_ms") or 0), int(seg.get("end_ms") or 0)
     out = []
     for it in items:
         if it.get("kind") != "video" or it.get("freeze"):
             out.append(it)
             continue
-        off = int(seg.get("start_ms") or 0) - int(it.get("start_ms") or 0)
-        mine = []
+        off, ln = s0 - int(it.get("start_ms") or 0), int(it.get("end_ms") or 0) - int(it.get("start_ms") or 0)
+        mine, added = [], 0
         for h in fz["holds"]:
+            if not isinstance(h, dict):
+                continue
+            if h.get("on") and h.get("on") != it.get("id"):
+                added += _hold_ms(h)
+                continue
             try:
                 at = round(float(h["at_ms"])) + off
-                mine.append({"at_ms": max(0, at), "len_ms": at + round(float(h["len_ms"])) - max(0, at)})
             except (TypeError, ValueError, KeyError):
                 continue
+            mine.append({"at_ms": max(0, at), "len_ms": at + _hold_ms(h) - max(0, at)})
+        if added and int(it.get("end_ms") or 0) >= s1 - 1:
+            mine.append({"at_ms": max(0, ln - added), "len_ms": min(ln, added), "tail": True})
         out.append({**it, "holds": [*(it.get("holds") or []), *mine], "dim": it.get("dim") or fz.get("dim")})
     return out
 
@@ -578,6 +586,11 @@ def item_source_at(it: dict, t: int) -> tuple[int, bool]:
         before += max(0, min(rel - at, n))
         held = held or at <= rel < at + n
     return off + rel - before, held
+
+
+def item_dim_runs(it: dict, a: int, b: int) -> list[tuple[int, int]]:
+    """The stretches Dim darkens: its freezes, not the last picture held for time another layer added."""
+    return item_held_runs({**it, "holds": [h for h in it.get("holds") or [] if not (isinstance(h, dict) and h.get("tail"))]}, a, b)
 
 
 def item_held_runs(it: dict, a: int, b: int) -> list[tuple[int, int]]:
@@ -683,12 +696,29 @@ def main_audio_volume(state: dict) -> float:
     return total
 
 
+def _hold_is_main(h: dict) -> bool:
+    """A freeze on the main video (editor: isMainHold): `on` is absent or main:<slot>."""
+    on = h.get("on") if isinstance(h, dict) else None
+    return not on or str(on).startswith("main:")
+
+
+def _hold_ms(h: dict) -> int:
+    try:
+        return max(0, round(float(h["len_ms"])))
+    except (TypeError, ValueError, KeyError):
+        return 0
+
+
 def main_freeze_item(seg: dict, state: dict, off_ms: int) -> dict | None:
-    """The main video of a frame with freezes (frame.freeze) as a video item, so it holds as one would."""
+    """The main video of a part with freezes (frame.freeze) as a video item, so it holds as one would: its own, and its last picture for the time another layer's added."""
     f = state.get("freeze")
     if not isinstance(f, dict) or not f.get("holds"):
         return None
-    return {"kind": "video", "start_ms": int(seg["start_ms"]), "end_ms": int(seg["end_ms"]), "source_offset_ms": off_ms, "holds": f["holds"], "dim": f.get("dim")}
+    s0, s1 = int(seg["start_ms"]), int(seg["end_ms"])
+    holds = [h for h in f["holds"] if isinstance(h, dict)]
+    added = sum(_hold_ms(h) for h in holds if not _hold_is_main(h))
+    own = [h for h in holds if _hold_is_main(h)] + ([{"at_ms": max(0, s1 - s0 - added), "len_ms": added, "tail": True}] if added else [])
+    return {"kind": "video", "start_ms": s0, "end_ms": s1, "source_offset_ms": off_ms, "holds": own, "dim": f.get("dim")} if own else None
 
 
 def frame_audio_plan(seg: dict, secondary_videos: dict[str, str]) -> list[tuple[str | None, float, float, float, float]]:

@@ -13,7 +13,12 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from frames import is_frame, frame_audio_plan, frame_state, main_audio_volume
+from frames import is_frame, frame_audio_plan, frame_state, main_audio_volume, main_freeze_item, item_play_runs
+
+
+def _has_freeze(seg: dict) -> bool:
+    """A part whose main video waits for stretches: its sound is in pieces, with silence between them."""
+    return main_freeze_item(seg, seg.get("frame") or {}, 0) is not None
 
 
 def build_ffmpeg_audio_args(
@@ -271,7 +276,13 @@ def build_segment_audio_args(
                 vid_off_ms = int(seg["video_offset_ms"]) if seg.get("video_offset_ms") is not None else (int(_cb_off) if _cb_off is not None else int(seg["start_ms"]))
                 if _part_speed(seg) != 1:
                     sped[len(plans)] = (_part_speed(seg), bool(seg.get("pitch")))
-                plans.append([(None, vid_off_ms / 1000.0, main_vol, 0.0, seg_dur)])
+                # With freezes: silent while it waits, then on from the same moment
+                frozen = main_freeze_item(seg, seg.get("frame") or {}, vid_off_ms)
+                if frozen:
+                    s0 = int(seg["start_ms"])
+                    plans.append([(None, src / 1000.0, main_vol, (a - s0) / 1000.0, (b - a) / 1000.0) for a, b, src in item_play_runs(frozen, s0, int(seg["end_ms"]))])
+                else:
+                    plans.append([(None, vid_off_ms / 1000.0, main_vol, 0.0, seg_dur)])
 
         # ── Transitions: which cuts cross-fade, and how much sound each part reads past its edges ──
         xf_at: dict[int, float] = {}        # index of the part before the cut -> half the transition (s)
@@ -281,7 +292,7 @@ def build_segment_audio_args(
                 cut = int(a["end_ms"])
                 if abs(int(b["start_ms"]) - cut) > 1 or is_frame(a.get("layout")) or is_frame(b.get("layout")):
                     continue
-                if len(plans[i]) != 1 or len(plans[i + 1]) != 1:
+                if len(plans[i]) != 1 or len(plans[i + 1]) != 1 or _has_freeze(a) or _has_freeze(b):
                     continue
                 h = next((hh for at, hh in crossfades if abs(at - cut) <= 1), 0.0)
                 if h <= 0:
@@ -388,7 +399,7 @@ def build_segment_audio_args(
                     continue
                 fp.append(f"{src}atrim=start={off_s:.3f}:end={off_s + piece_s:.3f},asetpts=PTS-STARTPTS{vol_f},{fmt}{delay_f}{lbl}")
                 pieces.append(lbl)
-            if is_frame(seg.get("layout")):
+            if is_frame(seg.get("layout")) or _has_freeze(seg):
                 # A silent bed of exactly the frame's length with its sounds on top, each at its own volume
                 bed = f"[sbed{i}]"
                 fp.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={dur_s:.3f},{fmt}{bed}")

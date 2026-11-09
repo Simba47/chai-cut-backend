@@ -24,10 +24,75 @@ STYLE_KEYS = ("weight", "italic", "uppercase", "letter_spacing", "opacity", "str
 # at the weight asked (regular file: thickened); any other font is the family's Bold file
 BUNDLED = {"roboto", "montserrat-bold", "noto-sans-telugu", "noto-sans-devanagari", "noto-sans-tamil",
            "noto-sans-kannada", "noto-sans-malayalam", "noto-sans-bengali"}
+# The Indian scripts' letters: the bundled font for each, and a letter to try a font with
+SCRIPTS = (("ఀ", "౿", "noto-sans-telugu", "క"), ("ऀ", "ॿ", "noto-sans-devanagari", "क"),
+           ("஀", "௿", "noto-sans-tamil", "க"), ("ಀ", "೿", "noto-sans-kannada", "ಕ"),
+           ("ഀ", "ൿ", "noto-sans-malayalam", "ക"), ("ঀ", "৿", "noto-sans-bengali", "ক"))
 LINE_EM = 1.15            # textStyle.ts TEXT_LINE_EM
 BG_PAD = (0.35, 0.18)     # textStyle.ts BG_PAD, em
 LONG_ANIMS = {"drop", "bounce", "spin", "glitch", "flicker"}
 FAKE_ITALIC = 0.25        # the browser's slant for a font with no italic (Skia: skewX −1/4)
+
+
+_HAS_LETTER: dict[tuple[str, str], bool] = {}
+
+
+def _has_letter(path: str, ch: str) -> bool:
+    """Whether a font file can draw `ch` (it draws something else than for a letter no font has)"""
+    key = (path, ch)
+    if key not in _HAS_LETTER:
+        font = ImageFont.truetype(path, 48)
+
+        def ink(c: str) -> bytes:
+            img = Image.new("L", (160, 120), 0)
+            ImageDraw.Draw(img).text((20, 90), c, font=font, fill=255, anchor="ls")
+            return img.tobytes()
+        _HAS_LETTER[key] = ink(ch) != ink("\U0010ffff")
+    return _HAS_LETTER[key]
+
+
+def font_runs(text: str, base: str, find_font) -> list[tuple[str, str]]:
+    """
+    `text` in pieces, each with a font that has its letters: (font id, piece). `base` is the text's own
+    font; Telugu, Hindi… it has no letters for go in their Noto font, and the English letters a Noto
+    font has none of in Roboto (the export draws a piece in one font: the letters it lacks came out as
+    boxes). What the preview's font list does letter by letter (VideoPreview letterFallbacks).
+    Spaces, digits and punctuation stay with the letters before them.
+    """
+    script_fonts = {s[2] for s in SCRIPTS}
+    in_script = lambda c: next((s for s in SCRIPTS if s[0] <= c <= s[1]), None)
+    base_path = find_font(base)
+    if not text or not base_path or (base not in script_fonts and not any(in_script(c) for c in text)):
+        return [(base, text)] if text else []
+
+    def pick(c: str, cur: str | None) -> str | None:
+        script = in_script(c)
+        if script:
+            return base if _has_letter(base_path, script[3]) else script[2]
+        if c.isspace() or c in "‌‍":
+            return cur
+        if not c.isalpha() and cur and _has_letter(find_font(cur) or base_path, c):
+            return cur
+        if not c.isalpha() and not cur and _has_letter(base_path, c):
+            return None
+        return base if _has_letter(base_path, c) else "roboto"
+
+    out: list[tuple[str, str]] = []
+    cur, piece = None, ""
+    for c in text:
+        f = pick(c, cur)
+        if cur is None or f is None or f == cur:
+            cur, piece = cur or f, piece + c
+        else:
+            out.append((cur, piece))
+            cur, piece = f, c
+    out.append((cur or base, piece))
+    return out
+
+
+def text_width(text: str, base: str, size: int, find_font) -> float:
+    """How wide `text` is at `size`, each piece measured in its own font"""
+    return sum(ImageFont.truetype(find_font(f) or find_font(base), size).getlength(p) for f, p in font_runs(text, base, find_font))
 
 
 def is_styled(ov: dict) -> bool:
@@ -166,7 +231,7 @@ def _bold_file(path: str) -> bool:
     return any(w in name for w in ("bold", "black", "heavy", "extrabold", "semibold"))
 
 
-def frame(ov: dict, lines: list[str], font_path: str, W: int, H: int, dt: float) -> Image.Image | None:
+def frame(ov: dict, lines: list[str], font_path: str, W: int, H: int, dt: float, find_font=None) -> Image.Image | None:
     """
     The whole W × H frame (see-through but for the text) with the text as the preview draws it `dt`
     ms after it came in (math.inf: at rest). `lines`: its lines as the preview wraps them.
@@ -176,9 +241,14 @@ def frame(ov: dict, lines: list[str], font_path: str, W: int, H: int, dt: float)
     font = ImageFont.truetype(font_path, size)
     font_id = ov.get("font") or ""
     weight = ov.get("weight") or (400 if font_id in BUNDLED else 700)
+    faces = {font_path: font}
+
+    def face(path: str) -> ImageFont.FreeTypeFont:
+        return faces.setdefault(path, ImageFont.truetype(path, size))
+
     # The browser thickens a regular file drawn bold (Skia's fake bold: ~1/32 of the size in all)
-    fake_bold = weight >= 600 and not _bold_file(font_path)
-    bold_px = max(1, round(size / 64)) if fake_bold else 0
+    def bold_px(path: str) -> int:
+        return max(1, round(size / 64)) if weight >= 600 and not _bold_file(path) else 0
     italic = bool(ov.get("italic"))
     spacing = float(ov.get("letter_spacing") or 0) * k
     a = _anim(ov, dt, W, H, k)
@@ -186,14 +256,24 @@ def frame(ov: dict, lines: list[str], font_path: str, W: int, H: int, dt: float)
         return None
 
     full = _shown(ov)
-    line_runs = [emoji_art.split_emoji(ln) for ln in lines]
 
-    def run_w(is_e: bool, s: str) -> float:
+    def pieces(ln: str) -> list[tuple[bool, str, str]]:
+        out: list[tuple[bool, str, str]] = []
+        for is_e, s in emoji_art.split_emoji(ln):
+            if is_e or not find_font:
+                out.append((is_e, s, font_path))
+            else:
+                out += [(False, p, find_font(f) or font_path) for f, p in font_runs(s, font_id or "roboto", find_font)]
+        return out
+
+    line_runs = [pieces(ln) for ln in lines]
+
+    def run_w(is_e: bool, s: str, path: str) -> float:
         if is_e:
             return size * emoji_art.ADVANCE_EM
-        return font.getlength(s) + spacing * len(s)
+        return face(path).getlength(s) + spacing * len(s)
 
-    widths = [[run_w(e, s) for e, s in runs] for runs in line_runs]
+    widths = [[run_w(e, s, p) for e, s, p in runs] for runs in line_runs]
     text_w = max((sum(ws) for ws in widths), default=0.0)
     line_h = size * LINE_EM
     has_bg = bool(ov.get("bg_color"))
@@ -238,7 +318,7 @@ def frame(ov: dict, lines: list[str], font_path: str, W: int, H: int, dt: float)
             base = ty0 + li * line_h + em_top
             cursor = tx
             used = 0
-            for is_e, s in line_runs[li]:
+            for is_e, s, path in line_runs[li]:
                 if used >= len(ln):
                     break
                 s = s[:len(ln) - used]
@@ -246,13 +326,14 @@ def frame(ov: dict, lines: list[str], font_path: str, W: int, H: int, dt: float)
                 if is_e:
                     cursor += size * emoji_art.ADVANCE_EM
                     continue
+                f, thick = face(path), extra + bold_px(path)
                 if spacing:
                     for ch in s:
-                        d.text((cursor, base), ch, font=font, fill=255, anchor="ls", stroke_width=extra)
-                        cursor += font.getlength(ch) + spacing
+                        d.text((cursor, base), ch, font=f, fill=255, anchor="ls", stroke_width=thick)
+                        cursor += f.getlength(ch) + spacing
                 else:
-                    d.text((cursor, base), s, font=font, fill=255, anchor="ls", stroke_width=extra)
-                    cursor += font.getlength(s)
+                    d.text((cursor, base), s, font=f, fill=255, anchor="ls", stroke_width=thick)
+                    cursor += f.getlength(s)
         if italic:
             # Slanted round each line's baseline (top leans right)
             out = Image.new("L", (lw, lh), 0)
@@ -267,7 +348,7 @@ def frame(ov: dict, lines: list[str], font_path: str, W: int, H: int, dt: float)
             mask = out
         return mask
 
-    fill_mask = glyph_mask(bold_px)
+    fill_mask = glyph_mask()
     color = _rgba(ov.get("color") or "#ffffff")
 
     def colored(mask: Image.Image, rgba: tuple[int, int, int, int]) -> Image.Image:
@@ -280,7 +361,7 @@ def frame(ov: dict, lines: list[str], font_path: str, W: int, H: int, dt: float)
     stroke_img = None
     if stroke > 0:
         s = max(1, int(round(stroke)))
-        outer = glyph_mask(bold_px + s)
+        outer = glyph_mask(s)
         inner = fill_mask.filter(ImageFilter.MinFilter(2 * s + 1)) if s < 40 else Image.new("L", (lw, lh), 0)
         stroke_img = colored(ImageChops.subtract(outer, inner), _rgba(ov.get("stroke_color")))
 
@@ -325,7 +406,7 @@ def frame(ov: dict, lines: list[str], font_path: str, W: int, H: int, dt: float)
         base = ty0 + li * line_h + em_top
         cursor = tx
         used = 0
-        for (is_e, s), w in zip(line_runs[li], widths[li]):
+        for (is_e, s, _), w in zip(line_runs[li], widths[li]):
             if used >= len(ln):
                 break
             used += len(s)
@@ -370,7 +451,7 @@ def frame(ov: dict, lines: list[str], font_path: str, W: int, H: int, dt: float)
     return out
 
 
-def frames(ov: dict, lines: list[str], font_path: str, W: int, H: int, fps: float, tmp: str, tag: str) -> tuple[str | None, str | None, float]:
+def frames(ov: dict, lines: list[str], font_path: str, W: int, H: int, fps: float, tmp: str, tag: str, find_font=None) -> tuple[str | None, str | None, float]:
     """
     The text's entrance as numbered PNGs (an image sequence at `fps`; None when it has none) and
     the text at rest (one PNG), and how long the entrance lasts in s.
@@ -383,13 +464,13 @@ def frames(ov: dict, lines: list[str], font_path: str, W: int, H: int, fps: floa
         os.makedirs(d, exist_ok=True)
         blank = None
         for i in range(n):
-            img = frame(ov, lines, font_path, W, H, i * 1000 / fps)
+            img = frame(ov, lines, font_path, W, H, i * 1000 / fps, find_font)
             if img is None:
                 blank = blank or Image.new("RGBA", (W, H), (0, 0, 0, 0))
                 img = blank
             img.save(os.path.join(d, f"f{i:04d}.png"), compress_level=1)
         seq = os.path.join(d, "f%04d.png")
-    rest = frame(ov, lines, font_path, W, H, math.inf)
+    rest = frame(ov, lines, font_path, W, H, math.inf, find_font)
     still = None
     if rest is not None:
         fd, still = tempfile.mkstemp(suffix=".png", prefix=f"tx_{tag}_", dir=tmp)

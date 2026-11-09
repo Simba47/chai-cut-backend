@@ -2,8 +2,9 @@ FROM node:22-slim
 WORKDIR /app
 
 # System deps. fontconfig: config files the ffmpeg build's caption/text renderer (libass) expects.
+# libfribidi0: Pillow joins Telugu and Hindi letters only with it (text with a look is drawn by Pillow).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip curl ca-certificates xz-utils fontconfig \
+    python3 python3-pip curl ca-certificates xz-utils fontconfig libfribidi0 \
     && rm -rf /var/lib/apt/lists/*
 
 # FFmpeg 9.0, static build. Debian's package is 5.1, which fails on renders with looping inputs

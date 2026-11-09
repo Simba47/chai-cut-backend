@@ -27,7 +27,7 @@ from audio import build_ffmpeg_audio_args, build_segment_audio_args, extract_spe
 import emoji as emoji_art   # colour emoji (Twemoji 17), drawn locally
 import creator_captions     # the Creator caption styles (a template's `look`)
 import text_style           # a text's Text-tool look, drawn as the preview draws it
-from frames import main_freeze_item, is_frame, row_heights, row_order, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base, BLUR_SOURCE_SLOT, shown_main_slots, frame_background, bg_filter, item_held_runs
+from frames import main_freeze_item, item_dim_runs, is_frame, row_heights, row_order, photo_motion_filter, frame_state, frame_band_shown, lane_items, caption_band_zones, corner_geometry, frame_areas, frame_base, BLUR_SOURCE_SLOT, shown_main_slots, frame_background, bg_filter, item_held_runs
 from picture_check import main_picture_probes, missing_main_picture, at
 
 # ── Quality presets (identical to previous version) ───────────────────────────
@@ -1778,11 +1778,11 @@ def _dim_filter(enable: str = "") -> str:
     return f"format=yuv420p,lutyuv=y='16+(val-16)*0.55':u='128+(val-128)*0.55':v='128+(val-128)*0.55'{enable},"
 
 
-def _hold_filters(held: list[tuple[int, int]], a_ms: int, fps: float, dim) -> str:
+def _hold_filters(held: list[tuple[int, int]], a_ms: int, fps: float, dim: list[tuple[int, int]] | None) -> str:
     """
     Filters holding a video still over `held` (clip ms; it stays one piece): the frames after each held
-    picture pushed later by the stretch's length, fps filling the gap with that picture — darker there
-    with Dim. `a_ms`: the clip time its first frame is at. Ends with a comma.
+    picture pushed later by the stretch's length, fps filling the gap with that picture. `dim`: the
+    stretches darker meanwhile. `a_ms`: the clip time its first frame is at. Ends with a comma.
     """
     shift = []
     for ha, hb in held:
@@ -1792,7 +1792,7 @@ def _hold_filters(held: list[tuple[int, int]], a_ms: int, fps: float, dim) -> st
     expr = "+".join(f"gte(T,{x:.4f})*{n:.4f}" for x, n in shift)
     out = f"setpts='PTS+({expr})/TB',fps={fps:.3f}:start_time=0,"
     if dim:
-        on = "+".join(f"gte(t,{(ha - a_ms) / 1000.0:.4f})*lt(t,{(hb - a_ms) / 1000.0:.4f})" for ha, hb in held)
+        on = "+".join(f"gte(t,{(ha - a_ms) / 1000.0:.4f})*lt(t,{(hb - a_ms) / 1000.0:.4f})" for ha, hb in dim)
         out += _dim_filter(f":enable='{on}'")
     return out
 
@@ -2429,7 +2429,9 @@ def main(
                         # The frame's freezes (frame.freeze): it waits, as a video put there would
                         mf = main_freeze_item(seg, st, int(off_ms))
                         mheld = item_held_runs(mf, int(seg["start_ms"]), int(seg["end_ms"])) if mf else []
-                        mhold = f"{_hold_filters(mheld, int(seg['start_ms']), _probe_fps(video_path), mf.get('dim'))}trim=duration={dur_s:.3f}," if mheld else ""
+                        mdim = item_dim_runs(mf, int(seg["start_ms"]), int(seg["end_ms"])) if mheld and mf.get("dim") else None
+                        # (tpad: at the very end of the video there's no later frame to hold up to)
+                        mhold = f"{_hold_filters(mheld, int(seg['start_ms']), _probe_fps(video_path), mdim)}tpad=stop_mode=clone:stop_duration={dur_s:.3f},trim=duration={dur_s:.3f}," if mheld else ""
                         iw, ih, px, py, rr, boxed = media_box((st.get("main_corners") or {}).get(str(slot)),
                                                               (st.get("main_rects") or {}).get(str(slot)), aw, rh)
                         if contain and not area.get("main_crop"):
@@ -2523,7 +2525,7 @@ def main(
                             a_ms = int(seg["start_ms"]) + round(rel * 1000)
                             held = item_held_runs(it, a_ms, a_ms + round(d * 1000)) if (si, it["id"]) in frame_item_fps else []
                             if held:
-                                dim += _hold_filters(held, a_ms, frame_item_fps[(si, it["id"])], it.get("dim"))
+                                dim += _hold_filters(held, a_ms, frame_item_fps[(si, it["id"])], item_dim_runs(it, a_ms, a_ms + round(d * 1000)) if it.get("dim") else None)
                             if contain:
                                 chain = shown_whole(f"{src}setpts=PTS-STARTPTS,trim=duration={d:.3f},{dim}", frame_item_dims.get((si, it["id"])), iw, ih, rr, f"{key}i{ii}")
                                 if boxed:
@@ -2593,6 +2595,11 @@ def main(
                 seg_labels.append(out_lbl)
                 continue
 
+            # A plain part's freezes (a frame's are done with its slots)
+            _mf = main_freeze_item(seg, seg.get("frame") or {}, 0)
+            seg_frozen = item_held_runs(_mf, int(seg["start_ms"]), int(seg["end_ms"])) if _mf else []
+            seg_fps = _probe_fps(video_path) if seg_frozen else 0.0
+
             # Primary (slot-0) B-roll source for this segment, used as fallback for empty slots.
             _primary_broll = _primary_box_vid_id if (_primary_box_vid_id and _primary_box_vid_id in secondary_videos) else None
 
@@ -2650,6 +2657,10 @@ def main(
                 # (smooth slow motion reads a little past the part's end: the in-between frames
                 # would otherwise end a few frames short of its length)
                 te_read = te + 0.3 if seg_speed != 1 and seg_smooth and src == primary_src_tag else te
+                # The part's freezes: the main video waits (before the crop, whose views are in timeline time)
+                if src == primary_src_tag and seg_frozen:
+                    held_from = smss - int(round(x_h * 1000))
+                    speed_f += f"{_hold_filters(seg_frozen, held_from, seg_fps, None)}trim=duration={dur_ms / 1000.0 + x_h + x_t:.3f},"
                 fp.append(
                     f"{src}trim=start={ts:.3f}:end={te_read:.3f},setpts=PTS-STARTPTS,{speed_f}"
                     f"{crop},{scale},setsar=1{lbl}"
@@ -2820,6 +2831,13 @@ def main(
             font_path = _find_font_path(ov.get("font") or "roboto")
             if not font_path:
                 continue
+            # Each piece in a font that has its letters (text_style.font_runs): all of it in another
+            # font (Telugu in a font with no Telugu) is that font's text; `mixed` is drawn in pieces
+            text_fonts = {f for f, _ in text_style.font_runs(raw_text, ov.get("font") or "roboto", _find_font_path)}
+            mixed = len(text_fonts) > 1
+            if not mixed and text_fonts != {ov.get("font") or "roboto"}:
+                ov = {**ov, "font": next(iter(text_fonts))}
+                font_path = _find_font_path(ov["font"]) or font_path
             # Sizes are px at 1080 wide (as the editor draws them): scaled to this export's width
             sz   = max(8, int(round((ov.get("size") or 48) * out_w / 1080)))
             hx   = (ov.get("color") or "#ffffff").lstrip("#")
@@ -2839,21 +2857,21 @@ def main(
 
             # ── A text with its Text-tool look (text_style.py): drawn as the preview draws it — its
             # entrance frame by frame from when it comes in, then at rest until it goes ──
-            if text_style.is_styled(ov):
+            if text_style.is_styled(ov) or (mixed and not centered):
                 from PIL import ImageFont as _IF
                 shown = raw_text.upper() if ov.get("uppercase") else raw_text
                 # Its lines as the preview wraps them: measured with the preview's font file for the
                 # text (a bundled one, else Roboto), regular, no spacing (VideoPreview textOverlayLines)
                 if box_w > 0:
-                    wrap_path = _find_font_path(ov.get("font") if (ov.get("font") or "") in text_style.BUNDLED else "roboto")
-                    wrap_font = _IF.truetype(wrap_path, int(round(float(ov.get("size") or 72) * out_w / 1080)))
+                    wrap_id = ov.get("font") if (ov.get("font") or "") in text_style.BUNDLED else "roboto"
+                    wrap_font = _IF.truetype(_find_font_path(wrap_id), int(round(float(ov.get("size") or 72) * out_w / 1080)))
                     def _ws(s: str, f=wrap_font) -> float:
-                        return sum(f.size * emoji_art.ADVANCE_EM if is_e else f.getlength(t) for is_e, t in emoji_art.split_emoji(s))
+                        return sum(f.size * emoji_art.ADVANCE_EM if is_e else text_style.text_width(t, wrap_id, f.size, _find_font_path) for is_e, t in emoji_art.split_emoji(s))
                     st_lines = _wrap_text_lines(shown, box_w * out_w, _ws)
                 else:
                     st_lines = shown.split("\n")
                 st_fps = _probe_fps(video_path)
-                seq, still, anim_s = text_style.frames(ov, st_lines, font_path, out_w, out_h, st_fps, tempfile.mkdtemp(prefix="txs_"), str(oi))
+                seq, still, anim_s = text_style.frames(ov, st_lines, font_path, out_w, out_h, st_fps, tempfile.mkdtemp(prefix="txs_"), str(oi), _find_font_path)
                 t_rest = min(t1, t0 + anim_s)
                 if seq and anim_s > 0:
                     inputs += ["-framerate", f"{st_fps:.3f}", "-i", seq]
@@ -2872,7 +2890,7 @@ def main(
                 print(f"[render] text {oi} with its look: {ov.get('animation') or 'no'} entrance ({anim_s:.2f}s), {len(st_lines)} line(s)", flush=True)
                 continue
 
-            if not emoji_art.has_emoji(raw_text) and "\n" not in raw_text and box_w <= 0 and box_h <= 0 and not rotation:
+            if not mixed and not emoji_art.has_emoji(raw_text) and "\n" not in raw_text and box_w <= 0 and box_h <= 0 and not rotation:
                 # ── One line, no emoji: a single drawtext call, exactly as before ──
                 sz_fit = _fit_font_size(raw_text, font_path, sz, int(out_w * 0.9)) if centered else sz
                 sx = "(w-text_w)/2" if centered else int((ov.get("x") or 0.1) * out_w)
@@ -2899,12 +2917,16 @@ def main(
                 text_lines = _wrap_text_lines(raw_text, box_w * out_w, _w)
             else:
                 text_lines = raw_text.split("\n")
-            line_runs = [emoji_art.split_emoji(ln) for ln in text_lines]
+            base_id = ov.get("font") or "roboto"
+            line_runs = [[(e, p) for e, s in emoji_art.split_emoji(ln)
+                          for p in ([s] if e else [x for _, x in text_style.font_runs(s, base_id, _find_font_path)])] for ln in text_lines]
+
+            def _piece_font(s: str) -> str:
+                return _find_font_path(text_style.font_runs(s, base_id, _find_font_path)[0][0]) or font_path
 
             def _measure(size: int) -> tuple[list[list[float]], float]:
-                pil_font = ImageFont.truetype(font_path, size)
                 # An emoji takes the Chai Emoji font's room (as the editor's preview draws it)
-                widths = [[size * emoji_art.ADVANCE_EM if is_e else pil_font.getlength(s) for is_e, s in runs] for runs in line_runs]
+                widths = [[size * emoji_art.ADVANCE_EM if is_e else ImageFont.truetype(_piece_font(s), size).getlength(s) for is_e, s in runs] for runs in line_runs]
                 return widths, max((sum(ws) for ws in widths), default=0.0)
 
             widths, max_w = _measure(sz)
@@ -2962,7 +2984,7 @@ def main(
                     else:
                         olbl = f"[vdt{oi}_{ridx}]"
                         fp.append(
-                            f"{cur}drawtext=fontfile={_filter_path(font_path)}:{_text_opt(s)}:fontsize={sz}"
+                            f"{cur}drawtext=fontfile={_filter_path(_piece_font(s))}:{_text_opt(s)}:fontsize={sz}"
                             f":fontcolor=0x{r:02X}{g:02X}{b2:02X}:x={int(cursor)}:y_align=baseline:y={int(base)}"
                             f":shadowx=2:shadowy=2:shadowcolor=black@0.7{outline}"
                             f":enable='{enable}'{olbl}"

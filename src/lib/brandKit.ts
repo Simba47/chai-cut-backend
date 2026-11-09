@@ -28,10 +28,15 @@ export interface ClipBrand {
     highlight_color: string; uppercase: boolean; words_per_line: number | null
   } | null
   /** Its logo on the frame (shares of it) and when it shows; null: no logo */
-  logo: { path: string; x: number; y: number; w: number; h: number; opacity: number; show: 'all' | 'start' | 'end'; seconds: number } | null
+  logo: ClipLogo | null
   /** Its words (brand kit Phase 5, lib/brandWords.ts): its spellings and tone in the post text the job writes */
   words: BrandWords
 }
+
+type LogoCorner = 'tl' | 'tr' | 'bl' | 'br'
+export interface LogoBox { x: number; y: number; w: number; h: number }
+/** `smart`: moved to the clearest corner on each clip (placedLogo); never one placed by hand */
+export interface ClipLogo extends LogoBox { path: string; opacity: number; show: 'all' | 'start' | 'end'; seconds: number; corner: LogoCorner; safe: boolean; smart: boolean }
 
 const HEX = /^#[0-9a-f]{6}$/i
 /** The plans whose kits can be shared with a team (the frontend's lib/shared/brandTeam.ts TEAM_SEATS): a kit shared by someone on another plan waits */
@@ -45,6 +50,14 @@ const LOGO_MARGIN = 0.04
 /** What Reels and Shorts draw over a video, for a logo kept clear of it (kit logo.safe): the frontend's LOGO_SAFE */
 const LOGO_SAFE = { top: 0.08, bottom: 0.13, right: 0.14, edge: 0.035 }
 
+/** Where a logo sits in a corner of the 1080 × 1920 frame: the frontend's logoBox */
+function cornerSpot(w: number, h: number, safe: boolean, corner: LogoCorner) {
+  const mx = safe ? Math.max(LOGO_MARGIN, LOGO_SAFE.edge) : LOGO_MARGIN
+  const top = safe ? LOGO_SAFE.top : (LOGO_MARGIN * 1080) / 1920, bottom = safe ? LOGO_SAFE.bottom : (LOGO_MARGIN * 1080) / 1920
+  const right = safe && corner === 'br' ? LOGO_SAFE.right : mx
+  return { x: r4(corner.endsWith('l') ? mx : 1 - right - w), y: r4(corner.startsWith('t') ? top : 1 - bottom - h) }
+}
+
 /** A kit's saved settings (as the brand_kits row keeps them) as what goes on a clip; anything missing or wrong takes the default */
 export function clipBrand(raw: unknown, userId: string): ClipBrand {
   const d = (raw && typeof raw === 'object' ? raw : {}) as Record<string, any>
@@ -57,17 +70,14 @@ export function clipBrand(raw: unknown, userId: string): ClipBrand {
     // Where the frontend's logoBox puts it on the 1080 × 1920 frame
     const w = num(l.size, 0.06, 0.5, 0.18)
     const h = Math.min(0.9, (w * 1080 * num(l.ratio, 0.05, 20, 1)) / 1920)
-    const corner = ['tl', 'tr', 'bl', 'br'].includes(l.corner as string) ? (l.corner as string) : 'tr'
+    const corner = (['tl', 'tr', 'bl', 'br'] as const).find(c => c === l.corner) ?? 'tr'
     const safe = l.safe !== false
-    const mx = safe ? Math.max(LOGO_MARGIN, LOGO_SAFE.edge) : LOGO_MARGIN
-    const top = safe ? LOGO_SAFE.top : (LOGO_MARGIN * 1080) / 1920, bottom = safe ? LOGO_SAFE.bottom : (LOGO_MARGIN * 1080) / 1920
-    const right = safe && corner === 'br' ? LOGO_SAFE.right : mx
     const placed = typeof l.x === 'number' && typeof l.y === 'number' && isFinite(l.x) && isFinite(l.y)
-    const x = placed ? Math.min(1 - w, Math.max(0, l.x as number)) : corner.endsWith('l') ? mx : 1 - right - w
-    const y = placed ? Math.min(1 - h, Math.max(0, l.y as number)) : corner.startsWith('t') ? top : 1 - bottom - h
+    const spot = placed ? { x: r4(Math.min(1 - w, Math.max(0, l.x as number))), y: r4(Math.min(1 - h, Math.max(0, l.y as number))) } : cornerSpot(w, h, safe, corner)
     logo = {
-      path, x: r4(x), y: r4(y), w: r4(w), h: r4(h), opacity: num(l.opacity, 0.1, 1, 0.9),
+      path, ...spot, w: r4(w), h: r4(h), opacity: num(l.opacity, 0.1, 1, 0.9),
       show: (['all', 'start', 'end'] as const).find(s => s === l.show) ?? 'all', seconds: Math.round(num(l.seconds, 1, 15, 3)),
+      corner, safe, smart: !placed && l.smart !== false,
     }
   }
   return {
@@ -142,8 +152,63 @@ export function appliedHere(data: unknown): unknown {
   return { ...d, ...(ends ? { ends: { ...ends, card: false, intro: null, outro: null } } : {}) }
 }
 
+const overlapArea = (a: LogoBox, b: LogoBox) =>
+  Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)) * Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y))
+
+/**
+ * The logo in the corner it's clearest in on this clip (kit logo.smart): the frontend's pickLogoCorner —
+ * the kit's own corner when nothing is in the way there, else the one covering the least of `avoid`
+ */
+export function placedLogo(logo: ClipLogo, avoid: LogoBox[]): ClipLogo {
+  if (!logo.smart || !avoid.length) return logo
+  const scored = [...new Set<LogoCorner>([logo.corner, 'tr', 'tl', 'br', 'bl'])].map(c => {
+    const spot = cornerSpot(logo.w, logo.h, logo.safe, c)
+    return { spot, v: avoid.reduce((t, a) => t + overlapArea({ ...spot, w: logo.w, h: logo.h }, a), 0) }
+  })
+  const best = scored.find(s => s.v < 1e-4) ?? scored.reduce((b, s) => (s.v < b.v - 1e-6 ? s : b))
+  return { ...logo, ...best.spot }
+}
+
+type LogoView = LogoBox & { t_ms: number }
+function viewAt(kfs: LogoView[], t: number): LogoBox | null {
+  const after = kfs.findIndex(k => k.t_ms > t)
+  if (after <= 0) return kfs[after === 0 ? 0 : kfs.length - 1] ?? null
+  const a = kfs[after - 1], b = kfs[after], p = (t - a.t_ms) / (b.t_ms - a.t_ms)
+  const mix = (u: number, v: number) => u + (v - u) * p
+  return { x: mix(a.x, b.x), y: mix(a.y, b.y), w: mix(a.w, b.w), h: mix(a.h, b.h) }
+}
+
+/**
+ * What a clip's logo keeps off (the frontend's EditorShell brandAvoid): the captions' band, and the
+ * faces in its full-frame parts, about once a second — a face seen longer weighs more.
+ * `frames`: the faces read, at ms from the clip's start, as shares of the source picture.
+ */
+export function logoAvoid(
+  segments: Array<{ start_ms: number; end_ms: number; layout: string; slotKfs: LogoView[][]; slotSources?: Array<number | null> }>,
+  frames: Array<{ t_ms: number; faces: LogoBox[] }>,
+  captions: boolean,
+): LogoBox[] {
+  // (the band the frontend's captionBand gives captions at their usual height)
+  const out: LogoBox[] = captions ? [{ x: 0.06, y: 0.76, w: 0.88, h: 0.16 }] : []
+  if (!frames.length) return out
+  for (const seg of segments) {
+    if (seg.layout !== 'vertical' || seg.slotKfs.length !== 1 || seg.slotSources?.[0] != null) continue
+    for (let t = seg.start_ms; t < seg.end_ms; t += 1000) {
+      const v = viewAt(seg.slotKfs[0], t)
+      if (!v || v.w <= 0 || v.h <= 0) continue
+      const near = frames.reduce((b, f) => (Math.abs(f.t_ms - t) < Math.abs(b.t_ms - t) ? f : b))
+      if (Math.abs(near.t_ms - t) > 500) continue
+      for (const f of near.faces) {
+        const x = (f.x - v.x) / v.w, y = (f.y - v.y) / v.h, w = f.w / v.w, h = f.h / v.h
+        if (x + w > 0 && x < 1 && y + h > 0 && y < 1) out.push({ x, y, w, h })
+      }
+    }
+  }
+  return out
+}
+
 /** When the logo shows on a clip `lengthMs` long: [start, end] ms (the frontend's logoSpan) */
-export function logoSpan(logo: NonNullable<ClipBrand['logo']>, lengthMs: number): [number, number] {
+export function logoSpan(logo: ClipLogo, lengthMs: number): [number, number] {
   const len = Math.max(0, Math.round(lengthMs))
   const s = Math.min(len, logo.seconds * 1000)
   return logo.show === 'start' ? [0, s] : logo.show === 'end' ? [len - s, len] : [0, len]
