@@ -111,3 +111,22 @@ test('the edge check says which question the clip answers when it was asked befo
   const moved = await refineEdges(clip(1, 3), lines, words, async () => '{"start_phrase": 2, "end_phrase": 6, "question": null, "why": "w"}')
   assert.equal(moved.clip.question, null)
 })
+
+test('findClips says how far it is: each part of the transcript read, then each pick’s edges checked (user, 2026-11-09: the bar sat still)', async () => {
+  // ~20 minutes of speech: more than one 10-minute part
+  const long = speech(4000, Object.fromEntries(Array.from({ length: 133 }, (_, l) => [l * 30 + 29, 400])))
+  const ask = async (system: string) => (/^You check where/.test(system)
+    ? '{"start_phrase": 1, "end_phrase": 2, "why": "w"}'
+    : '[{"start_line":1,"end_line":3,"title":"T","summary":"S","reason":"R","hook":8,"emotion":8,"story":8,"value":8,"clarity":8}]')
+  const seen: Array<[string, number, number]> = []
+  await findClips({ words: long, durationMs: long[long.length - 1].end_ms, mode: { kind: 'best' }, ask, limit: 2, onProgress: (s, d, t) => seen.push([s, d, t]) })
+  const read = seen.filter(s => s[0] === 'read'), edges = seen.filter(s => s[0] === 'edges')
+  const parts = read[0][2]
+  assert.ok(parts > 1, `parts: ${parts}`)
+  assert.deepEqual(read.map(s => s[1]), Array.from({ length: parts + 1 }, (_, i) => i))
+  assert.ok(edges.length > 1)
+  assert.deepEqual(edges.map(s => s[1]), Array.from({ length: edges.length }, (_, i) => i))
+  assert.equal(edges[edges.length - 1][1], edges[0][2])
+  // all the reading is reported before any edge check
+  assert.ok(seen.findIndex(s => s[0] === 'edges') > seen.findLastIndex(s => s[0] === 'read'))
+})

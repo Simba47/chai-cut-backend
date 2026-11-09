@@ -1519,7 +1519,8 @@ type Word = { word: string; word_roman?: string | null; start_ms: number; end_ms
 
 // Gemini picks the clips: the numbered-line, windowed, scored method shared with the app's
 // "Best moments" (src/lib/clipFinder.ts)
-async function selectHighlights(words: Word[], clipCount: number, durationMs: number, exclude: Array<[number, number]> = []): Promise<FoundClip[]> {
+async function selectHighlights(words: Word[], clipCount: number, durationMs: number, exclude: Array<[number, number]> = [],
+  onProgress?: (step: 'read' | 'edges', done: number, total: number) => void): Promise<FoundClip[]> {
   const ask = (system: string, user: string, o?: { temperature?: number }) => askGemini(user, { system, ...o })
   // Enough candidates per window that a short video (one window) can still fill the request
   const windowCount = Math.max(1, Math.ceil(durationMs / (9 * 60_000)))
@@ -1527,7 +1528,7 @@ async function selectHighlights(words: Word[], clipCount: number, durationMs: nu
   const perWindow = Math.min(12, Math.max(4, Math.ceil((clipCount * 1.5 + exclude.length) / windowCount)))
   return findClips({
     words, durationMs, mode: { kind: 'best' }, ask,
-    limit: clipCount, perWindow, spread: true, exclude,
+    limit: clipCount, perWindow, spread: true, exclude, onProgress,
     log: msg => console.warn('[ai_edit] clip finder:', msg),
   })
 }
@@ -1627,8 +1628,18 @@ async function waitForFullTranscription(videoId: string, signal?: AbortSignal) {
   }
 }
 
-async function setProgress(aiEditJobId: string, progress: number) {
-  await db`UPDATE ai_edit_jobs SET progress = ${Math.round(progress)} WHERE id = ${aiEditJobId}`
+/**
+ * What Make my clips is doing, as the app shows it (user, 2026-11-09: the bar sat still for minutes
+ * with a guessed label): `text` says the step in words ("Framing clips · 2 of 5 done"), `to` is where
+ * this step's part of the bar ends — the app moves the bar slowly toward it between its checks.
+ */
+interface AiEditStage { text: string; to: number }
+
+async function setProgress(aiEditJobId: string, progress: number, stage?: AiEditStage) {
+  const p = Math.round(progress)
+  await (stage
+    ? db`UPDATE ai_edit_jobs SET progress = ${p}, stage = ${db.json({ text: stage.text, to: Math.round(stage.to) } as never)} WHERE id = ${aiEditJobId}`
+    : db`UPDATE ai_edit_jobs SET progress = ${p} WHERE id = ${aiEditJobId}`)
     .catch(e => console.warn('[ai_edit] could not save progress:', e))
 }
 
@@ -1669,6 +1680,13 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
     return
   }
 
+  // The bar's parts: captions 5–20, finding the moments 20–30, titles 30–35, the video 35–45,
+  // framing 45–99. Each step says what it is and moves inside its part
+  // (one after another: steps reported side by side — clips framed at once — are saved in order)
+  let stepping: Promise<void> = Promise.resolve()
+  const step = (progress: number, text: string, to: number) =>
+    (stepping = stepping.then(() => setProgress(ai_edit_job_id, progress, { text, to })))
+
   try {
     // 1. Get video info
     const [video] = await db`
@@ -1688,6 +1706,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
     const durationFor = (w: Word[]) => video.duration_ms ?? (w.length ? w[w.length - 1].end_ms : 0)
     const complete = () => whole || coversVideo(words, durationFor(words))
     if (!complete()) {
+      await step(5, 'Waiting for your video’s captions to finish', 19)
       await waitForFullTranscription(video_id, signal)
       ;({ words, whole } = await loadWords(video_id))
     }
@@ -1697,6 +1716,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
     const loops = complete() ? findLoops(words) : []
     if (complete() && !loops.length) {
       console.log(`[ai_edit] Using the saved transcript of ${video_id} (${words.length} words): nothing is sent for captions`)
+      await step(12, 'Checking the captions for missed speech', 19)
       // Read before the skipped-speech re-read: the speech it skipped is read once now, so the clips
       // see every setup and answer (and their captions have every word). If that fails, the clips are
       // made from the transcript as it is
@@ -1710,6 +1730,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       console.log(loops.length
         ? `[ai_edit] The saved transcript of ${video_id} has a stuck reading (${loops.reduce((n, l) => n + l.words * l.copies, 0)} of ${words.length} words are loops) — reading the video again`
         : `[ai_edit] Transcript for ${video_id} missing or partial (${words.length} words) — transcribing now`)
+      await step(5, 'Getting captions', 19)
       await handleTranscribeJob({
         id: `ai-edit-tx-${ai_edit_job_id}`,
         type: 'transcribe',
@@ -1720,12 +1741,12 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         updated_at: new Date().toISOString(),
         // Reading a long video takes many minutes: the bar moves from 5% to 19% as its 5-minute
         // chunks come in (it used to sit at 5% the whole time, which looked stuck)
-      }, signal, (done, total) => setProgress(ai_edit_job_id, 5 + (14 * done) / Math.max(1, total)))
+      }, signal, (done, total) => step(5 + (14 * done) / Math.max(1, total), `Getting captions · part ${Math.min(done + 1, total)} of ${total}`, 5 + (14 * Math.min(done + 1, total)) / Math.max(1, total)))
       ;({ words, whole } = await loadWords(video_id))
     }
     if (!words.length) throw new Error('This video has no speech to make clips from')
     const durationMs = video.duration_ms ?? words[words.length - 1].end_ms
-    await setProgress(ai_edit_job_id, 20)
+    await step(20, 'Finding the best moments', 27)
 
     // 3. Pick the clips across the whole video, never repeating one an earlier batch made
     const earlier = await db`
@@ -1735,7 +1756,14 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
     // The user said yes to fewer clips: the moments found before asking are used as they are
     // (finding them again would be paid for twice, and could find different ones)
     const kept = payload.confirmed ? await foundMoments(ai_edit_job_id) : []
-    const highlights = kept.length ? kept : await selectHighlights(words, clip_count, durationMs, exclude)
+    // (finding: the transcript's parts read 20–27, then each pick's start and end checked 27–30)
+    const highlights = kept.length ? kept : await selectHighlights(words, clip_count, durationMs, exclude, (s, done, total) => {
+      const n = Math.max(1, total)
+      void (s === 'read'
+        ? step(20 + (7 * done) / n, total > 1 ? `Finding the best moments · part ${Math.min(done + 1, total)} of ${total}` : 'Finding the best moments', 20 + (7 * Math.min(done + 1, total)) / n)
+        // (no count in the words: two spare picks are checked too, so "3 of 7" for 5 clips would confuse)
+        : step(27 + (3 * done) / n, 'Checking where each clip starts and ends', 27 + (3 * Math.min(done + 1, total)) / n))
+    })
     signal.throwIfAborted()
     if (highlights.length === 0) {
       throw new Error(exclude.length
@@ -1756,9 +1784,11 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         return
       }
     }
-    await setProgress(ai_edit_job_id, 30)
+    await step(30, highlights.length > 1 ? `Writing titles and hooks · 0 of ${highlights.length}` : 'Writing the title and hook', 35)
 
     // Hook, title, post caption and hashtags per clip (a clip whose call fails just has none)
+    let written = 0
+    const wroteOne = () => { written++; void step(30 + (5 * written) / highlights.length, highlights.length > 1 ? `Writing titles and hooks · ${written} of ${highlights.length}` : 'Writing the title and hook', 35) }
     const texts: Array<ClipText | null> = await Promise.all(highlights.map(async (h, i) => {
       await new Promise(r => setTimeout(r, (i % 4) * 250)) // spread the calls a little
       try {
@@ -1769,10 +1799,12 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       } catch (e) {
         console.warn(`[ai_edit] clip text failed for ${h.start_ms}-${h.end_ms}:`, e instanceof Error ? e.message : e)
         return null
+      } finally {
+        wroteOne()
       }
     }))
     signal.throwIfAborted()
-    await setProgress(ai_edit_job_id, 35)
+    await step(35, 'Getting your video ready for framing', 40)
 
     // 4. Download video once (for framing)
     const tmp = await mkdtemp(join(tmpdir(), 'ai-edit-'))
@@ -1783,6 +1815,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       const size = await probeSize(videoPath)
       // The picture inside its black bars, if it has any (found once, kept on the video): the framing keeps inside it
       const picture = await pictureOf(video_id, signal, videoPath)
+      await step(40, 'Looking for screens and graphics in the video', 45)
       // The video's own visuals (screen recordings, product shots…), described once, to show
       // under the speaker when they talk about them
       let visuals: Visual[] = []
@@ -1792,7 +1825,19 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
       } catch (e) {
         console.warn('[ai_edit] related visuals skipped:', e instanceof Error ? e.message : e)
       }
-      await setProgress(ai_edit_job_id, 45)
+      // Framing 45–99: each clip's share moves as its own steps finish (faces and camera cuts are
+      // the long one), not only when a whole clip is done
+      const N = highlights.length
+      const share = highlights.map(() => 0)      // how far each clip is, 0–1
+      const shareNext = highlights.map(() => 0)  // where the step it's on now ends
+      const framed = (hi: number, at: number, next: number, what: string) => {
+        share[hi] = at; shareNext[hi] = next
+        const sum = share.reduce((a, b) => a + b, 0)
+        const ahead = shareNext.reduce((a, b, i) => a + Math.max(0, b - share[i]), 0)
+        const done = share.filter(s => s >= 1).length
+        void step(45 + (54 * sum) / N, N > 1 ? `Framing clips · ${done} of ${N} done` : `Framing the clip · ${what}`, 45 + (54 * (sum + ahead)) / N)
+      }
+      await step(45, N > 1 ? `Framing clips · 0 of ${N} done` : 'Framing the clip', 46)
 
       // 5. Frame each clip and save it as a draft. Nothing is exported: the user previews the
       //    clips in the app and exports the ones they want. AI_CLIPS_AT_ONCE (default 3) are made
@@ -1808,6 +1853,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         const clipDurationMs = highlight.end_ms - highlight.start_ms
 
         // Faces 4× a second and camera cuts across the entire clip
+        framed(hi, 0, 0.6, 'finding faces and camera cuts')
         const tDetect = Date.now()
         const rulebook = RULEBOOK_FORMATS && framing.layouts !== false && !!size && size.height < size.width
         const analysis = await analyseClip(tmp, videoPath, highlight.start_ms, highlight.end_ms, size, words, signal, rulebook)
@@ -1816,6 +1862,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
           .then(found => refinePanels(found, analysis.cuts, clipDurationMs, videoPath, highlight.start_ms))
           .catch(e => { console.warn('[ai_edit] panel detection skipped:', e instanceof Error ? e.message : e); return [] })
         const detectS = ((Date.now() - tDetect) / 1000).toFixed(1)
+        framed(hi, 0.6, 0.85, 'choosing the layouts')
 
         // Brain: dynamically switch layout within the clip — by the Rulebook (each scene's format from its
         // people, the views following them), its graphic panels over one-person parts; else frame by frame
@@ -1849,6 +1896,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         segments = segments.map(s => ({ ...s, slotKfs: s.slotKfs.map(kfs => kfs.map(k => insidePicture(k, picture))) }))
         const clipWords = words.filter(w => w.start_ms >= highlight.start_ms && w.start_ms < highlight.end_ms)
         const caption = captionFontFor(clipWords, payload.caption_language)
+        framed(hi, 0.85, 0.95, 'finding pauses to cut')
 
         // Its pauses and filler words, cut as removed parts the editor shows (and can bring back): the
         // export cuts only what the editor shows (user, 2026-11-04: an export 2–3 s shorter than its
@@ -1856,6 +1904,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
         const pauses = await findPauses(words, highlight.start_ms, highlight.end_ms, segments, videoPath, signal)
           .catch(e => { console.warn('[ai_edit] pauses not found:', e instanceof Error ? e.message : e); return [] })
 
+        framed(hi, 0.95, 1, 'saving it')
         const clip_id = await saveClip(video_id, ai_edit_job_id, highlight, segments, withCaptions ? caption : null, texts[hi], withTitle, brand, pauses)
 
         const layoutSummary = segments.map(s =>
@@ -1869,7 +1918,7 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
             + `avg=${counts.length ? (counts.reduce((a, b) => a + b, 0) / counts.length).toFixed(2) : 0} max=${analysis.info.face_count}, `
             + `${analysis.cuts.length} camera cut(s)`)
         made++
-        await setProgress(ai_edit_job_id, 45 + (55 * made) / highlights.length - 1)
+        framed(hi, 1, 1, 'saved')
       }
       const lane = async () => {
         while (next < highlights.length && !firstError) {
@@ -1884,7 +1933,8 @@ export async function handleAiEditJob(job: Job, outerSignal?: AbortSignal) {
     }
 
     // A stop that lands after the last clip was saved still counts as stopped
-    await db`UPDATE ai_edit_jobs SET status = 'done', progress = 100 WHERE id = ${ai_edit_job_id} AND status = 'running'`
+    await stepping // (a step still being saved would set the bar back under 100 afterwards)
+    await db`UPDATE ai_edit_jobs SET status = 'done', progress = 100, stage = NULL WHERE id = ${ai_edit_job_id} AND status = 'running'`
     console.log(`[ai_edit] Job ${ai_edit_job_id} done in ${((Date.now() - t0) / 1000).toFixed(0)}s (clips ready to preview)`)
   } catch (err) {
     if (cancelled || await isCancelled()) {
