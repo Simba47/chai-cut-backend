@@ -188,6 +188,13 @@ async function runMigrations() {
   await db`ALTER TABLE ai_edit_jobs ADD COLUMN IF NOT EXISTS found JSONB`
   // What a Make my clips run is doing, for its progress bar: { text, to } (jobs/ai_edit.ts setProgress)
   await db`ALTER TABLE ai_edit_jobs ADD COLUMN IF NOT EXISTS stage JSONB`
+  // A Make my clips clip as the AI made it, for the editor's Reset (jobs/ai_edit.ts saveClip); its own
+  // table: every keyframe is in it, and clips is read whole all over the place
+  await db`
+    CREATE TABLE IF NOT EXISTS clip_ai_made (
+      clip_id UUID PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+      made JSONB NOT NULL
+    )`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_score INTEGER`
   await db`ALTER TABLE clips ADD COLUMN IF NOT EXISTS ai_reason TEXT`
   // Animated caption presets (render.py _preset_events, editor drawPresetCaptions)
