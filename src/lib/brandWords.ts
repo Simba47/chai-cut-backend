@@ -49,6 +49,9 @@ export const LINE_MAX = 80
 
 export const NO_BRAND_WORDS: BrandWords = { spell: [], hide: [], lines: [], end_posts: false, hashtags: [], tone: null }
 
+/** Whether a kit's words are used at all. Off (user, 2026-11-10: the Words step is gone): what a kit saved stays with it, unused */
+export const BRAND_WORDS_ON = false
+
 /** The tones a brand can pick: how its post text sounds (`prompt`), and ready lines to start from */
 export const TONES: Array<{ id: BrandTone; name: string; prompt: string; lines: string[] }> = [
   { id: 'friendly', name: 'Friendly', prompt: 'warm, friendly and simple, like talking to a friend',

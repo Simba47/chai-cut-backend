@@ -1,5 +1,5 @@
 import db from '../db.js'
-import { cleanBrandWords, type BrandWords } from './brandWords.js'
+import { BRAND_WORDS_ON, cleanBrandWords, NO_BRAND_WORDS, type BrandWords } from './brandWords.js'
 
 /**
  * Brand kits on the clips Make my clips makes (user, 2026-10-17). A kit is a user's saved look
@@ -81,7 +81,7 @@ export function clipBrand(raw: unknown, userId: string): ClipBrand {
     }
   }
   return {
-    words: cleanBrandWords(d.words),
+    words: BRAND_WORDS_ON ? cleanBrandWords(d.words) : NO_BRAND_WORDS,
     title: { font: typeof t.font === 'string' && t.font.length <= 60 ? t.font : null, color: color(t.color, '#ffffff'), size: Math.round(num(t.size, 24, 160, 64)) },
     captions: c.on === true ? {
       template: typeof c.template === 'string' && c.template.length <= 60 ? c.template : null,
@@ -124,6 +124,7 @@ export async function loadClipBrand(userId: string, choice: string | undefined):
  * services/brandKits.ts brandWordsFor. Null: none, or the kits couldn't be read (the words then go as they are).
  */
 export async function clipBrandWords(clipId: string): Promise<BrandWords | null> {
+  if (!BRAND_WORDS_ON) return null
   try {
     const [row] = await db<{ words: unknown }[]>`
       SELECT bk.data->'words' AS words FROM clips c JOIN videos v ON v.id = c.video_id

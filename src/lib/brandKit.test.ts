@@ -92,6 +92,11 @@ test('the logo moves to the clearest corner, the kit’s own first (the frontend
   assert.equal(logoAvoid([seg], frames, true).length, 3, 'and the captions')
 })
 
+test('the kit’s saved words aren’t used (the Words step is gone)', () => {
+  const b = clipBrand(kit({ words: { spell: [{ text: 'ShortCut', heard: [] }], hide: ['damn'], lines: ['Follow'], hashtags: ['x'], tone: 'bold' } }), U)
+  assert.deepEqual(b.words, { spell: [], hide: [], lines: [], end_posts: false, hashtags: [], tone: null })
+})
+
 test("a kit's progress bar and voice aren't used", () => {
   const b = clipBrand({ progress: { on: true, color: '#FF3366' }, progress_bar: { on: true }, voice: { tone: 'fun' } }, U) as Record<string, unknown>
   assert.equal(b.progress, undefined); assert.equal(b.progress_bar, undefined); assert.equal(b.voice, undefined)
