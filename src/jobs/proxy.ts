@@ -7,6 +7,7 @@ import { DeleteObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3'
 import { r2, R2_BUCKET, r2DownloadToFile, r2UploadFile } from '../r2.js'
 import db from '../db.js'
 import type { Job, ProxyJobPayload } from '../types.js'
+import { makePoster } from './poster.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -120,6 +121,8 @@ export async function handleProxyJob(job: Job, signal?: AbortSignal) {
     console.log(`[proxy] video ${video_id}: editing copy made in ${Math.round((Date.now() - started) / 1000)} s, ${(b.size / 1e6).toFixed(1)} MB (original ${(a.size / 1e6).toFixed(1)} MB)`)
     await keepAudio(storagePath, src, tmp, signal)
       .catch(e => console.warn(`[proxy] video ${video_id}: could not keep its audio:`, (e instanceof Error ? e.message : String(e)).split('\n')[0]))
+    // A video from before pictures were made: its picture, from the file already here (nothing when it has one)
+    await makePoster(video_id, src, signal)
   } finally {
     await rm(tmp, { recursive: true, force: true })
   }

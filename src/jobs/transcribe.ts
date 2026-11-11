@@ -20,6 +20,7 @@ import { filenameFromDisposition, titleFromFilename } from '../lib/fileName.js'
 import db from '../db.js'
 import type { Job, TranscribeJobPayload } from '../types.js'
 import { audioKeyFor, queueProxy } from './proxy.js'
+import { makePoster } from './poster.js'
 
 async function r2Download(key: string): Promise<Buffer> {
   const res = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }))
@@ -185,6 +186,8 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
       .catch(e => console.warn('[transcribe] could not read video length:', e))
     // Its editing copy, made when the worker has nothing else to do (jobs/proxy.ts)
     await queueProxy(payload.video_id).catch(e => console.warn('[transcribe] could not queue the editing copy:', e))
+    // Its picture for the dashboard (jobs/poster.ts: read over a link, only the part needed; never fails the job)
+    await makePoster(payload.video_id, undefined, signal)
     if (!isFullJob) {
       console.log(`[transcribe] upload video ${payload.video_id} ready — transcription deferred to clip creation`)
       return
@@ -245,6 +248,8 @@ async function transcribeJob(job: Job, signal?: AbortSignal, onRead?: ReadProgre
           await db`UPDATE videos SET status = 'ready', storage_path = ${storagePath}, download_progress = 100, duration_ms = ${durationMs} WHERE id = ${payload.video_id}`
           videoReady = true
           await queueProxy(payload.video_id).catch(e => console.warn('[transcribe] could not queue the editing copy:', e))
+          // Its picture for the dashboard, from the file already here (jobs/poster.ts; never fails the job)
+          await makePoster(payload.video_id, videoPath, signal)
           if (!isFullJob) {
             console.log(`[transcribe] link video ${payload.video_id} ready — no captions on this plan`)
             return

@@ -173,6 +173,8 @@ async function runMigrations() {
   `
   // The editing copy of a video (jobs/proxy.ts): what the editor plays, quick to drag through
   await db`ALTER TABLE videos ADD COLUMN IF NOT EXISTS proxy_path TEXT`
+  // A video's picture for the dashboard (jobs/poster.ts): one small JPEG instead of loading the video
+  await db`ALTER TABLE videos ADD COLUMN IF NOT EXISTS poster_path TEXT`
   // "Make my clips": how far the job has got (0–100), and why the AI picked each clip
   await db`ALTER TABLE ai_edit_jobs ADD COLUMN IF NOT EXISTS progress INTEGER NOT NULL DEFAULT 0`
   // Make my clips asks before making fewer clips than asked for: the run stops in 'confirm' with
