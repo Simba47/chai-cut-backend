@@ -10,7 +10,8 @@ import { join } from 'node:path'
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { GoogleAuth } from 'google-auth-library'
-import { r2, R2_BUCKET, r2DownloadToFile, r2SignedUrl, r2UploadFile } from '../r2.js'
+import { r2, R2_BUCKET, r2DownloadToFile, r2SignedUrl, r2UploadFileInParts } from '../r2.js'
+import { LINK_BAR, fetchPct, savePct, progressFeed } from '../lib/linkProgress.js'
 import { aiProvider, askGemini, dropCode, isNetworkDrop, retryAfterMs, retryDelayMs } from '../lib/gemini.js'
 import { sttRank, sttTurn, waitForStt, wavSeconds, type SttSide } from '../lib/googleBudget.js'
 import { runawayReason, trimRunaway } from '../lib/transcriptGuard.js'
@@ -450,7 +451,8 @@ async function downloadDirectLink(
   const name = LINK_NAMES[source]
   const tooBig = () => new UserFacingError(`This video is bigger than your plan's ${Math.round((maxBytes ?? 0) / 1024 ** 3)} GB limit.`)
 
-  await setProgress(videoId, 5)
+  const bar = progressFeed(pct => setProgress(videoId, pct))
+  bar.set(LINK_BAR.start)
   let res = await fetch(directDownloadUrl(video.source_url, source), { redirect: 'follow', signal })
   // Large Drive files can come back as a "can't scan this file for viruses" page whose button
   // carries the real download link (a form with hidden fields): follow it once
@@ -491,34 +493,34 @@ async function downloadDirectLink(
   }
 
   // Stream to disk, counting bytes: stop as soon as it's bigger than the plan allows
-  // (Content-Length can be missing), and report progress as 5–45 %
+  // (Content-Length can be missing), and move the bar through its download step (lib/linkProgress.ts)
   const localPath = join(tmp, `video${ext}`)
-  let received = 0, lastPct = 5
+  let received = 0
   const counter = new Transform({
     transform(chunk: Buffer, _enc, done) {
       received += chunk.length
       if (maxBytes && received > maxBytes) { done(tooBig()); return }
-      if (total) {
-        const pct = Math.round(5 + (received / total) * 40)
-        if (pct !== lastPct) { lastPct = pct; setProgress(videoId, pct).catch(() => {}) }
-      }
+      if (total) bar.set(fetchPct(received, total))
       done(null, chunk)
     },
   })
   await pipeline(Readable.fromWeb(res.body as unknown as WebReadableStream), counter, createWriteStream(localPath), { signal })
 
   // Make sure it really is a video before storing it
+  bar.set(LINK_BAR.checking)
   const { stdout } = await execFileAsync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', localPath], { signal })
     .catch(() => ({ stdout: '' }))
   if (!stdout.includes('video')) throw new UserFacingError('That file doesn\'t contain a video we can read.')
 
-  await setProgress(videoId, 47)
+  // Saved to storage in parts, the bar moving with each part (it used to stand still for the whole save)
+  bar.set(LINK_BAR.saveFrom)
   const storagePath = `raw/${video.user_id}/${videoId}${ext}`
-  await r2UploadFile(storagePath, localPath, VIDEO_TYPE_BY_EXT[ext])
+  await r2UploadFileInParts(storagePath, localPath, VIDEO_TYPE_BY_EXT[ext], { signal, onProgress: (up, size) => bar.set(savePct(up, size)) })
   // The file's own name becomes the video's title (unless the user already named it)
   const title = titleFromFilename(filename)
   if (title) await db`UPDATE videos SET title = COALESCE(title, ${title}) WHERE id = ${videoId}`
-  await setProgress(videoId, 58)
+  bar.set(LINK_BAR.almost)
+  await bar.done()   // no late bar write after the job marks it ready
   return { localPath, storagePath }
 }
 
@@ -528,9 +530,12 @@ async function downloadWithYtDlp(videoId: string, tmp: string, signal?: AbortSig
 
   const outputTemplate = join(tmp, 'video.%(ext)s')
 
-  // ── Stage 1: Download (progress 5 → 45%) ──────────────────────────────────
+  // The dashboard bar's steps as for a Drive link (lib/linkProgress.ts), written in order
+  const bar = progressFeed(pct => setProgress(videoId, pct))
+
+  // ── Stage 1: Download (bar 5 → 50) ──────────────────────────────────────────
   console.log(`[transcribe] yt-dlp downloading ${video.source_url}`)
-  await setProgress(videoId, 5)
+  bar.set(LINK_BAR.start)
 
   const cookiesPath = process.env.YOUTUBE_COOKIES_PATH
   const ytdlpArgs = [
@@ -547,19 +552,13 @@ async function downloadWithYtDlp(videoId: string, tmp: string, signal?: AbortSig
     const proc = spawn('yt-dlp', ytdlpArgs, { signal })
     proc.on('error', reject)
 
-    let lastUpdate = 0
     proc.stdout.on('data', (chunk: Buffer) => {
       const lines = chunk.toString().split('\n')
       for (const line of lines) {
         const m = line.match(/\[download\]\s+([\d.]+)%/)
         if (m) {
           const dlPct = parseFloat(m[1])
-          // Map yt-dlp 0-100% → overall progress 5-45%
-          const overall = Math.round(5 + dlPct * 0.4)
-          if (overall !== lastUpdate) {
-            lastUpdate = overall
-            setProgress(videoId, overall).catch(() => {})
-          }
+          bar.set(fetchPct(dlPct, 100))
           process.stdout.write(`\r[transcribe] downloading ${dlPct.toFixed(1)}%   `)
         }
       }
@@ -583,7 +582,7 @@ async function downloadWithYtDlp(videoId: string, tmp: string, signal?: AbortSig
 
   const rawPath = join(tmp, videoFile)
 
-  // ── Stage 2: Remux to MP4 (progress 45 → 55%) ───────────────────────────────
+  // ── Stage 2: Remux to MP4 (the bar's "checking" step: a stream copy, quick) ───
   // Stream-copy video (no quality loss, no duration cap) and encode audio to AAC.
   // R2 has no meaningful size limit, so the old 30-min / 480p budget is gone.
   const { stdout: durOut } = await execFileAsync('ffprobe', [
@@ -593,7 +592,7 @@ async function downloadWithYtDlp(videoId: string, tmp: string, signal?: AbortSig
   const sourceDurationSec = parseFloat(durOut.trim()) || 60
 
   console.log(`[transcribe] remuxing full video (${(sourceDurationSec / 60).toFixed(1)} min) to MP4…`)
-  await setProgress(videoId, 47)
+  bar.set(LINK_BAR.checking)
 
   const localPath = join(tmp, 'video_final.mp4')
 
@@ -610,18 +609,7 @@ async function downloadWithYtDlp(videoId: string, tmp: string, signal?: AbortSig
     ], { signal })
     proc.on('error', reject)
 
-    let outTime = 0
-    proc.stdout.on('data', (chunk: Buffer) => {
-      const text = chunk.toString()
-      const m = text.match(/out_time_ms=(\d+)/)
-      if (m) {
-        outTime = parseInt(m[1]) / 1_000_000  // seconds
-        const pct = Math.min(1, outTime / sourceDurationSec)
-        // Map ffmpeg 0-100% → overall 47-55%
-        const overall = Math.round(47 + pct * 8)
-        setProgress(videoId, overall).catch(() => {})
-      }
-    })
+    proc.stdout.on('data', () => {})
     proc.stderr.on('data', () => {})
     proc.on('close', code => {
       if (code === 0) resolve()
@@ -629,14 +617,15 @@ async function downloadWithYtDlp(videoId: string, tmp: string, signal?: AbortSig
     })
   })
 
-  // ── Stage 3: Upload to R2 (progress 55 → 58%) ────────────────────────────
-  await setProgress(videoId, 55)
+  // ── Stage 3: Upload to R2 in parts (bar 52 → 95) ────────────────────────────
+  bar.set(LINK_BAR.saveFrom)
   const storagePath = `raw/${video.user_id}/${videoId}.mp4`
 
   console.log(`[transcribe] uploading to R2: ${storagePath}`)
-  await r2UploadFile(storagePath, localPath, 'video/mp4')
+  await r2UploadFileInParts(storagePath, localPath, 'video/mp4', { signal, onProgress: (up, size) => bar.set(savePct(up, size)) })
 
-  await setProgress(videoId, 58)
+  bar.set(LINK_BAR.almost)
+  await bar.done()   // no late bar write after the job marks it ready
   return { localPath, storagePath }
 }
 
